@@ -30,8 +30,8 @@ use self::{
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
         GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
         ImportRequest, LeaveRequest, ListRequest, OpenRequest, SetDownloadPolicyRequest,
-        SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest,
-        SubscribeRequest,
+        SetDurableRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest,
+        StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -92,6 +92,7 @@ impl DocsApi {
                     DocsProtocol::Drop(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Import(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Set(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::SetDurable(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetHash(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Get(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetExact(msg) => local.send((msg, tx)).await,
@@ -317,6 +318,41 @@ impl Doc {
         let response = self
             .inner
             .rpc(SetRequest {
+                doc_id: self.namespace_id,
+                author_id,
+                key: key.into(),
+                value: value.into(),
+            })
+            .await??;
+        Ok(response.entry.content_hash())
+    }
+
+    /// [`Self::set_bytes`], but the blob store's metadata is committed to
+    /// disk before the document record is inserted.
+    ///
+    /// After this returns, a hard process kill (SIGKILL, panic-abort) cannot
+    /// leave a durable document record whose content hash names blob metadata
+    /// that was never committed — the crash window `set_bytes` has between
+    /// the content import's acknowledgement and the blob store's batched
+    /// commit. The barrier also commits every earlier import completed on the
+    /// same blob store, so an entry pipeline that imports payloads first and
+    /// publishes a manifest record last gets whole-pipeline ordering from the
+    /// one call. The cost is one blob-store commit per call: use it for
+    /// publish points whose records must never dangle, not for high-rate
+    /// writes whose loss on crash is acceptable (those self-heal by retry).
+    ///
+    /// This orders the two stores' commits; it is not a power-loss guarantee
+    /// for the data files themselves.
+    pub async fn set_bytes_durable(
+        &self,
+        author_id: AuthorId,
+        key: impl Into<Bytes>,
+        value: impl Into<Bytes>,
+    ) -> Result<Hash> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(SetDurableRequest {
                 doc_id: self.namespace_id,
                 author_id,
                 key: key.into(),
