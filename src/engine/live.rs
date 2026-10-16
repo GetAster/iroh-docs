@@ -17,7 +17,11 @@ use iroh_blobs::{
     Hash, HashAndFormat,
 };
 use iroh_gossip::net::Gossip;
-use n0_future::{task::JoinSet, time::SystemTime, FutureExt};
+use n0_future::{
+    task::{Id as TaskId, JoinError, JoinSet},
+    time::SystemTime,
+    FutureExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
@@ -142,6 +146,8 @@ type SyncConnectRes = (
 );
 type SyncAcceptRes = Result<SyncFinished, AcceptError>;
 type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
+/// Set by an accept task once it has read which (namespace, peer) it serves.
+type AcceptedRequest = Arc<std::sync::OnceLock<(NamespaceId, PublicKey)>>;
 
 const MAX_REPLICA_EVENT_BATCH: usize = 1024;
 
@@ -173,10 +179,18 @@ pub struct LiveActor {
 
     /// Running sync futures (from connect).
     running_sync_connect: JoinSet<SyncConnectRes>,
+    /// What each running connect task is for, so a task that panics or is
+    /// cancelled (and so returns no result) still releases its peer state.
+    running_sync_connect_ids: HashMap<TaskId, (NamespaceId, PublicKey, SyncReason)>,
     /// Running sync futures (from accept).
     running_sync_accept: JoinSet<SyncAcceptRes>,
+    /// The (namespace, peer) each running accept task has been asked for,
+    /// once its request has been read.
+    running_sync_accept_ids: HashMap<TaskId, AcceptedRequest>,
     /// Running download futures.
     download_tasks: JoinSet<DownloadRes>,
+    /// What each running download task is for, like `running_sync_connect_ids`.
+    download_task_ids: HashMap<TaskId, (NamespaceId, Hash)>,
     /// Content hashes which are wanted but not yet queued because no provider was found.
     missing_hashes: MissingHashes,
     /// Content hashes queued in downloader.
@@ -230,9 +244,12 @@ impl LiveActor {
             downloader,
             sync_actor_tx,
             running_sync_connect: Default::default(),
+            running_sync_connect_ids: Default::default(),
             running_sync_accept: Default::default(),
+            running_sync_accept_ids: Default::default(),
             subscribers: Default::default(),
             download_tasks: Default::default(),
+            download_task_ids: Default::default(),
             state: Default::default(),
             missing_hashes: Default::default(),
             queued_hashes: Default::default(),
@@ -285,24 +302,43 @@ impl LiveActor {
                     let event = event.context("replica_events closed")?;
                     self.on_replica_events(event).await;
                 }
-                Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
+                // A sync or download task that panics (or is cancelled) ends
+                // that one exchange, not the actor: its peer or hash state is
+                // released as a failure, so a later start_sync works. Upstream
+                // returned the JoinError, which stopped the actor, gossip and
+                // the sync actor, failing every later docs call.
+                Some(res) = self.running_sync_connect.join_next_with_id(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
                     self.metrics.doc_live_tick_running_sync_connect.inc();
-                    let (namespace, peer, reason, res) = res.context("running_sync_connect closed")?;
-                    self.on_sync_via_connect_finished(namespace, peer, reason, res).await;
-
+                    match res {
+                        Ok((id, (namespace, peer, reason, res))) => {
+                            self.running_sync_connect_ids.remove(&id);
+                            self.on_sync_via_connect_finished(namespace, peer, reason, res).await;
+                        }
+                        Err(err) => self.on_sync_connect_task_failed(err).await,
+                    }
                 }
-                Some(res) = self.running_sync_accept.join_next(), if !self.running_sync_accept.is_empty() => {
+                Some(res) = self.running_sync_accept.join_next_with_id(), if !self.running_sync_accept.is_empty() => {
                     trace!(?i, "tick: running_sync_accept");
                     self.metrics.doc_live_tick_running_sync_accept.inc();
-                    let res = res.context("running_sync_accept closed")?;
-                    self.on_sync_via_accept_finished(res).await;
+                    match res {
+                        Ok((id, res)) => {
+                            self.running_sync_accept_ids.remove(&id);
+                            self.on_sync_via_accept_finished(res).await;
+                        }
+                        Err(err) => self.on_sync_accept_task_failed(err).await,
+                    }
                 }
-                Some(res) = self.download_tasks.join_next(), if !self.download_tasks.is_empty() => {
+                Some(res) = self.download_tasks.join_next_with_id(), if !self.download_tasks.is_empty() => {
                     trace!(?i, "tick: pending_downloads");
                     self.metrics.doc_live_tick_pending_downloads.inc();
-                    let (namespace, hash, res) = res.context("pending_downloads closed")?;
-                    self.on_download_ready(namespace, hash, res).await;
+                    match res {
+                        Ok((id, (namespace, hash, res))) => {
+                            self.download_task_ids.remove(&id);
+                            self.on_download_ready(namespace, hash, res).await;
+                        }
+                        Err(err) => self.on_download_task_failed(err).await,
+                    }
                 }
                 res = self.gossip.progress(), if !self.gossip.is_empty() => {
                     if let Err(error) = res {
@@ -410,6 +446,8 @@ impl LiveActor {
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
         let fut = async move {
+            #[cfg(test)]
+            fault::maybe_panic_connect(&namespace);
             let res = connect_and_sync(
                 &endpoint,
                 &sync,
@@ -421,7 +459,63 @@ impl LiveActor {
             (namespace, peer, reason, res)
         }
         .instrument(Span::current());
-        self.running_sync_connect.spawn(fut);
+        let task = self.running_sync_connect.spawn(fut);
+        self.running_sync_connect_ids
+            .insert(task.id(), (namespace, peer, reason));
+    }
+
+    /// A connect task ended without a result: fail its sync like any error.
+    async fn on_sync_connect_task_failed(&mut self, err: JoinError) {
+        let Some((namespace, peer, reason)) = self.running_sync_connect_ids.remove(&err.id())
+        else {
+            warn!(?err, "untracked sync connect task failed");
+            return;
+        };
+        warn!(?err, namespace = %namespace.fmt_short(), peer = %peer.fmt_short(), "sync connect task failed");
+        self.on_sync_finished(
+            namespace,
+            peer,
+            Origin::Connect(reason),
+            Err(anyhow::anyhow!("sync connect task failed: {err}")),
+        )
+        .await
+    }
+
+    /// An accept task ended without a result: fail its sync, if it had read
+    /// the request, like any error.
+    async fn on_sync_accept_task_failed(&mut self, err: JoinError) {
+        let accepted = self
+            .running_sync_accept_ids
+            .remove(&err.id())
+            .and_then(|request| request.get().copied());
+        let Some((namespace, peer)) = accepted else {
+            warn!(?err, "sync accept task failed before reading a request");
+            return;
+        };
+        warn!(?err, namespace = %namespace.fmt_short(), peer = %peer.fmt_short(), "sync accept task failed");
+        self.on_sync_finished(
+            namespace,
+            peer,
+            Origin::Accept,
+            Err(anyhow::anyhow!("sync accept task failed: {err}")),
+        )
+        .await
+    }
+
+    /// A download task ended without a result: fail its download like any
+    /// error, so the hash is wanted again.
+    async fn on_download_task_failed(&mut self, err: JoinError) {
+        let Some((namespace, hash)) = self.download_task_ids.remove(&err.id()) else {
+            warn!(?err, "untracked download task failed");
+            return;
+        };
+        warn!(?err, namespace = %namespace.fmt_short(), hash = %hash.fmt_short(), "download task failed");
+        self.on_download_ready(
+            namespace,
+            hash,
+            Err(anyhow::anyhow!("download task failed: {err}")),
+        )
+        .await
     }
 
     async fn shutdown(&mut self) -> anyhow::Result<()> {
@@ -916,13 +1010,15 @@ impl LiveActor {
                 self.queued_hashes.insert(hash, namespace);
                 self.missing_hashes.remove(hash, &namespace);
             }
-            self.download_tasks.spawn(async move {
+            let task = self.download_tasks.spawn(async move {
                 (
                     download_namespace,
                     hash,
                     handle.await.map_err(|e| anyhow::anyhow!(e)),
                 )
             });
+            self.download_task_ids
+                .insert(task.id(), (download_namespace, hash));
         }
     }
 
@@ -955,8 +1051,11 @@ impl LiveActor {
     #[instrument("accept", skip_all)]
     pub async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) {
         let to_actor_tx = self.sync_actor_tx.clone();
+        let accepted = AcceptedRequest::default();
+        let accepted_cb = accepted.clone();
         let accept_request_cb = move |namespace, peer| {
             let to_actor_tx = to_actor_tx.clone();
+            accepted_cb.set((namespace, peer)).ok();
             async move {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 to_actor_tx
@@ -982,10 +1081,11 @@ impl LiveActor {
         debug!("incoming connection");
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
-        self.running_sync_accept.spawn(
+        let task = self.running_sync_accept.spawn(
             async move { handle_connection(sync, conn, accept_request_cb, Some(&metrics)).await }
                 .instrument(Span::current()),
         );
+        self.running_sync_accept_ids.insert(task.id(), accepted);
     }
 
     pub fn accept_sync_request(
@@ -1270,5 +1370,129 @@ mod tests {
         assert!(missing.remove(h1, &n2));
         assert!(!missing.contains(h1, &n2));
         assert!(missing.hashes_for_namespace(&n2).is_empty());
+    }
+}
+
+/// Test-only fault injection into the live actor's tasks.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::{collections::HashSet, sync::Mutex};
+
+    use crate::NamespaceId;
+
+    static PANIC_CONNECT: Mutex<Option<HashSet<NamespaceId>>> = Mutex::new(None);
+
+    /// The next sync connect task for `namespace` panics before connecting.
+    pub(crate) fn panic_next_connect(namespace: NamespaceId) {
+        PANIC_CONNECT
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(namespace);
+    }
+
+    pub(crate) fn maybe_panic_connect(namespace: &NamespaceId) {
+        let armed = PANIC_CONNECT
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|s| s.remove(namespace));
+        if armed {
+            panic!("injected sync connect panic");
+        }
+    }
+}
+
+#[cfg(test)]
+mod task_failure_tests {
+    use iroh::{endpoint::presets, protocol::Router};
+    use n0_future::{time::Duration, StreamExt};
+
+    use crate::{
+        api::protocol::{AddrInfoOptions, ShareMode},
+        engine::LiveEvent,
+        protocol::Docs,
+    };
+
+    struct TestNode {
+        router: Router,
+        docs: Docs,
+    }
+
+    async fn node() -> anyhow::Result<TestNode> {
+        let ep = iroh::Endpoint::bind(presets::Minimal).await?;
+        let store = iroh_blobs::store::mem::MemStore::new();
+        let gossip = iroh_gossip::net::Gossip::builder().spawn(ep.clone());
+        let docs = Docs::memory()
+            .spawn(ep.clone(), (*store).clone(), gossip.clone())
+            .await?;
+        let router = Router::builder(ep)
+            .accept(
+                iroh_blobs::ALPN,
+                iroh_blobs::BlobsProtocol::new(&store, None),
+            )
+            .accept(iroh_gossip::ALPN, gossip)
+            .accept(crate::ALPN, docs.clone())
+            .spawn();
+        Ok(TestNode { router, docs })
+    }
+
+    /// A sync task that panics fails that one sync. The live actor keeps
+    /// running, the peer is not left marked as syncing, and a later
+    /// start_sync with the same peer reconciles. Upstream stopped the actor,
+    /// so every later docs call failed with "channel closed".
+    #[tokio::test]
+    async fn panicked_sync_task_leaves_the_actor_alive() -> anyhow::Result<()> {
+        let a = node().await?;
+        let b = node().await?;
+        let author = a.docs.api().author_create().await?;
+        let doc_a = a.docs.api().create().await?;
+        doc_a
+            .set_bytes(author, b"key".to_vec(), b"value".to_vec())
+            .await?;
+        let ticket = doc_a
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        let doc_b = b
+            .docs
+            .api()
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        let mut events = doc_b.subscribe().await?;
+
+        super::fault::panic_next_connect(doc_b.id());
+        doc_b.start_sync(ticket.nodes.clone()).await?;
+
+        // The panicked connect surfaces as a failed sync round.
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = events.next().await {
+                if let LiveEvent::SyncFinished(ev) = ev? {
+                    if ev.peer == a.router.endpoint().id() {
+                        return anyhow::Ok(ev.result);
+                    }
+                }
+            }
+            anyhow::bail!("event stream ended: the live actor stopped")
+        })
+        .await??;
+        let err = failed.expect_err("the injected panic fails the round");
+        assert!(err.contains("panic"), "{err}");
+
+        // The actor still serves requests, and the peer can sync again.
+        doc_b.start_sync(ticket.nodes.clone()).await?;
+        let entry = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(entry) = doc_b.get_exact(author, b"key".to_vec(), false).await? {
+                    return anyhow::Ok(entry);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await??;
+        assert_eq!(entry.content_len(), 5);
+
+        b.router.shutdown().await?;
+        a.router.shutdown().await?;
+        Ok(())
     }
 }
