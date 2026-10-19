@@ -286,8 +286,12 @@ impl BobState {
     }
 
     /// Consume self and get the [`SyncOutcome`] for this connection.
+    ///
+    /// Empty when [`run`](Self::run) failed while processing a message: it
+    /// takes the progress before each step and only puts it back on success,
+    /// and the accept path asks for the outcome before it looks at the result.
     pub fn into_outcome(self) -> SyncOutcome {
-        self.progress.unwrap()
+        self.progress.unwrap_or_default()
     }
 }
 
@@ -305,6 +309,16 @@ mod tests {
         store::{self, Query, Store},
         AuthorId, NamespaceSecret,
     };
+
+    #[test]
+    fn into_outcome_after_a_failed_step_is_empty() {
+        // `run` leaves `progress` taken when `sync_process_message` fails; the
+        // accept path then still asks for the outcome.
+        let mut state = BobState::new(SecretKey::from_bytes(&[7u8; 32]).public());
+        state.progress = None;
+        let outcome = state.into_outcome();
+        assert_eq!((outcome.num_sent, outcome.num_recv), (0, 0));
+    }
 
     #[tokio::test]
     async fn test_sync_simple() -> Result<()> {
