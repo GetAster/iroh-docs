@@ -74,9 +74,9 @@ Bookkeeping and documentation commits (not needed at runtime):
 
 No iroh-docs patch has been upstreamed or dropped. Superseded releases (not patches): 0.101.2 (`c1987427`) shipped a defective row 20 and is superseded by 0.101.3; it was never published to the registry, and its tag stays in place.
 
-### Branches not yet triaged
+### Closed security-review branches
 
-These topic branches exist in this repository (April 2026, from an earlier security review) but are not on the current upgrade branch and have no row above. Whether each is still needed, was fixed upstream, or should be dropped has not been decided yet.
+These topic branches came from an April 2026 security review. The fixes from that review that held up were merged upstream, so these branches are not carried on the upgrade branch. They are kept for reference.
 
 | Branch |
 |---|
