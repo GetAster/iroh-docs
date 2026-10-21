@@ -63,6 +63,11 @@ pub struct SyncReport {
 /// Messages to the sync actor
 #[derive(derive_more::Debug, strum::Display)]
 pub enum ToLiveActor {
+    DownloadStatus {
+        namespace: NamespaceId,
+        hash: Hash,
+        reply: sync::oneshot::Sender<super::DownloadStatus>,
+    },
     StartSync {
         namespace: NamespaceId,
         peers: Vec<EndpointAddr>,
@@ -374,6 +379,14 @@ impl LiveActor {
         match msg {
             ToLiveActor::Shutdown { .. } => {
                 unreachable!("handled in run");
+            }
+            ToLiveActor::DownloadStatus {
+                namespace,
+                hash,
+                reply,
+            } => {
+                let status = self.download_status(namespace, hash);
+                let _ = reply.send(status);
             }
             ToLiveActor::IncomingSyncReport { from, report } => {
                 self.on_sync_report(from, report).await
@@ -781,6 +794,15 @@ impl LiveActor {
         if resync {
             self.sync_with_peer(namespace, peer, SyncReason::Resync);
         }
+    }
+
+    fn download_status(&self, namespace: NamespaceId, hash: Hash) -> super::DownloadStatus {
+        download_status(
+            namespace,
+            hash,
+            &self.pending_downloads,
+            &self.queued_hashes,
+        )
     }
 
     async fn redrive_missing_content_for_peer(&mut self, namespace: NamespaceId, peer: PublicKey) {
@@ -1509,5 +1531,57 @@ mod task_failure_tests {
         b.router.shutdown().await?;
         a.router.shutdown().await?;
         Ok(())
+    }
+}
+
+fn download_status(
+    namespace: NamespaceId,
+    hash: Hash,
+    pending: &[DownloadCandidate],
+    running: &QueuedHashes,
+) -> super::DownloadStatus {
+    if running
+        .by_namespace
+        .get(&namespace)
+        .is_some_and(|hashes| hashes.contains(&hash))
+    {
+        super::DownloadStatus::Downloading
+    } else if pending
+        .iter()
+        .any(|c| c.namespace == namespace && c.hash == hash)
+    {
+        super::DownloadStatus::Queued
+    } else {
+        super::DownloadStatus::NoProvider
+    }
+}
+
+#[cfg(test)]
+mod download_status_tests {
+    use super::*;
+    #[test]
+    fn scheduler_states_are_scoped_and_removed_after_failure() {
+        use super::super::DownloadStatus::*;
+        let n1 = NamespaceId::from(&[1; 32]);
+        let n2 = NamespaceId::from(&[2; 32]);
+        let hash = Hash::new(b"content");
+        let other = Hash::new(b"other");
+        let node = PublicKey::from_bytes(&[1; 32]).unwrap();
+        let mut pending = vec![DownloadCandidate {
+            namespace: n1,
+            hash,
+            node,
+            only_if_missing: false,
+        }];
+        let mut running = QueuedHashes::default();
+        assert_eq!(download_status(n1, hash, &pending, &running), Queued);
+        assert_eq!(download_status(n2, hash, &pending, &running), NoProvider);
+        assert_eq!(download_status(n1, other, &pending, &running), NoProvider);
+        running.insert(hash, n1);
+        assert_eq!(download_status(n1, hash, &pending, &running), Downloading);
+        pending.clear();
+        assert_eq!(download_status(n1, hash, &pending, &running), Downloading);
+        running.remove_hash(&hash);
+        assert_eq!(download_status(n1, hash, &pending, &running), NoProvider);
     }
 }

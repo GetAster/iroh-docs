@@ -407,6 +407,8 @@ pub enum DocsProtocol {
     // inserting a variant above renumbers everything after it.
     #[rpc(tx = oneshot::Sender<RpcResult<SetResponse>>)]
     SetDurable(SetDurableRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<crate::engine::DownloadStatus>>)]
+    DownloadStatus(DownloadStatusRequest),
 }
 
 /// Options to configure what is included in a [`iroh::EndpointAddr`].
@@ -466,4 +468,10 @@ impl AddrInfoOptions {
             },
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DownloadStatusRequest {
+    pub doc_id: NamespaceId,
+    pub hash: iroh_blobs::Hash,
 }

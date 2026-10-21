@@ -2,6 +2,17 @@
 //!
 //! [`crate::Replica`] is also called documents here.
 
+/// State of a hash in the docs engine's content download scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DownloadStatus {
+    /// Work is pending submission to the downloader.
+    Queued,
+    /// A downloader task is running (including waiting for downloader capacity).
+    Downloading,
+    /// No task or queued provider is available; a later sync may redrive it.
+    NoProvider,
+}
+
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
@@ -164,6 +175,25 @@ impl Engine {
     /// Returns the metrics tracked for this engine.
     pub fn metrics(&self) -> &Arc<Metrics> {
         self.sync.metrics()
+    }
+
+    /// Snapshot of the engine's download tracking for a document content hash.
+    /// Complete/local content is checked separately by the blob store. A hash
+    /// with no scheduled work reports `NoProvider`, including unknown hashes.
+    pub async fn download_status(
+        &self,
+        namespace: NamespaceId,
+        hash: iroh_blobs::Hash,
+    ) -> Result<DownloadStatus> {
+        let (reply, recv) = tokio::sync::oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::DownloadStatus {
+                namespace,
+                hash,
+                reply,
+            })
+            .await?;
+        Ok(recv.await?)
     }
 
     /// Start to sync a document.
