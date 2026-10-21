@@ -188,10 +188,11 @@ async fn connect_rejected_as_already_syncing_must_not_wedge_forever() -> Result<
                     match ev {
                         Some(Ok(LiveEvent::SyncFinished(ev))) => {
                             info!(?ev, "sync round ended on the wedge candidate");
-                            // Only a round that actually RECONCILED counts: the
-                            // fix also surfaces the aborted collision round as
-                            // a failed SyncFinished, and accepting that would
-                            // pass the test without any recovery happening.
+                            // Only a round that actually RECONCILED counts. The
+                            // aborted collision round used to surface as a
+                            // failed SyncFinished (row 39 makes it quiet), and
+                            // accepting any ended round would pass the test
+                            // without any recovery happening.
                             if ev.result.is_ok() {
                                 round_ended = true;
                                 break 'outer;
