@@ -22,7 +22,7 @@ use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 // use super::gossip::{GossipActor, ToGossipActor};
-use super::state::{NamespaceStates, Origin, SyncReason};
+use super::state::{is_tiebreak_loss, NamespaceStates, Origin, SyncReason};
 use crate::{
     actor::{OpenOpts, SyncHandle},
     engine::gossip::GossipState,
@@ -501,10 +501,25 @@ impl LiveActor {
         // was stale), the bet failed permanently: the state stayed
         // `Running{Connect}` with no timeout and no retry, and every later
         // attempt for this (namespace, peer) was refused as already running.
-        // Routing the abort through `on_sync_finished` resets the state when
-        // the connect still owns it; `PeerState::finish` is origin-conditional,
-        // so if the reciprocal accept has already taken ownership the abort is
-        // discarded and that live exchange is left untouched.
+        // The abort must therefore reset the state when the connect still owns
+        // it; `PeerState::finish` is origin-conditional, so if the reciprocal
+        // accept has already taken ownership the abort is discarded and that
+        // live exchange is left untouched.
+        //
+        // That reset is all it is. Losing the simultaneous-dial tie-break is
+        // designed behaviour, not a failed sync: the reciprocal exchange does
+        // the work and reports it. Emitting `SyncFinished(Err)` and a
+        // `PendingContentReady` for it was noise to every subscriber, and the
+        // success paths (peer registration, report broadcast, redrive) do not
+        // apply. Real errors still go through `on_sync_finished`.
+        if is_tiebreak_loss(&result) {
+            debug!("lost the simultaneous-dial tie-break; reset without reporting");
+            let origin = Origin::Connect(reason);
+            if let Some(true) = self.state.finish_tiebreak_loss(&namespace, peer, &origin) {
+                self.sync_with_peer(namespace, peer, SyncReason::Resync);
+            }
+            return;
+        }
         self.on_sync_finished(
             namespace,
             peer,
