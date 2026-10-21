@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
-    net::{AbortReason, AcceptOutcome, SyncFinished},
+    net::{AbortReason, AcceptOutcome, ConnectError, SyncFinished},
     NamespaceId,
 };
 
@@ -115,6 +115,26 @@ impl NamespaceStates {
     ) -> Option<(SystemTime, bool)> {
         let state = self.entry(namespace, node)?;
         state.finish(origin, result)
+    }
+
+    /// Reset a connect that lost the simultaneous-dial tie-break, without reporting it.
+    ///
+    /// Same state transition as [`Self::finish`] with an error result (the wedge fix needs the
+    /// peer back to idle), but the caller emits no event for it. Returns `Some(true)` if a
+    /// follow-up sync was requested while the connect ran, `None` if nothing was reset.
+    pub fn finish_tiebreak_loss(
+        &mut self,
+        namespace: &NamespaceId,
+        node: EndpointId,
+        origin: &Origin,
+    ) -> Option<bool> {
+        self.finish(
+            namespace,
+            node,
+            origin,
+            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing")),
+        )
+        .map(|(_started, resync)| resync)
     }
 
     /// Set whether a [`super::live::Event::PendingContentReady`] may be emitted once the pending queue
@@ -251,6 +271,19 @@ impl PeerState {
     }
 }
 
+/// Whether a finished connect lost the simultaneous-dial tie-break.
+///
+/// When both peers dial each other, [`PeerState::accept_request`] makes the higher id accept and
+/// the lower id reject with [`AbortReason::AlreadySyncing`]. The rejected connect is the
+/// designed loser: the reciprocal exchange does the work, so it is not a failure to report.
+/// Only the typed remote abort qualifies; every other error is a real failure.
+pub(super) fn is_tiebreak_loss(result: &Result<SyncFinished, ConnectError>) -> bool {
+    matches!(
+        result,
+        Err(ConnectError::RemoteAbort(AbortReason::AlreadySyncing))
+    )
+}
+
 #[derive(Debug)]
 enum SyncDirection {
     Accept,
@@ -342,5 +375,71 @@ mod tests {
             .finish(&Origin::Accept, Err(anyhow::anyhow!("x")))
             .is_some());
         assert!(state.start_connect(SyncReason::Resync));
+    }
+
+    /// The tie-break loser's connect is reset to idle silently, so a later attempt can run.
+    #[test]
+    fn tiebreak_loss_resets_to_idle() {
+        let mut peers = NamespaceStates::default();
+        let ns = NamespaceId::from(&[7u8; 32]);
+        let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let origin = Origin::Connect(SyncReason::DirectJoin);
+        peers.insert(ns);
+        assert!(peers.start_connect(&ns, node, SyncReason::DirectJoin));
+        assert_eq!(peers.finish_tiebreak_loss(&ns, node, &origin), Some(false));
+        assert!(
+            peers.start_connect(&ns, node, SyncReason::Resync),
+            "the peer must accept a new attempt",
+        );
+    }
+
+    /// A follow-up requested while the connect ran survives the quiet reset.
+    #[test]
+    fn tiebreak_loss_keeps_the_queued_resync() {
+        let mut peers = NamespaceStates::default();
+        let ns = NamespaceId::from(&[7u8; 32]);
+        let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        peers.insert(ns);
+        assert!(peers.start_connect(&ns, node, SyncReason::DirectJoin));
+        assert!(!peers.start_connect(&ns, node, SyncReason::NewNeighbor));
+        let origin = Origin::Connect(SyncReason::DirectJoin);
+        assert_eq!(peers.finish_tiebreak_loss(&ns, node, &origin), Some(true));
+    }
+
+    /// A stale tie-break abort after the reciprocal accept took over leaves that exchange alone.
+    #[test]
+    fn tiebreak_loss_does_not_erase_a_running_accept() {
+        let mut peers = NamespaceStates::default();
+        let ns = NamespaceId::from(&[7u8; 32]);
+        let a = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let b = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let (me, other) = if a.as_bytes() > b.as_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        peers.insert(ns);
+        assert!(peers.start_connect(&ns, other, SyncReason::DirectJoin));
+        assert!(matches!(
+            peers.accept_request(&me, &ns, other),
+            AcceptOutcome::Allow
+        ));
+        let origin = Origin::Connect(SyncReason::DirectJoin);
+        assert_eq!(peers.finish_tiebreak_loss(&ns, other, &origin), None);
+    }
+
+    /// Only the typed remote AlreadySyncing abort is quiet; real errors are still reported.
+    #[test]
+    fn only_the_alreadysyncing_abort_is_a_tiebreak_loss() {
+        let abort = |r| Err(ConnectError::RemoteAbort(r));
+        assert!(is_tiebreak_loss(&abort(AbortReason::AlreadySyncing)));
+        assert!(!is_tiebreak_loss(&abort(AbortReason::NotFound)));
+        assert!(!is_tiebreak_loss(&abort(AbortReason::InternalServerError)));
+        assert!(!is_tiebreak_loss(&Err(ConnectError::Connect {
+            error: anyhow::anyhow!("unreachable"),
+        })));
+        assert!(!is_tiebreak_loss(&Err(ConnectError::Sync {
+            error: anyhow::anyhow!("remote aborted sync: AlreadySyncing"),
+        })));
     }
 }
