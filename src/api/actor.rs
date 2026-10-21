@@ -177,6 +177,15 @@ impl RpcActor {
                 let WithChannels { tx, inner, .. } = subscribe;
                 self.doc_subscribe(inner, tx).await;
             }
+            DocsMessage::DownloadStatus(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self
+                    .engine
+                    .download_status(inner.doc_id, inner.hash)
+                    .await
+                    .map_err(|e| RpcError::new(&*e));
+                let _ = tx.send(result).await;
+            }
             DocsMessage::GetDownloadPolicy(get_policy) => {
                 let WithChannels { tx, inner, .. } = get_policy;
                 let result = self.doc_get_download_policy(inner).await;

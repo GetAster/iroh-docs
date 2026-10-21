@@ -106,6 +106,7 @@ impl DocsApi {
                     DocsProtocol::Leave(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Share(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Subscribe(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::DownloadStatus(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetSyncPeers(msg) => local.send((msg, tx)).await,
@@ -597,6 +598,22 @@ impl Doc {
             })
             .await??;
         Ok(())
+    }
+
+    /// Snapshot of this hash's state in the docs content download scheduler.
+    /// Local completeness must be checked separately in the blob store.
+    pub async fn download_status(
+        &self,
+        hash: iroh_blobs::Hash,
+    ) -> Result<crate::engine::DownloadStatus> {
+        self.ensure_open()?;
+        Ok(self
+            .inner
+            .rpc(protocol::DownloadStatusRequest {
+                doc_id: self.namespace_id,
+                hash,
+            })
+            .await??)
     }
 
     /// Returns the download policy for this document

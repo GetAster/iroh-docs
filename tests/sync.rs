@@ -228,6 +228,19 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
         "content should not be available before the provider stores it"
     );
 
+    // The attempt against peer0, which lacks the content, may still be in
+    // flight right after the sync; once it fails nothing else can serve the
+    // hash, so the status must settle on NoProvider.
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match doc1.download_status(hash).await? {
+                iroh_docs::engine::DownloadStatus::NoProvider => return anyhow::Ok(()),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await??;
+
     let added = clients[0].blobs().add_bytes(payload).await?;
     assert_eq!(added.hash, hash);
 
