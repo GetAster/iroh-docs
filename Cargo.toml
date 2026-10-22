@@ -101,12 +101,12 @@ cfg_aliases = "0.2.1"
 
 # Pin to Aster rc1 forks. The fork main branches mirror upstream main.
 [patch.crates-io]
-iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "261ad623da7eb4dbdbdba2b7a20bcc178a1b7b7c" }
-iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "261ad623da7eb4dbdbdba2b7a20bcc178a1b7b7c" }
-iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "261ad623da7eb4dbdbdba2b7a20bcc178a1b7b7c" }
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "1ec44e4418260919602e13bef063618e5a6d1f93" }
-noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e" }
-noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e" }
-noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e" }
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5fde770e167767eadfd208193cb2bf667096e6a7" }
-iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "a90ea88d46b3178a5f1a7d4c3e28a34a2ad80aa4" }
+iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "41ec78b1034aad5cb7a2b88364955965092fa541" }
+iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "41ec78b1034aad5cb7a2b88364955965092fa541" }
+iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "41ec78b1034aad5cb7a2b88364955965092fa541" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "6f6b41956a05a633753f6587658f043a5c644ab0" }
+noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "13dcb5b7f60240d729580014356fca6ab7f18ce3" }
+noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "13dcb5b7f60240d729580014356fca6ab7f18ce3" }
+noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "13dcb5b7f60240d729580014356fca6ab7f18ce3" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "a45ab096bb196fe0f418e945a9d2d754be06eaab" }
+iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "8c7947b638f1b5b9524b7b4aaa7c48855cf0e3b2" }
