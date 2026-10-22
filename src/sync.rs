@@ -8,6 +8,7 @@
 
 use std::{
     cmp::Ordering,
+    collections::BTreeSet,
     fmt::Debug,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -470,8 +471,16 @@ where
     ) -> Result<usize, InsertError> {
         let namespace = self.id();
 
+        let allowed_writers = self.store.allowed_writers().map_err(InsertError::Store)?;
         let store = &self.store;
-        validate_entry(system_time_now(), store, namespace, &entry, &origin)?;
+        validate_entry(
+            system_time_now(),
+            store,
+            namespace,
+            allowed_writers.as_ref(),
+            &entry,
+            &origin,
+        )?;
 
         let outcome = self.store.put(entry.clone()).map_err(InsertError::Store)?;
         tracing::debug!(?origin, hash = %entry.content_hash(), ?outcome, "insert");
@@ -563,6 +572,8 @@ where
             .store
             .get_download_policy(&my_namespace)
             .unwrap_or_default();
+        // Read once per message: the actor applies a change to the allowlist between messages.
+        let allowed_writers = self.store.allowed_writers()?;
         let reply = self
             .store
             .process_message(
@@ -574,7 +585,15 @@ where
                         from: from_peer,
                         remote_content_status: content_status,
                     };
-                    validate_entry(now, store, my_namespace, entry, &origin).is_ok()
+                    validate_entry(
+                        now,
+                        store,
+                        my_namespace,
+                        allowed_writers.as_ref(),
+                        entry,
+                        &origin,
+                    )
+                    .is_ok()
                 },
                 // on_insert callback: is called when an entry was actually inserted in the store
                 async |_store, entry, content_status| {
@@ -639,12 +658,14 @@ pub struct ReadOnly;
 /// This validates that
 /// * the entry's author and namespace signatures are correct
 /// * the entry's namespace matches the current replica
+/// * the entry's author is in `allowed_writers`, if the namespace restricts its writers
 /// * the entry's timestamp is not more than 10 minutes in the future of our system time
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
     store: &S,
     expected_namespace: NamespaceId,
+    allowed_writers: Option<&BTreeSet<AuthorId>>,
     entry: &SignedEntry,
     origin: &InsertOrigin,
 ) -> Result<(), ValidationFailure> {
@@ -656,6 +677,13 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     // Verify signature for non-local entries.
     if !matches!(origin, InsertOrigin::Local) && entry.verify(store).is_err() {
         return Err(ValidationFailure::BadSignature);
+    }
+
+    // Verify that the author may write to this namespace.
+    if let Some(allowed) = allowed_writers {
+        if !allowed.contains(&entry.author()) {
+            return Err(ValidationFailure::AuthorNotAllowed);
+        }
     }
 
     // Verify that the timestamp of the entry is not too far in the future.
@@ -715,6 +743,9 @@ pub enum ValidationFailure {
     /// Entry has length 0 but not the empty hash, or the empty hash but not length 0.
     #[error("Entry has length 0 but not the empty hash, or the empty hash but not length 0")]
     InvalidEmptyEntry,
+    /// Entry author is not allowed to write to this namespace.
+    #[error("Entry author is not allowed to write to this namespace")]
+    AuthorNotAllowed,
 }
 
 /// A signed entry.
@@ -2583,6 +2614,189 @@ mod tests {
         let retrieved_policy = store.get_download_policy(&id)?;
         assert_eq!(retrieved_policy, policy);
         store.flush()?;
+        Ok(())
+    }
+
+    fn assert_author_not_allowed<T: Debug>(res: Result<T, InsertError>) {
+        assert!(
+            matches!(
+                res,
+                Err(InsertError::Validation(ValidationFailure::AuthorNotAllowed))
+            ),
+            "expected AuthorNotAllowed, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allowed_writers_local_memory() -> Result<()> {
+        test_allowed_writers_local(store::Store::memory()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn test_allowed_writers_local_fs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        test_allowed_writers_local(store::fs::Store::persistent(dbfile.path())?).await
+    }
+
+    async fn test_allowed_writers_local(mut store: Store) -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let id = namespace.id();
+        let writer = Author::new(&mut rng);
+        let other = Author::new(&mut rng);
+        let only_writer = BTreeSet::from([writer.id()]);
+
+        store
+            .set_allowed_writers(&id, Some(only_writer.clone()))
+            .expect_err("document does not exist");
+        store.new_replica(namespace.clone())?;
+        assert_eq!(store.get_allowed_writers(&id)?, None);
+
+        store.set_allowed_writers(&id, Some(only_writer.clone()))?;
+        assert_eq!(store.get_allowed_writers(&id)?, Some(only_writer.clone()));
+        let mut replica = store.open_replica(&id)?;
+        replica.hash_and_insert(b"k", &writer, b"v").await?;
+        assert_author_not_allowed(replica.hash_and_insert(b"k", &other, b"v").await);
+        assert_author_not_allowed(replica.delete_prefix(b"k", &other).await);
+        // The path gossip uses for a single remote entry.
+        let remote = SignedEntry::from_entry(
+            Entry::new(
+                RecordIdentifier::new(id, other.id(), b"r"),
+                Record::new_current(Hash::new(b"r"), 1),
+            ),
+            &namespace,
+            &other,
+        );
+        assert_author_not_allowed(
+            replica
+                .insert_remote_entry(remote, [9u8; 32], ContentStatus::Complete)
+                .await,
+        );
+        assert!(get_entry(&mut store, id, other.id(), b"k").is_err());
+        get_entry(&mut store, id, writer.id(), b"k")?;
+
+        // An empty set rejects every author.
+        store.set_allowed_writers(&id, Some(BTreeSet::new()))?;
+        let mut replica = store.open_replica(&id)?;
+        assert_author_not_allowed(replica.hash_and_insert(b"k2", &writer, b"v").await);
+
+        // Clearing lifts the restriction.
+        store.set_allowed_writers(&id, None)?;
+        assert_eq!(store.get_allowed_writers(&id)?, None);
+        let mut replica = store.open_replica(&id)?;
+        replica.hash_and_insert(b"k", &other, b"v").await?;
+        get_entry(&mut store, id, other.id(), b"k")?;
+
+        // Removing the replica removes its allowlist.
+        store.set_allowed_writers(&id, Some(only_writer))?;
+        store.close_replica(id);
+        store.remove_replica(&id)?;
+        store.new_replica(namespace)?;
+        assert_eq!(store.get_allowed_writers(&id)?, None);
+        store.flush()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn test_allowed_writers_persist_fs() -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(3);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let id = namespace.id();
+        let writer = Author::new(&mut rng);
+        let other = Author::new(&mut rng);
+        let only_writer = BTreeSet::from([writer.id()]);
+        let dbfile = tempfile::NamedTempFile::new()?;
+        {
+            let mut store = store::fs::Store::persistent(dbfile.path())?;
+            store.new_replica(namespace)?;
+            store.set_allowed_writers(&id, Some(only_writer.clone()))?;
+            store.flush()?;
+        }
+        let mut store = store::fs::Store::persistent(dbfile.path())?;
+        assert_eq!(store.get_allowed_writers(&id)?, Some(only_writer));
+        let mut replica = store.open_replica(&id)?;
+        assert_author_not_allowed(replica.hash_and_insert(b"k", &other, b"v").await);
+        replica.hash_and_insert(b"k", &writer, b"v").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allowed_writers_sync_memory() -> Result<()> {
+        test_allowed_writers_sync(store::Store::memory(), store::Store::memory()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn test_allowed_writers_sync_fs() -> Result<()> {
+        let alice_dbfile = tempfile::NamedTempFile::new()?;
+        let bob_dbfile = tempfile::NamedTempFile::new()?;
+        test_allowed_writers_sync(
+            store::fs::Store::persistent(alice_dbfile.path())?,
+            store::fs::Store::persistent(bob_dbfile.path())?,
+        )
+        .await
+    }
+
+    /// Alice accepts every author, Bob only `writer`. Sync completes, Bob skips `other`'s
+    /// entries and keeps the rest, and repeating the sync does not change that.
+    async fn test_allowed_writers_sync(mut alice_store: Store, mut bob_store: Store) -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(2);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let id = namespace.id();
+        let writer = Author::new(&mut rng);
+        let other = Author::new(&mut rng);
+
+        let mut alice = alice_store.new_replica(namespace.clone())?;
+        alice.hash_and_insert("a", &writer, b"a").await?;
+        alice.hash_and_insert("b", &writer, b"b").await?;
+        alice.hash_and_insert("a", &other, b"a").await?;
+        alice.hash_and_insert("c", &other, b"c").await?;
+
+        bob_store.new_replica(namespace)?;
+        bob_store.set_allowed_writers(&id, Some(BTreeSet::from([writer.id()])))?;
+        let mut bob = bob_store.open_replica(&id)?;
+        bob.hash_and_insert("d", &writer, b"d").await?;
+
+        for _ in 0..2 {
+            let mut alice = alice_store.open_replica(&id)?;
+            let mut bob = bob_store.open_replica(&id)?;
+            let (alice_out, bob_out) = sync(&mut alice, &mut bob).await?;
+            assert_eq!(bob_out.num_sent, 1, "bob only has his own entry to offer");
+            assert!(alice_out.num_sent >= 2);
+
+            for key in [&b"a"[..], b"b"] {
+                get_entry(&mut bob_store, id, writer.id(), key)?;
+            }
+            for key in [&b"a"[..], b"c"] {
+                assert!(get_entry(&mut bob_store, id, other.id(), key).is_err());
+            }
+            get_entry(&mut alice_store, id, writer.id(), b"d")?;
+        }
+
+        // A disallowed author's newer head is no news for Bob; an allowed one's is.
+        let far = system_time_now() + 1_000_000;
+        let heads = AuthorHeads::from_iter([(other.id(), far)]);
+        assert_eq!(bob_store.has_news_for_us(id, &heads)?, None);
+        let heads = AuthorHeads::from_iter([(other.id(), far), (writer.id(), far)]);
+        assert_eq!(
+            bob_store.has_news_for_us(id, &heads)?,
+            std::num::NonZeroU64::new(1)
+        );
+
+        // Once cleared, the next sync brings `other`'s entries.
+        bob_store.set_allowed_writers(&id, None)?;
+        {
+            let mut alice = alice_store.open_replica(&id)?;
+            let mut bob = bob_store.open_replica(&id)?;
+            sync(&mut alice, &mut bob).await?;
+        }
+        for key in [&b"a"[..], b"c"] {
+            get_entry(&mut bob_store, id, other.id(), key)?;
+        }
+        alice_store.flush()?;
+        bob_store.flush()?;
         Ok(())
     }
 

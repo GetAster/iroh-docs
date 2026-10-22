@@ -13,15 +13,16 @@ use super::{
         AuthorGetDefaultResponse, AuthorImportRequest, AuthorImportResponse, AuthorListRequest,
         AuthorListResponse, AuthorSetDefaultRequest, AuthorSetDefaultResponse, CloseRequest,
         CloseResponse, CreateRequest, CreateResponse, DelRequest, DelResponse, DocsMessage,
-        DocsProtocol, DropRequest, DropResponse, GetDownloadPolicyRequest,
-        GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
-        GetManyResponse, GetManyVecRequest, GetSyncPeersRequest, GetSyncPeersResponse,
-        ImportRequest, ImportResponse, LeaveRequest, LeaveResponse, ListRequest, ListResponse,
-        OpenRequest, OpenResponse, RetireWriteAuthorityRequest, RetireWriteAuthorityResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetDurableRequest, SetHashRequest,
-        SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse,
-        StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest,
-        SubscribeResponse,
+        DocsProtocol, DropRequest, DropResponse, GetAllowedWritersRequest,
+        GetAllowedWritersResponse, GetDownloadPolicyRequest, GetDownloadPolicyResponse,
+        GetExactRequest, GetExactResponse, GetManyRequest, GetManyResponse, GetManyVecRequest,
+        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse, LeaveRequest,
+        LeaveResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
+        RetireWriteAuthorityRequest, RetireWriteAuthorityResponse, SetAllowedWritersRequest,
+        SetAllowedWritersResponse, SetDownloadPolicyRequest, SetDownloadPolicyResponse,
+        SetDurableRequest, SetHashRequest, SetHashResponse, SetRequest, SetResponse, ShareMode,
+        ShareRequest, ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest,
+        StatusResponse, SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -198,6 +199,20 @@ impl RpcActor {
                 let result = self.doc_set_download_policy(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send SetDownloadPolicy response: {}", e);
+                }
+            }
+            DocsMessage::SetAllowedWriters(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self.doc_set_allowed_writers(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send SetAllowedWriters response: {}", e);
+                }
+            }
+            DocsMessage::GetAllowedWriters(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self.doc_get_allowed_writers(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send GetAllowedWriters response: {}", e);
                 }
             }
             DocsMessage::GetSyncPeers(get_peers) => {
@@ -696,6 +711,29 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(GetDownloadPolicyResponse { policy })
+    }
+
+    pub(super) async fn doc_set_allowed_writers(
+        &self,
+        req: SetAllowedWritersRequest,
+    ) -> RpcResult<SetAllowedWritersResponse> {
+        self.sync
+            .set_allowed_writers(req.doc_id, req.writers)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(SetAllowedWritersResponse {})
+    }
+
+    pub(super) async fn doc_get_allowed_writers(
+        &self,
+        req: GetAllowedWritersRequest,
+    ) -> RpcResult<GetAllowedWritersResponse> {
+        let writers = self
+            .sync
+            .get_allowed_writers(req.doc_id)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(GetAllowedWritersResponse { writers })
     }
 
     pub(super) async fn doc_get_sync_peers(

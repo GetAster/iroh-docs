@@ -1,6 +1,6 @@
 //! Protocol definitions for irpc-based RPC.
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use bytes::Bytes;
 use iroh::EndpointAddr;
@@ -269,6 +269,26 @@ pub struct SetDownloadPolicyRequest {
 pub struct SetDownloadPolicyResponse;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SetAllowedWritersRequest {
+    pub doc_id: NamespaceId,
+    /// `None` lets any author write.
+    pub writers: Option<BTreeSet<AuthorId>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SetAllowedWritersResponse;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetAllowedWritersRequest {
+    pub doc_id: NamespaceId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetAllowedWritersResponse {
+    pub writers: Option<BTreeSet<AuthorId>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GetSyncPeersRequest {
     pub doc_id: NamespaceId,
 }
@@ -409,6 +429,10 @@ pub enum DocsProtocol {
     SetDurable(SetDurableRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<crate::engine::DownloadStatus>>)]
     DownloadStatus(DownloadStatusRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<SetAllowedWritersResponse>>)]
+    SetAllowedWriters(SetAllowedWritersRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<GetAllowedWritersResponse>>)]
+    GetAllowedWriters(GetAllowedWritersRequest),
 }
 
 /// Options to configure what is included in a [`iroh::EndpointAddr`].

@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 
 use std::{
+    collections::BTreeSet,
     future::Future,
     path::Path,
     pin::Pin,
@@ -28,10 +29,11 @@ use self::{
         AddrInfoOptions, AuthorCreateRequest, AuthorDeleteRequest, AuthorExportRequest,
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
-        GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetManyVecRequest,
-        GetSyncPeersRequest, ImportRequest, LeaveRequest, ListRequest, OpenRequest,
-        RetireWriteAuthorityRequest, SetDownloadPolicyRequest, SetDurableRequest, SetHashRequest,
-        SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest, SubscribeRequest,
+        GetAllowedWritersRequest, GetDownloadPolicyRequest, GetExactRequest, GetManyRequest,
+        GetManyVecRequest, GetSyncPeersRequest, ImportRequest, LeaveRequest, ListRequest,
+        OpenRequest, RetireWriteAuthorityRequest, SetAllowedWritersRequest,
+        SetDownloadPolicyRequest, SetDurableRequest, SetHashRequest, SetRequest, ShareMode,
+        ShareRequest, StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -109,6 +111,8 @@ impl DocsApi {
                     DocsProtocol::DownloadStatus(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetDownloadPolicy(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::SetAllowedWriters(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::GetAllowedWriters(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetSyncPeers(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorList(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorCreate(msg) => local.send((msg, tx)).await,
@@ -626,6 +630,54 @@ impl Doc {
             })
             .await??;
         Ok(response.policy)
+    }
+
+    /// Restricts the authors that may write to this document to `writers`, replacing any
+    /// previous restriction.
+    ///
+    /// Entries signed by any other author are then rejected: a local [`Doc::set_bytes`],
+    /// [`Doc::set_hash`] or [`Doc::del`] fails with a validation error, and an entry received
+    /// from a peer, by sync or gossip, is skipped while the rest of the exchange continues, as
+    /// with any other invalid entry. An empty set rejects every entry.
+    ///
+    /// The restriction is local to this node. It is not replicated: every replica that must
+    /// enforce it sets it. It is persisted in the docs store (committed before this returns),
+    /// survives a restart and is removed when the document is dropped. Entries stored before
+    /// the call are kept and still served to peers.
+    pub async fn set_allowed_writers(
+        &self,
+        writers: impl IntoIterator<Item = AuthorId>,
+    ) -> Result<()> {
+        self.set_allowed_writers_inner(Some(writers.into_iter().collect()))
+            .await
+    }
+
+    /// Removes the writer restriction of this document: any author may write again.
+    pub async fn clear_allowed_writers(&self) -> Result<()> {
+        self.set_allowed_writers_inner(None).await
+    }
+
+    /// Returns the authors allowed to write to this document, or `None` if any author may.
+    pub async fn get_allowed_writers(&self) -> Result<Option<BTreeSet<AuthorId>>> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(GetAllowedWritersRequest {
+                doc_id: self.namespace_id,
+            })
+            .await??;
+        Ok(response.writers)
+    }
+
+    async fn set_allowed_writers_inner(&self, writers: Option<BTreeSet<AuthorId>>) -> Result<()> {
+        self.ensure_open()?;
+        self.inner
+            .rpc(SetAllowedWritersRequest {
+                doc_id: self.namespace_id,
+                writers,
+            })
+            .await??;
+        Ok(())
     }
 
     /// Returns sync peers for this document

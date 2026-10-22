@@ -1,7 +1,7 @@
 //! This contains an actor spawned on a separate thread to process replica and store operations.
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, BTreeSet, HashMap},
     num::NonZeroU64,
     sync::Arc,
 };
@@ -209,6 +209,15 @@ enum ReplicaAction {
     GetDownloadPolicy {
         #[debug("reply")]
         reply: oneshot::Sender<Result<DownloadPolicy>>,
+    },
+    SetAllowedWriters {
+        writers: Option<BTreeSet<AuthorId>>,
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetAllowedWriters {
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<Option<BTreeSet<AuthorId>>>>,
     },
 }
 
@@ -616,6 +625,30 @@ impl SyncHandle {
         rx.await?
     }
 
+    /// Restricts which authors may write to `namespace` (`None` lifts the restriction).
+    ///
+    /// The setting is flushed to the store before this returns.
+    pub async fn set_allowed_writers(
+        &self,
+        namespace: NamespaceId,
+        writers: Option<BTreeSet<AuthorId>>,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::SetAllowedWriters { reply, writers };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
+    pub async fn get_allowed_writers(
+        &self,
+        namespace: NamespaceId,
+    ) -> Result<Option<BTreeSet<AuthorId>>> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::GetAllowedWriters { reply };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
     pub async fn content_hashes(&self) -> Result<ContentHashesIterator> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ContentHashes { reply }).await?;
@@ -999,6 +1032,17 @@ impl Actor {
             }
             ReplicaAction::GetDownloadPolicy { reply } => {
                 send_reply(reply, self.store.get_download_policy(&namespace))
+            }
+            ReplicaAction::SetAllowedWriters { writers, reply } => {
+                // An access-control change is committed before it is acknowledged.
+                let res = self
+                    .store
+                    .set_allowed_writers(&namespace, writers)
+                    .and_then(|()| self.store.flush());
+                send_reply(reply, res)
+            }
+            ReplicaAction::GetAllowedWriters { reply } => {
+                send_reply(reply, self.store.get_allowed_writers(&namespace))
             }
         }
     }
