@@ -72,6 +72,14 @@ pub type Nanos = u64;
 pub const DOWNLOAD_POLICY_TABLE: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("download-policy-1");
 
+/// Table: Writer allowlist
+/// Key:   `[u8; 32]`        # NamespaceId
+/// Value: `Vec<u8>`         # Postcard encoded `BTreeSet<AuthorId>` of the authors allowed to write
+///
+/// A namespace without a row accepts entries from any author.
+pub const WRITER_ALLOWLIST_TABLE: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("writer-allowlist-1");
+
 self_cell::self_cell! {
     struct TransactionAndTablesInner {
         owner: WriteTransaction,
@@ -120,6 +128,7 @@ pub struct Tables<'tx> {
     #[debug("MultimapTable")]
     pub namespace_peers: MultimapTable<'tx, &'static [u8; 32], (Nanos, &'static PeerIdBytes)>,
     pub download_policy: Table<'tx, &'static [u8; 32], &'static [u8]>,
+    pub writer_allowlist: Table<'tx, &'static [u8; 32], &'static [u8]>,
     pub authors: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
 }
 
@@ -131,6 +140,7 @@ impl<'tx> Tables<'tx> {
         let latest_per_author = tx.open_table(LATEST_PER_AUTHOR_TABLE)?;
         let namespace_peers = tx.open_multimap_table(NAMESPACE_PEERS_TABLE)?;
         let download_policy = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
+        let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         Ok(Self {
             records,
@@ -139,6 +149,7 @@ impl<'tx> Tables<'tx> {
             latest_per_author,
             namespace_peers,
             download_policy,
+            writer_allowlist,
             authors,
         })
     }
@@ -153,6 +164,7 @@ pub struct ReadOnlyTables {
     #[debug("namespace_peers")]
     pub namespace_peers: ReadOnlyMultimapTable<&'static [u8; 32], (Nanos, &'static PeerIdBytes)>,
     pub download_policy: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
+    pub writer_allowlist: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
     pub authors: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
     tx: ReadTransaction,
 }
@@ -165,6 +177,7 @@ impl ReadOnlyTables {
         let latest_per_author = tx.open_table(LATEST_PER_AUTHOR_TABLE)?;
         let namespace_peers = tx.open_multimap_table(NAMESPACE_PEERS_TABLE)?;
         let download_policy = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
+        let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         Ok(Self {
             records,
@@ -173,6 +186,7 @@ impl ReadOnlyTables {
             latest_per_author,
             namespace_peers,
             download_policy,
+            writer_allowlist,
             authors,
             tx,
         })

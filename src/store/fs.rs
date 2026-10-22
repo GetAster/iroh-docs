@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     iter::{Chain, Flatten},
     num::NonZeroU64,
     ops::Bound,
@@ -319,6 +319,20 @@ impl Store {
         namespace: NamespaceId,
         heads: &AuthorHeads,
     ) -> Result<Option<NonZeroU64>> {
+        // Heads of authors that may not write here are no news: their entries would be
+        // rejected, so they must not trigger a sync.
+        let filtered;
+        let heads = match self.get_allowed_writers(&namespace)? {
+            None => heads,
+            Some(allowed) => {
+                filtered = heads
+                    .iter()
+                    .filter(|(author, _)| allowed.contains(*author))
+                    .map(|(author, timestamp)| (*author, *timestamp))
+                    .collect::<AuthorHeads>();
+                &filtered
+            }
+        };
         let our_heads = {
             let latest = self.get_latest_for_each_author(namespace)?;
             let mut heads = AuthorHeads::default();
@@ -546,6 +560,7 @@ impl Store {
             tables.namespaces.remove(namespace.as_bytes())?;
             tables.namespace_peers.remove_all(namespace.as_bytes())?;
             tables.download_policy.remove(namespace.as_bytes())?;
+            tables.writer_allowlist.remove(namespace.as_bytes())?;
             Ok(())
         })
     }
@@ -723,6 +738,53 @@ impl Store {
             Some(value) => postcard::from_bytes(value.value())?,
         })
     }
+
+    /// Set or clear the authors allowed to write to a namespace.
+    ///
+    /// With `Some(writers)`, entries from any other author are rejected, both on local insert and
+    /// when received from a peer; an empty set rejects every entry. `None` removes the restriction,
+    /// which is the default for a namespace. Entries stored before the call are kept.
+    ///
+    /// The setting is local to this store and is not replicated. It is removed together with the
+    /// replica.
+    pub fn set_allowed_writers(
+        &mut self,
+        namespace: &NamespaceId,
+        writers: Option<BTreeSet<AuthorId>>,
+    ) -> Result<()> {
+        self.modify(|tables| {
+            let namespace = namespace.as_bytes();
+            anyhow::ensure!(
+                tables.namespaces.get(&namespace)?.is_some(),
+                "document not created"
+            );
+            match writers {
+                Some(writers) => {
+                    let value = postcard::to_stdvec(&writers)?;
+                    tables
+                        .writer_allowlist
+                        .insert(namespace, value.as_slice())?;
+                }
+                None => {
+                    tables.writer_allowlist.remove(namespace)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Get the authors allowed to write to a namespace, or `None` if any author may write.
+    pub fn get_allowed_writers(
+        &mut self,
+        namespace: &NamespaceId,
+    ) -> Result<Option<BTreeSet<AuthorId>>> {
+        let tables = self.tables()?;
+        let value = tables.writer_allowlist.get(namespace.as_bytes())?;
+        Ok(match value {
+            None => None,
+            Some(value) => Some(postcard::from_bytes(value.value())?),
+        })
+    }
 }
 
 impl PublicKeyStore for Store {
@@ -759,6 +821,13 @@ pub struct StoreInstance<'a> {
 impl<'a> StoreInstance<'a> {
     pub(crate) fn new(namespace: NamespaceId, store: &'a mut Store) -> Self {
         StoreInstance { namespace, store }
+    }
+}
+
+impl StoreInstance<'_> {
+    /// The authors allowed to write to this namespace, or `None` if any author may write.
+    pub(crate) fn allowed_writers(&mut self) -> Result<Option<BTreeSet<AuthorId>>> {
+        self.store.get_allowed_writers(&self.namespace)
     }
 }
 
