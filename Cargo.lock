@@ -1822,8 +1822,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.11"
-source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=6f6b41956a05a633753f6587658f043a5c644ab0#6f6b41956a05a633753f6587658f043a5c644ab0"
+version = "0.103.12"
+source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=5e1f4a6fe47c8c8728c9344e841ea841a0c4982c#5e1f4a6fe47c8c8728c9344e841ea841a0c4982c"
 dependencies = [
  "arrayvec",
  "bao-tree",
