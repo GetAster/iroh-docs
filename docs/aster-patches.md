@@ -15,7 +15,7 @@ This repository is Aster's fork of [n0-computer/iroh-docs](https://github.com/n0
 Historical and current tag schemes in this repository:
 
 - `aster-iroh-docs-v<version>`, for example `aster-iroh-docs-v0.99.0`, `aster-iroh-docs-v0.100.0`, `aster-iroh-docs-v0.101.7`.
-- `aster-iroh-docs-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-docs-v0.100.0-p1` (added the content-ready patch, row 10), `-v0.100.0-p2`, `-v0.101.0-p1`, `-v0.101.5-p1`, `-v0.101.5-p2` and `-v0.101.7-p1` (patch-block re-pins with no source change).
+- `aster-iroh-docs-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-docs-v0.100.0-p1` (added the content-ready patch, row 10), `-v0.100.0-p2`, `-v0.101.0-p1`, `-v0.101.5-p1`, `-v0.101.5-p2`, `-v0.101.7-p1` and `-v0.101.10-p1` (patch-block re-pins with no source change).
 
 ## Current release
 
@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.10` |
-| Pinned commit | `27b970589917c4b341514d7047646d810a4a5cb0` |
+| Tag | `aster-iroh-docs-v0.101.10-p1` (pending: created once the Aster consumer trial passes on this commit) |
+| Pinned commit | `03c44cd4a1c5ae1fccca557da0e2f942440731b1` |
 | Crate version | 0.101.10 (workspace spec `iroh-docs = "0.101.10"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
-The fork's own `[patch.crates-io]` (row 9, re-pinned in 0.101.7-p1) pins iroh `261ad623` (1.4.0), noq `535bd884` (1.4.0), iroh-blobs `1ec44e44` (0.103.11, `upgrade/iroh-blobs-v0.103.1`), iroh-gossip `5fde770e` (`aster-iroh-gossip-v0.101.1-p2`) and iroh-util `a90ea88d` (`aster-iroh-util-v0.6.3-p2`), all matching the manifest; the gossip and util lag noted at 0.101.7 is closed.
+The fork's own `[patch.crates-io]` (row 9, re-pinned in 0.101.10-p1) pins iroh `41ec78b1` (1.4.0, `aster-iroh-v1.4.0-p1`), noq `13dcb5b7` (1.4.1, `aster-noq-v1.4.1`), iroh-blobs `5e1f4a6f` (0.103.12, `aster-iroh-blobs-v0.103.12`), iroh-gossip `a45ab096` (`aster-iroh-gossip-v0.101.1-p3`) and iroh-util `8c7947b6` (`aster-iroh-util-v0.6.3-p3`), all matching the manifest. Those tags, like this fork's, are created after the Aster consumer trial.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "ebb13bc349045e53ec9a3c084863bdced71f8054" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "03c44cd4a1c5ae1fccca557da0e2f942440731b1" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -46,7 +46,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 
 | Id | Topic branch | What | Why / what in Aster depends on it | Commits (topic / upgrade) | Status | Conflict or porting notes |
 |---|---|---|---|---|---|---|
-| 9 | none recorded (original commit `81f3461`) | `[patch.crates-io]` block pointing the iroh/noq crates (and since 0.101.5-p2 also iroh-blobs, iroh-gossip, iroh-util) at the Aster forks. File: `Cargo.toml`. | Keeps the docs sync tests and standalone builds on the same endpoint/base/noq fork stack as Aster. | `81f3461` (original); rc.1 copy `7efdff0`; re-pinned since (see History), latest `ebb13bc3` (0.101.7-p1) | carried | Low conflict risk. Pin explicit fork revs or tags; drop stale `pre.6` wording. |
+| 9 | none recorded (original commit `81f3461`) | `[patch.crates-io]` block pointing the iroh/noq crates (and since 0.101.5-p2 also iroh-blobs, iroh-gossip, iroh-util) at the Aster forks. File: `Cargo.toml`. | Keeps the docs sync tests and standalone builds on the same endpoint/base/noq fork stack as Aster. | `81f3461` (original); rc.1 copy `7efdff0`; re-pinned since (see History), latest `c5dda393` and `03c44cd4` (0.101.10-p1) | carried | Low conflict risk. Pin explicit fork revs or tags; drop stale `pre.6` wording. |
 | 10 | none recorded | Emits `ContentReady` immediately when `start_download` sees `BlobStatus::Complete`, instead of silently returning. Files: `src/engine/live.rs`, `tests/sync.rs`. | portal-sync waits for `LiveEvent::ContentReady` to mark remotely advertised CAS content usable/retryable, even when the blob was preloaded through another path. | `4ae3eaf` (released in `aster-iroh-docs-v0.100.0-p1`) | carried | Medium conflict risk around `LiveActor::start_download`, `on_download_ready` and content-ready propagation. Preserve the regression: the receiver preloads the blob, imports the doc, receives `InsertRemote { content_status: Complete }`, and still gets an explicit `ContentReady` (`sync_emits_content_ready_for_already_local_content`). |
 | 11 | `fix/sync-redrive-missing-content-after-resync` | After a successful sync round, scans local doc entries matching the download policy and re-queues missing content downloads from the synced peer before emitting `PendingContentReady`. Files: `src/engine/live.rs`, `tests/sync.rs`. | portal-sync recovers from "entry replicated, content blob missing" after a peer reconnects or stabilises; repeated `start_sync` calls fetch content that was unavailable at the original insert. | `2c8ab9b` | carried | Medium conflict risk around `LiveActor::on_sync_finished`, `start_download` and `PendingContentReady` ordering. Preserve the regression: an entry arrives with `ContentStatus::Missing`, the provider later stores the blob, a re-sync receives no new entries, and the receiver still gets `ContentReady` plus the blob (`sync_redrives_known_missing_content_after_resync`; see row 20). |
 | 12 | `fix/large-namespace-initial-sync` (tip `14107686520394f1df0ffe08cb45c9ec7a229221`) | Adds a collected `Doc::get_many_vec` query path and protocol request, avoiding the streaming query channel drain path for large full-namespace snapshots. Files: `src/actor.rs`, `src/api.rs`, `src/api/actor.rs`, `src/api/protocol.rs`, `tests/sync.rs`. | Aster core uses `Doc::get_many_vec` for `query_key_exact`, `query_latest_exact`, `query_key_prefix` and `query_latest_prefix`; portal-sync uses those during Tree snapshots. | `e1f9340` | carried | Medium conflict risk around the docs query RPC plumbing. Preserve the large read-import, peer-initiated sync regression where a namespace with many content-bearing entries can be queried to completion after sync. |
@@ -162,7 +162,17 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 1.4.0 wave (2026-10-21), current
+### Native wave (2026-10-22), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.10-p1` (pending) | `03c44cd4a1c5ae1fccca557da0e2f942440731b1` | `upgrade/iroh-docs-v0.101` |
+
+- No upstream iroh-docs release and no source change; the crate stays 0.101.10 and is not republished. The wave moves noq to 1.4.1 (BBRv3 probe fixes and BBRv3 as the default controller, receive-buffer compaction, a non-zero pacing delay), iroh-blobs to 0.103.12 (the downloader's stall clock stops while an attempt waits on local work), and Salvo to 1.0.6 on the Noq backend; this fork only re-pins.
+- **2026-10-22, 0.101.10-p1** (`03c44cd4`, tag `aster-iroh-docs-v0.101.10-p1` after the consumer trial): re-pin only (row 9), in two commits. `c5dda393` moves iroh, iroh-base and iroh-relay `261ad623` → `41ec78b1` (1.4.0-p1); noq, noq-udp and noq-proto `535bd884` → `13dcb5b7` (1.4.1); iroh-blobs `1ec44e44` → `6f6b4195` (0.103.11 re-pin); iroh-gossip `5fde770e` → `a45ab096` (0.101.1-p3); iroh-util `a90ea88d` → `8c7947b6` (0.6.3-p3). `03c44cd4` then moves iroh-blobs to `5e1f4a6f` (0.103.12). Each touches only Cargo.toml's `[patch.crates-io]` and Cargo.lock. Validation on each commit: `cargo test --locked --all-features` 132 passed, 4 ignored (lib 94, client 5, durable_set_crash 1, gc 1, sync 27, tiebreak 1, wedge 1, writer_allowlist 1, doc 1); `tests/sync.rs` 27/27 on five further runs at `c5dda393`; clippy `--all-features --all-targets -D warnings` and fmt clean. Aster consumer trial on branch `wt/native-wave`: `aster_transport_core` 458 passed; `aster` with `rpc,binding-support,otel,health,expose` 628 passed, 8 ignored (the `it` binary 379, including the blob, docs and expose modules); `connect_*` and `expose_*` targets 49 of 50 (one timing failure in `connect_gates`, 0 in 30 reruns); `aster-expose` 55; `aster-transport-salvo` 34; `aster_transport_ffi` 342; workspace clippy `-D warnings`, fmt and cargo-deny clean.
+- The bootstrap pin line above had drifted (it still named `ebb13bc3`, 0.101.7-p1); it now names this commit.
+
+### 1.4.0 wave (2026-10-21)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
