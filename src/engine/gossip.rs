@@ -102,8 +102,13 @@ impl GossipState {
         self.gossip.max_message_size()
     }
 
+    /// Whether no receive loop is left for [`progress`](Self::progress) to
+    /// wait on. The live actor polls `progress` only while this is false,
+    /// so it must describe the task set: an `active` entry without a task
+    /// made `progress` return at once on every turn of the actor's loop,
+    /// which then spun without yielding.
     pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
+        self.active_tasks.is_empty()
     }
 
     /// Progress the internal task queues.
@@ -116,7 +121,14 @@ impl GossipState {
     pub async fn progress(&mut self) -> Result<()> {
         while let Some(res) = self.active_tasks.join_next().await {
             match res {
-                Err(err) if err.is_cancelled() => continue,
+                // `quit` aborts a loop after removing its namespace; one
+                // cancelled otherwise (its runtime shutting down) still has
+                // an entry, which would stop a later `join` from starting
+                // a new loop.
+                Err(err) if err.is_cancelled() => {
+                    let id = err.id();
+                    self.active.retain(|_, state| state.abort_handle.id() != id);
+                }
                 Err(err) => return Err(err).context("gossip receive loop panicked"),
                 Ok((namespace, res)) => {
                     self.active.remove(&namespace);
@@ -203,4 +215,43 @@ async fn receive_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use iroh::{endpoint::presets, Endpoint};
+
+    use super::*;
+
+    /// A receive loop cancelled other than by `quit` (as a shutting-down
+    /// runtime cancels it) leaves nothing for `progress` to wait on, and the
+    /// namespace can be joined again. Before, its `active` entry stayed:
+    /// `is_empty` was false while the task set was empty, so the live
+    /// actor's `progress` branch completed at once on every iteration and
+    /// its loop spun inside one poll, blocking the runtime's shutdown
+    /// (seen in Aster's FFI `gateway_identity` test).
+    #[tokio::test]
+    async fn a_cancelled_receive_loop_leaves_nothing_to_wait_on() -> Result<()> {
+        let endpoint = Endpoint::bind(presets::Minimal).await?;
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let sync = SyncHandle::spawn(crate::store::Store::memory(), None, "test".to_string());
+        let (tx, _rx) = mpsc::channel(8);
+        let mut state = GossipState::new(gossip, sync, tx);
+        let namespace = NamespaceId::from(&[7u8; 32]);
+        state.join(namespace, vec![]).await?;
+        assert!(!state.is_empty());
+
+        state.active[&namespace].abort_handle.abort();
+        tokio::time::timeout(Duration::from_secs(10), state.progress()).await??;
+        assert!(state.is_empty());
+        assert!(!state.active.contains_key(&namespace));
+
+        state.join(namespace, vec![]).await?;
+        assert!(!state.is_empty());
+        state.shutdown().await?;
+        endpoint.close().await;
+        Ok(())
+    }
 }
