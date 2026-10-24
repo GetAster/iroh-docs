@@ -19,7 +19,7 @@ use iroh_blobs::{
 use iroh_gossip::net::Gossip;
 use n0_future::{
     task::{Id as TaskId, JoinError, JoinSet},
-    time::SystemTime,
+    time::{Duration, SystemTime},
     FutureExt,
 };
 use serde::{Deserialize, Serialize};
@@ -656,7 +656,9 @@ impl LiveActor {
         //
         // That reset is all it is. Losing the simultaneous-dial tie-break is
         // designed behaviour, not a failed sync: the reciprocal exchange does
-        // the work and reports it. Emitting `SyncFinished(Err)` and a
+        // the work and reports it (and an exchange that completes is always
+        // reported by `on_sync_finished`, even if the abort or an accept took
+        // its state slot over meanwhile). Emitting `SyncFinished(Err)` and a
         // `PendingContentReady` for it was noise to every subscriber, and the
         // success paths (peer registration, report broadcast, redrive) do not
         // apply. Real errors still go through `on_sync_finished`.
@@ -757,8 +759,35 @@ impl LiveActor {
             Err(err) => Err(err.to_string()),
         };
 
-        let Some((started, resync)) = self.state.finish(&namespace, peer, &origin, result) else {
-            return;
+        // How long the exchange took, for the start time of a displaced success below.
+        let elapsed = match &result {
+            Ok(details) => details.timings.connect + details.timings.process,
+            Err(_) => Duration::ZERO,
+        };
+
+        // Who owns the (namespace, peer) slot decides only the bookkeeping: whether the slot
+        // goes back to idle and whether a queued resync runs. It never decides whether a
+        // completed exchange is reported. `PeerState::finish` is origin-conditional (row 22), so
+        // it returns `None` when the slot is idle or belongs to a different origin, as when an
+        // accept took over a running connect and finished first, or a later connect was
+        // rejected and reset the slot (row 39) while this one was still running. The exchange
+        // itself ran to completion regardless: its entries are in the replica and its content
+        // hashes are queued. Dropping its `SyncFinished` left waiters hanging, so a success is
+        // reported with its real origin and result and the slot is left alone (the live owner's
+        // own finish resets it, and no resync runs on its behalf).
+        // A failed displaced exchange stays unreported: it carries no work, and a stale abort
+        // must not look like a result for the exchange that owns the slot.
+        let (started, resync) = match self.state.finish(&namespace, peer, &origin, result) {
+            Some(finished) => finished,
+            None if result_for_event.is_ok() => {
+                debug!(
+                    ?origin,
+                    "completed sync no longer owns its state; reporting it anyway"
+                );
+                let now = SystemTime::now();
+                (now.checked_sub(elapsed).unwrap_or(now), false)
+            }
+            None => return,
         };
 
         let sync_succeeded = result_for_event.is_ok();
@@ -1679,7 +1708,10 @@ mod takeover_tests {
                 Err(ConnectError::RemoteAbort(AbortReason::AlreadySyncing)),
             )
             .await;
-        assert!(sync_origins(&rx).await.is_empty(), "tie-break loss is quiet");
+        assert!(
+            sync_origins(&rx).await.is_empty(),
+            "tie-break loss is quiet"
+        );
         // 4. connect B completes
         actor
             .on_sync_via_connect_finished(ns, peer, SyncReason::Resync, Ok(finished(ns, peer)))
