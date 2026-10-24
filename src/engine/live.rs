@@ -1585,3 +1585,136 @@ mod download_status_tests {
         assert_eq!(download_status(n1, hash, &pending, &running), NoProvider);
     }
 }
+
+/// A completed exchange is reported even when its state slot was taken over meanwhile.
+#[cfg(test)]
+mod takeover_tests {
+    use iroh::{endpoint::presets, SecretKey};
+
+    use super::*;
+    use crate::sync::SyncOutcome;
+
+    async fn actor() -> Result<(LiveActor, Endpoint)> {
+        let endpoint = Endpoint::bind(presets::Minimal).await?;
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let blobs = iroh_blobs::store::mem::MemStore::new();
+        let downloader = blobs.downloader(&endpoint);
+        let sync = SyncHandle::spawn(crate::store::Store::memory(), None, "test".to_string());
+        let (tx, rx) = mpsc::channel(8);
+        let actor = LiveActor::new(
+            sync,
+            endpoint.clone(),
+            gossip,
+            (*blobs).clone(),
+            downloader,
+            rx,
+            tx,
+            Default::default(),
+        )?;
+        Ok((actor, endpoint))
+    }
+
+    fn finished(namespace: NamespaceId, peer: PublicKey) -> SyncFinished {
+        SyncFinished {
+            namespace,
+            peer,
+            outcome: SyncOutcome::default(),
+            timings: Default::default(),
+        }
+    }
+
+    async fn sync_origins(rx: &async_channel::Receiver<Event>) -> Vec<(Origin, bool)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::SyncFinished(ev) = ev {
+                out.push((ev.origin, ev.result.is_ok()));
+            }
+        }
+        out
+    }
+
+    /// Row 42. Sequence from the Aster `revoke_reaches_a_direct_only_server...` failure:
+    /// 1. our connect B (`Resync`) to P is running;
+    /// 2. P's incoming accept takes over the (namespace, P) slot and finishes: Idle, B still running;
+    /// 3. a new connect A (`DirectJoin`) to P is rejected with `AlreadySyncing`: quiet reset;
+    /// 4. B completes successfully. Its `SyncFinished` must reach subscribers (it used to be
+    ///    dropped with "sync state finish called but not in running state"), and A's
+    ///    quiet reset must not have been reported.
+    #[tokio::test]
+    async fn a_completed_connect_is_reported_after_its_slot_was_taken_over() -> Result<()> {
+        let (mut actor, endpoint) = actor().await?;
+        let me = endpoint.id();
+        // The accept only takes over a running connect when `me` has the higher id.
+        let peer = (1u8..)
+            .map(|i| SecretKey::from_bytes(&[i; 32]).public())
+            .find(|p| p.as_bytes() < me.as_bytes())
+            .unwrap();
+        let ns = NamespaceId::from(&[9u8; 32]);
+        let (tx, rx) = async_channel::unbounded();
+        actor.subscribers.subscribe(ns, tx);
+        actor.state.insert(ns);
+
+        // 1. connect B is running
+        assert!(actor.state.start_connect(&ns, peer, SyncReason::Resync));
+        // 2. an accept from the peer takes over the slot and finishes
+        assert!(matches!(
+            actor.state.accept_request(&me, &ns, peer),
+            crate::net::AcceptOutcome::Allow
+        ));
+        actor
+            .on_sync_via_accept_finished(Ok(finished(ns, peer)))
+            .await;
+        assert_eq!(
+            sync_origins(&rx).await,
+            vec![(Origin::Accept, true)],
+            "the accept is reported"
+        );
+        // 3. connect A starts and loses the tie-break
+        assert!(actor.state.start_connect(&ns, peer, SyncReason::DirectJoin));
+        actor
+            .on_sync_via_connect_finished(
+                ns,
+                peer,
+                SyncReason::DirectJoin,
+                Err(ConnectError::RemoteAbort(AbortReason::AlreadySyncing)),
+            )
+            .await;
+        assert!(sync_origins(&rx).await.is_empty(), "tie-break loss is quiet");
+        // 4. connect B completes
+        actor
+            .on_sync_via_connect_finished(ns, peer, SyncReason::Resync, Ok(finished(ns, peer)))
+            .await;
+        assert_eq!(
+            sync_origins(&rx).await,
+            vec![(Origin::Connect(SyncReason::Resync), true)],
+            "the completed connect must be reported"
+        );
+        Ok(())
+    }
+
+    /// Row 22 still holds: a completed exchange of another origin is reported but does not
+    /// reset a live exchange that owns the slot.
+    #[tokio::test]
+    async fn a_reported_displaced_exchange_leaves_the_live_one_running() -> Result<()> {
+        let (mut actor, _endpoint) = actor().await?;
+        let peer = SecretKey::from_bytes(&[3u8; 32]).public();
+        let ns = NamespaceId::from(&[9u8; 32]);
+        let (tx, rx) = async_channel::unbounded();
+        actor.subscribers.subscribe(ns, tx);
+        actor.state.insert(ns);
+        // A (`DirectJoin`) owns the slot; displaced B (`Resync`) completes.
+        assert!(actor.state.start_connect(&ns, peer, SyncReason::DirectJoin));
+        actor
+            .on_sync_via_connect_finished(ns, peer, SyncReason::Resync, Ok(finished(ns, peer)))
+            .await;
+        assert_eq!(
+            sync_origins(&rx).await,
+            vec![(Origin::Connect(SyncReason::Resync), true)]
+        );
+        assert!(
+            !actor.state.start_connect(&ns, peer, SyncReason::Resync),
+            "connect A must still own the slot"
+        );
+        Ok(())
+    }
+}
