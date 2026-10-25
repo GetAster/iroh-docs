@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1012-p1` |
-| Pinned commit | `d7a10818dc200c48324f64e0a2fe57b277a56b16` |
+| Tag | `aster-iroh-docs-v0.101.1012-p2` |
+| Pinned commit | `35226e6eb680a65e0c588254cc53a885d9c0bb48` |
 | Crate version | 0.101.1012 (workspace spec `iroh-docs = "0.101.1012"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
-The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.10-p2) pins iroh `68b684ea` (1.4.1, `aster-iroh-v1.4.1`), noq `a3c70b7a` (1.4.2, `aster-noq-v1.4.2`), iroh-blobs `7a860e0a` (0.103.12, `aster-iroh-blobs-v0.103.12-p2`), iroh-gossip `aebdf023` (`aster-iroh-gossip-v0.101.1-p5`) and iroh-util `c9b91fce` (`aster-iroh-util-v0.6.3-p4`).
+The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.10-p2) pins iroh `0739c259` (1.4.2001, `aster-iroh-v1.4.2001`), noq `a3c70b7a` (1.4.2, `aster-noq-v1.4.2`), iroh-blobs `cb866dae` (0.103.12, `aster-iroh-blobs-v0.103.12-p3`), iroh-gossip `19b4bfbf` (`aster-iroh-gossip-v0.101.1-p6`) and iroh-util `c9b91fce` (`aster-iroh-util-v0.6.3-p4`).
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "d7a10818dc200c48324f64e0a2fe57b277a56b16" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "35226e6eb680a65e0c588254cc53a885d9c0bb48" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -164,12 +164,14 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### iroh 1.4.1 re-pin (2026-10-25), current
+### iroh 1.4.2001 re-pin (2026-10-25), current
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.101.0` | `aster-iroh-docs-v0.101.1012-p1` | `d7a10818dc200c48324f64e0a2fe57b277a56b16` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1012-p2` | `35226e6eb680a65e0c588254cc53a885d9c0bb48` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1012-p1` (pinned the superseded iroh 1.4.1, never published) | `d7a10818dc200c48324f64e0a2fe57b277a56b16` | `upgrade/iroh-docs-v0.101` |
 
+- **`aster-iroh-docs-v0.101.1012-p2`** (`35226e6e`): re-pin only, to iroh `0739c259` (`aster-iroh-v1.4.2001`), the same iroh source as `aster-iroh-docs-v0.101.1012-p1` published under the fork version rule; the iroh 1.4.1 commit `aster-iroh-docs-v0.101.1012-p1` pinned was tagged but never published. Suite re-run at the new commit, all passed.
 - **`aster-iroh-docs-v0.101.1012-p1`** (`d7a10818`): re-pin only, to iroh `68b684ea` (`aster-iroh-v1.4.1`: the port onto upstream 1.4.1 and row 44, the net report no longer waiting 3 s on an IPv6 path that drops UDP), and its re-pinned siblings. Only Cargo.toml's `[patch.crates-io]` and Cargo.lock change; the crate is not republished. Validation: `cargo test --locked --all-features`, lib 97 passed, integration and doc tests all passed.
 
 ### 0.101.1012 (2026-10-24)
