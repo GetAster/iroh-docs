@@ -970,6 +970,13 @@ impl LiveActor {
                         self.queue_download(namespace, hash, node_id, false);
                     } else {
                         self.missing_hashes.insert(hash, namespace);
+                        // A neighbor's `ContentReady` for this hash may have
+                        // been handled before this entry, while the hash was
+                        // not missing yet, and ignored. Ask the neighbors
+                        // known to have it.
+                        for node in self.known_providers(hash) {
+                            self.queue_download(namespace, hash, node, true);
+                        }
                     }
                 }
             }
@@ -1100,6 +1107,14 @@ impl LiveActor {
             );
         }
         statuses
+    }
+
+    fn known_providers(&self, hash: Hash) -> Vec<EndpointId> {
+        let providers = self.hash_providers.0.lock().expect("poisoned");
+        providers
+            .get(&hash)
+            .map(|nodes| nodes.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     fn record_hash_providers(&mut self, hash: Hash, candidates: &[DownloadCandidate]) {
@@ -1563,6 +1578,47 @@ mod task_failure_tests {
     }
 }
 
+/// A neighbor's `ContentReady` can be handled before the entry it announces:
+/// the actor's inbox outranks its replica events, and under load the gossip
+/// loop's `insert_remote` reaches the replica-event queue behind it.
+#[cfg(test)]
+mod content_ready_order_tests {
+    use iroh::SecretKey;
+
+    use super::*;
+    use crate::{Author, NamespaceSecret, Record};
+
+    #[tokio::test]
+    async fn content_ready_handled_before_its_entry_still_downloads() -> Result<()> {
+        let (mut actor, _endpoint) = super::takeover_tests::actor().await?;
+        let namespace = NamespaceSecret::from_bytes(&[5; 32]);
+        let ns = namespace.id();
+        let author = Author::from_bytes(&[6; 32]);
+        let neighbor = SecretKey::from_bytes(&[7; 32]).public();
+        let hash = Hash::new(b"relayed content");
+        let entry = SignedEntry::from_parts(&namespace, &author, b"key", Record::new(hash, 15, 1));
+
+        // The entry was relayed, so its content is missing until a neighbor
+        // announces it; the announcement arrives first.
+        actor.on_neighbor_content_ready(ns, neighbor, hash).await;
+        actor
+            .on_replica_events(crate::Event::RemoteInsert {
+                namespace: ns,
+                entry,
+                from: *neighbor.as_bytes(),
+                should_download: true,
+                remote_content_status: ContentStatus::Missing,
+            })
+            .await;
+        assert_eq!(
+            actor.download_status(ns, hash),
+            super::super::DownloadStatus::Downloading,
+            "the announcing neighbor must be asked for the content"
+        );
+        Ok(())
+    }
+}
+
 fn download_status(
     namespace: NamespaceId,
     hash: Hash,
@@ -1623,7 +1679,7 @@ mod takeover_tests {
     use super::*;
     use crate::sync::SyncOutcome;
 
-    async fn actor() -> Result<(LiveActor, Endpoint)> {
+    pub(super) async fn actor() -> Result<(LiveActor, Endpoint)> {
         let endpoint = Endpoint::bind(presets::Minimal).await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let blobs = iroh_blobs::store::mem::MemStore::new();
