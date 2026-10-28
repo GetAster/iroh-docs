@@ -56,7 +56,9 @@ pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_
 /// One clock must stamp every local entry of an (author, key), since the later timestamp wins.
 pub trait Clock: Send + Sync + 'static {
     /// Timestamp for a new local record, in microseconds since the Unix epoch.
-    fn now(&self) -> u64;
+    ///
+    /// An error fails the local insert or delete that asked, and stores nothing.
+    fn now(&self) -> Result<u64, ClockUnavailable>;
 
     /// Called with the timestamp of each remote entry that passed signature checks.
     ///
@@ -65,13 +67,18 @@ pub trait Clock: Send + Sync + 'static {
     fn observe(&self, remote: u64) -> bool;
 }
 
+/// The clock cannot issue a timestamp, for example because it cannot persist its reservation.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("clock unavailable: {0}")]
+pub struct ClockUnavailable(pub String);
+
 /// The default [`Clock`]: system time, with the [`MAX_TIMESTAMP_FUTURE_SHIFT`] rule.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> u64 {
-        system_time_now()
+    fn now(&self) -> Result<u64, ClockUnavailable> {
+        Ok(system_time_now())
     }
 
     fn observe(&self, remote: u64) -> bool {
@@ -371,10 +378,10 @@ impl ReplicaInfo {
     }
 
     /// Timestamp for a new local record: the clock's, or system time.
-    fn local_timestamp(&self) -> u64 {
+    fn local_timestamp(&self) -> Result<u64, InsertError> {
         match &self.clock {
-            Some(clock) => clock.now(),
-            None => system_time_now(),
+            Some(clock) => Ok(clock.now()?),
+            None => Ok(system_time_now()),
         }
     }
 
@@ -441,7 +448,7 @@ where
         }
         self.info.ensure_open()?;
         let id = RecordIdentifier::new(self.id(), author.id(), key);
-        let record = Record::new(hash, len, self.info.local_timestamp());
+        let record = Record::new(hash, len, self.info.local_timestamp()?);
         let entry = Entry::new(id, record);
         let secret = self.secret_key()?;
         let signed_entry = entry.sign(secret, author);
@@ -461,7 +468,7 @@ where
     ) -> Result<usize, InsertError> {
         self.info.ensure_open()?;
         let id = RecordIdentifier::new(self.id(), author.id(), prefix);
-        let entry = Entry::new(id, Record::empty(self.info.local_timestamp()));
+        let entry = Entry::new(id, Record::empty(self.info.local_timestamp()?));
         let signed_entry = entry.sign(self.secret_key()?, author);
         self.insert_entry(signed_entry, InsertOrigin::Local).await
     }
@@ -678,6 +685,8 @@ pub struct ReadOnly;
 /// * the entry's namespace matches the current replica
 /// * for remote entries, the configured [`Clock`] accepts the entry's timestamp; without a clock,
 ///   it is not more than 10 minutes in the future of our system time
+/// * local entries are not checked against the future limit when a clock is configured: the clock
+///   stamped them, and a clock may run ahead of system time
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
@@ -697,9 +706,11 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
         return Err(ValidationFailure::BadSignature);
     }
 
-    // A configured clock owns the acceptance rule for remote timestamps.
-    if let (Some(clock), false) = (clock, matches!(origin, InsertOrigin::Local)) {
-        if !clock.observe(entry.timestamp()) {
+    // A configured clock owns the timestamp rules. It screens remote entries; local entries
+    // carry its own timestamps, which can legitimately lead system time (after a backward step
+    // of the wall clock, for one).
+    if let Some(clock) = clock {
+        if !matches!(origin, InsertOrigin::Local) && !clock.observe(entry.timestamp()) {
             return Err(ValidationFailure::TooFarInTheFuture);
         }
         return Ok(());
@@ -734,6 +745,9 @@ pub enum InsertError {
     /// The replica is closed, no operations may be performed.
     #[error("replica is closed")]
     Closed,
+    /// The configured [`Clock`] could not issue a timestamp.
+    #[error(transparent)]
+    Clock(#[from] ClockUnavailable),
 }
 
 /// Reason why verifying a [`SignedEntry`] failed.
@@ -1816,11 +1830,15 @@ mod tests {
         now: std::sync::atomic::AtomicU64,
         limit: std::sync::atomic::AtomicU64,
         observed: std::sync::Mutex<Vec<u64>>,
+        failing: std::sync::atomic::AtomicBool,
     }
 
     impl Clock for TestClock {
-        fn now(&self) -> u64 {
-            self.now.load(std::sync::atomic::Ordering::SeqCst)
+        fn now(&self) -> Result<u64, ClockUnavailable> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ClockUnavailable("test clock is failing".into()));
+            }
+            Ok(self.now.load(std::sync::atomic::Ordering::SeqCst))
         }
 
         fn observe(&self, remote: u64) -> bool {
@@ -1905,6 +1923,72 @@ mod tests {
             get_content_hash(&mut bob_store, namespace.id(), author.id(), b"late")?,
             Some(late)
         );
+        Ok(())
+    }
+
+    /// A clock far ahead of system time stamps local inserts and deletes, which must succeed;
+    /// without a clock the future limit still applies to them.
+    #[tokio::test]
+    async fn test_local_entries_skip_future_limit_with_clock() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ahead = system_time_now() + 2 * MAX_TIMESTAMP_FUTURE_SHIFT;
+
+        let clock = Arc::new(TestClock::default());
+        clock.now.store(ahead, SeqCst);
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica.info.set_clock(clock.clone());
+        replica.hash_and_insert(b"key", &author, b"one").await?;
+        clock.now.store(ahead + 1, SeqCst);
+        replica.delete_prefix(b"key", &author).await?;
+        let e = get_entry(&mut store, namespace.id(), author.id(), b"key")?;
+        assert_eq!(e.timestamp(), ahead + 1);
+
+        // The same local entry with no clock configured is refused.
+        let mut replica = store.new_replica(namespace.clone())?;
+        let entry = SignedEntry::from_parts(
+            &namespace,
+            &author,
+            b"other",
+            Record::from_data(b"1", ahead),
+        );
+        let res = replica.insert_entry(entry, InsertOrigin::Local).await;
+        assert!(matches!(
+            res,
+            Err(InsertError::Validation(
+                ValidationFailure::TooFarInTheFuture
+            ))
+        ));
+        Ok(())
+    }
+
+    /// A clock that cannot issue a timestamp fails the local write and stores nothing.
+    #[tokio::test]
+    async fn test_unavailable_clock_fails_local_writes() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let clock = Arc::new(TestClock::default());
+        clock.now.store(system_time_now(), SeqCst);
+        clock.failing.store(true, SeqCst);
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica.info.set_clock(clock.clone());
+
+        let res = replica.hash_and_insert(b"key", &author, b"one").await;
+        assert!(matches!(res, Err(InsertError::Clock(_))));
+        let res = replica.delete_prefix(b"key", &author).await;
+        assert!(matches!(res, Err(InsertError::Clock(_))));
+
+        // Recovery: the next write succeeds and is the first entry stored.
+        clock.failing.store(false, SeqCst);
+        replica.hash_and_insert(b"key", &author, b"one").await?;
+        drop(replica);
+        assert!(get_entry(&mut store, namespace.id(), author.id(), b"key").is_ok());
         Ok(())
     }
 
