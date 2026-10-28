@@ -47,6 +47,38 @@ pub type PeerIdBytes = [u8; 32];
 /// Value is 10 minutes.
 pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_micros() as u64;
 
+/// A timestamp source for local records and a check on remote ones.
+///
+/// Set once on the docs [`Builder`](crate::protocol::Builder) with `clock`. Without one,
+/// local records are stamped with system time and remote entries more than
+/// [`MAX_TIMESTAMP_FUTURE_SHIFT`] ahead of it are refused.
+///
+/// One clock must stamp every local entry of an (author, key), since the later timestamp wins.
+pub trait Clock: Send + Sync + 'static {
+    /// Timestamp for a new local record, in microseconds since the Unix epoch.
+    fn now(&self) -> u64;
+
+    /// Called with the timestamp of each remote entry that passed signature checks.
+    ///
+    /// Returning `false` refuses the entry: it is not stored, and sync continues with the
+    /// remaining entries. The sender offers it again on a later sync.
+    fn observe(&self, remote: u64) -> bool;
+}
+
+/// The default [`Clock`]: system time, with the [`MAX_TIMESTAMP_FUTURE_SHIFT`] rule.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> u64 {
+        system_time_now()
+    }
+
+    fn observe(&self, remote: u64) -> bool {
+        remote <= system_time_now().saturating_add(MAX_TIMESTAMP_FUTURE_SHIFT)
+    }
+}
+
 /// Callback that may be set on a replica to determine the availability status for a content hash.
 pub type ContentStatusCallback =
     Arc<dyn Fn(Hash) -> n0_future::boxed::BoxFuture<ContentStatus> + Send + Sync + 'static>;
@@ -277,6 +309,8 @@ pub struct ReplicaInfo {
     subscribers: Subscribers,
     #[debug("ContentStatusCallback")]
     content_status_cb: Option<ContentStatusCallback>,
+    #[debug("Clock")]
+    clock: Option<Arc<dyn Clock>>,
     closed: bool,
 }
 
@@ -288,6 +322,7 @@ impl ReplicaInfo {
             subscribers: Default::default(),
             // on_insert_sender: RwLock::new(None),
             content_status_cb: None,
+            clock: None,
             closed: false,
         }
     }
@@ -325,6 +360,21 @@ impl ReplicaInfo {
         } else {
             self.content_status_cb = Some(cb);
             true
+        }
+    }
+
+    /// Set the [`Clock`] that stamps local records and screens remote entries.
+    ///
+    /// Replaces any previously set clock.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = Some(clock);
+    }
+
+    /// Timestamp for a new local record: the clock's, or system time.
+    fn local_timestamp(&self) -> u64 {
+        match &self.clock {
+            Some(clock) => clock.now(),
+            None => system_time_now(),
         }
     }
 
@@ -391,7 +441,7 @@ where
         }
         self.info.ensure_open()?;
         let id = RecordIdentifier::new(self.id(), author.id(), key);
-        let record = Record::new_current(hash, len);
+        let record = Record::new(hash, len, self.info.local_timestamp());
         let entry = Entry::new(id, record);
         let secret = self.secret_key()?;
         let signed_entry = entry.sign(secret, author);
@@ -411,7 +461,7 @@ where
     ) -> Result<usize, InsertError> {
         self.info.ensure_open()?;
         let id = RecordIdentifier::new(self.id(), author.id(), prefix);
-        let entry = Entry::new_empty(id);
+        let entry = Entry::new(id, Record::empty(self.info.local_timestamp()));
         let signed_entry = entry.sign(self.secret_key()?, author);
         self.insert_entry(signed_entry, InsertOrigin::Local).await
     }
@@ -449,7 +499,14 @@ where
         let namespace = self.id();
 
         let store = &self.store;
-        validate_entry(system_time_now(), store, namespace, &entry, &origin)?;
+        validate_entry(
+            system_time_now(),
+            self.info.clock.as_deref(),
+            store,
+            namespace,
+            &entry,
+            &origin,
+        )?;
 
         let outcome = self.store.put(entry.clone()).map_err(InsertError::Store)?;
         tracing::debug!(?origin, hash = %entry.content_hash(), ?outcome, "insert");
@@ -525,6 +582,7 @@ where
         self.info.ensure_open()?;
         let my_namespace = self.id();
         let now = system_time_now();
+        let clock = self.info.clock.clone();
 
         // update state with incoming data.
         state.num_recv += message.value_count();
@@ -552,7 +610,8 @@ where
                         from: from_peer,
                         remote_content_status: content_status,
                     };
-                    validate_entry(now, store, my_namespace, entry, &origin).is_ok()
+                    validate_entry(now, clock.as_deref(), store, my_namespace, entry, &origin)
+                        .is_ok()
                 },
                 // on_insert callback: is called when an entry was actually inserted in the store
                 async |_store, entry, content_status| {
@@ -617,10 +676,12 @@ pub struct ReadOnly;
 /// This validates that
 /// * the entry's author and namespace signatures are correct
 /// * the entry's namespace matches the current replica
-/// * the entry's timestamp is not more than 10 minutes in the future of our system time
+/// * for remote entries, the configured [`Clock`] accepts the entry's timestamp; without a clock,
+///   it is not more than 10 minutes in the future of our system time
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
+    clock: Option<&dyn Clock>,
     store: &S,
     expected_namespace: NamespaceId,
     entry: &SignedEntry,
@@ -634,6 +695,14 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     // Verify signature for non-local entries.
     if !matches!(origin, InsertOrigin::Local) && entry.verify(store).is_err() {
         return Err(ValidationFailure::BadSignature);
+    }
+
+    // A configured clock owns the acceptance rule for remote timestamps.
+    if let (Some(clock), false) = (clock, matches!(origin, InsertOrigin::Local)) {
+        if !clock.observe(entry.timestamp()) {
+            return Err(ValidationFailure::TooFarInTheFuture);
+        }
+        return Ok(());
     }
 
     // Verify that the timestamp of the entry is not too far in the future.
@@ -1738,6 +1807,135 @@ mod tests {
         );
         alice_store.flush()?;
         bob_store.flush()?;
+        Ok(())
+    }
+
+    /// Test clock: fixed `now`, and remote timestamps up to `limit` are accepted.
+    #[derive(Debug, Default)]
+    struct TestClock {
+        now: std::sync::atomic::AtomicU64,
+        limit: std::sync::atomic::AtomicU64,
+        observed: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> u64 {
+            self.now.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn observe(&self, remote: u64) -> bool {
+            self.observed.lock().unwrap().push(remote);
+            remote <= self.limit.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clock_stamps_local_records() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let clock = Arc::new(TestClock::default());
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica.info.set_clock(clock.clone());
+
+        let base = system_time_now();
+        clock.now.store(base + 1111, SeqCst);
+        replica.hash_and_insert(b"key", &author, b"one").await?;
+        let e = get_entry(&mut store, namespace.id(), author.id(), b"key")?;
+        assert_eq!(e.timestamp(), base + 1111);
+
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica.info.set_clock(clock.clone());
+        clock.now.store(base + 2222, SeqCst);
+        replica.delete_prefix(b"key", &author).await?;
+        let e = get_entry(&mut store, namespace.id(), author.id(), b"key")?;
+        assert_eq!(e.timestamp(), base + 2222);
+        assert!(e.is_empty());
+        // Local inserts never consult observe().
+        assert!(clock.observed.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clock_observe_refuses_then_accepts_on_later_sync() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut alice_store = store::Store::memory();
+        let mut bob_store = store::Store::memory();
+
+        let base = system_time_now();
+        let alice_clock = Arc::new(TestClock::default());
+        let bob_clock = Arc::new(TestClock::default());
+        bob_clock.limit.store(base, SeqCst);
+
+        let mut alice = alice_store.new_replica(namespace.clone())?;
+        alice.info.set_clock(alice_clock.clone());
+        // Stamped within system time's own future window, so alice accepts it locally.
+        alice_clock.now.store(base + 1_000, SeqCst);
+        let late = alice.hash_and_insert(b"late", &author, b"late").await?;
+        alice_clock.now.store(base - 1_000, SeqCst);
+        let early = alice.hash_and_insert(b"early", &author, b"early").await?;
+
+        let mut bob = bob_store.new_replica(namespace.clone())?;
+        bob.info.set_clock(bob_clock.clone());
+        sync(&mut alice, &mut bob).await?;
+        // The refused entry is skipped, the other one still arrives.
+        assert_eq!(
+            get_content_hash(&mut bob_store, namespace.id(), author.id(), b"early")?,
+            Some(early)
+        );
+        assert_eq!(
+            get_content_hash(&mut bob_store, namespace.id(), author.id(), b"late")?,
+            None
+        );
+        assert!(bob_clock.observed.lock().unwrap().contains(&(base + 1_000)));
+
+        // Bob's clock catches up: the next sync offers the entry again.
+        bob_clock.limit.store(base + 1_000, SeqCst);
+        let mut alice = alice_store.new_replica(namespace.clone())?;
+        alice.info.set_clock(alice_clock.clone());
+        let mut bob = bob_store.new_replica(namespace.clone())?;
+        bob.info.set_clock(bob_clock.clone());
+        sync(&mut alice, &mut bob).await?;
+        assert_eq!(
+            get_content_hash(&mut bob_store, namespace.id(), author.id(), b"late")?,
+            Some(late)
+        );
+        Ok(())
+    }
+
+    /// Without a clock, the fixed future-shift rule decides, as before.
+    #[tokio::test]
+    async fn test_no_clock_keeps_future_shift_rule() -> Result<()> {
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut replica = store.new_replica(namespace.clone())?;
+        let record = Record::from_data(
+            b"1",
+            system_time_now() + MAX_TIMESTAMP_FUTURE_SHIFT + 10_000,
+        );
+        let entry = SignedEntry::from_parts(&namespace, &author, b"k", record);
+        let res = replica
+            .insert_entry(
+                entry,
+                InsertOrigin::Sync {
+                    from: [0u8; 32],
+                    remote_content_status: ContentStatus::Missing,
+                },
+            )
+            .await;
+        assert!(matches!(
+            res,
+            Err(InsertError::Validation(
+                ValidationFailure::TooFarInTheFuture
+            ))
+        ));
         Ok(())
     }
 

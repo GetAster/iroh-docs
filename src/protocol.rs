@@ -11,6 +11,7 @@ use crate::{
     api::DocsApi,
     engine::{DefaultAuthorStorage, Engine, ProtectCallbackHandler},
     store::Store,
+    Clock,
 };
 
 #[derive(Default, Debug)]
@@ -41,6 +42,7 @@ impl Docs {
         Builder {
             storage: Storage::Persistent(path),
             protect_cb: None,
+            clock: None,
         }
     }
 
@@ -82,10 +84,12 @@ impl ProtocolHandler for Docs {
 }
 
 /// Builder for the docs protocol.
-#[derive(Debug, Default)]
+#[derive(derive_more::Debug, Default)]
 pub struct Builder {
     storage: Storage,
     protect_cb: Option<ProtectCallbackHandler>,
+    #[debug("Clock")]
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl Builder {
@@ -94,6 +98,15 @@ impl Builder {
     /// See [`ProtectCallbackHandler::new`] for details.
     pub fn protect_handler(mut self, protect_handler: ProtectCallbackHandler) -> Self {
         self.protect_cb = Some(protect_handler);
+        self
+    }
+
+    /// Set the [`Clock`] that stamps local entries and screens remote ones.
+    ///
+    /// Without one, local entries use system time and remote entries more than ten minutes
+    /// ahead of it are refused.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
         self
     }
 
@@ -117,7 +130,7 @@ impl Builder {
             }
         };
         let downloader = blobs.downloader(&endpoint);
-        let engine = Engine::spawn(
+        let engine = Engine::spawn_with_clock(
             endpoint,
             gossip,
             replica_store,
@@ -125,6 +138,7 @@ impl Builder {
             downloader,
             author_store,
             self.protect_cb,
+            self.clock,
         )
         .await?;
         Ok(Docs::new(engine))
