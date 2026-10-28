@@ -28,7 +28,7 @@ use crate::{
         fs::{ContentHashesIterator, StoreInstance},
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
-    Author, AuthorHeads, AuthorId, Capability, ContentStatus, ContentStatusCallback, Event,
+    Author, AuthorHeads, AuthorId, Capability, Clock, ContentStatus, ContentStatusCallback, Event,
     NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, RetireWriteAuthorityOutcome,
     SignedEntry, SyncOutcome,
 };
@@ -292,6 +292,16 @@ impl SyncHandle {
         content_status_callback: Option<ContentStatusCallback>,
         me: String,
     ) -> SyncHandle {
+        Self::spawn_with_clock(store, content_status_callback, me, None)
+    }
+
+    /// Like [`Self::spawn`], with a [`Clock`] applied to every replica the actor opens.
+    pub fn spawn_with_clock(
+        store: Store,
+        content_status_callback: Option<ContentStatusCallback>,
+        me: String,
+        clock: Option<Arc<dyn Clock>>,
+    ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
         let actor = Actor {
@@ -299,6 +309,7 @@ impl SyncHandle {
             states: Default::default(),
             action_rx,
             content_status_callback,
+            clock,
             tasks: Default::default(),
             metrics: metrics.clone(),
         };
@@ -716,6 +727,7 @@ struct Actor {
     states: OpenReplicas,
     action_rx: async_channel::Receiver<Action>,
     content_status_callback: Option<ContentStatusCallback>,
+    clock: Option<Arc<dyn Clock>>,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
 }
@@ -1066,6 +1078,9 @@ impl Actor {
             let mut info = self.store.load_replica_info(&namespace)?;
             if let Some(cb) = &self.content_status_callback {
                 info.set_content_status_callback(Arc::clone(cb));
+            }
+            if let Some(clock) = &self.clock {
+                info.set_clock(Arc::clone(clock));
             }
             Ok(info)
         };

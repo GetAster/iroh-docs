@@ -38,8 +38,8 @@ pub use self::{
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, ContentStatus, ContentStatusCallback,
-    Entry, NamespaceId,
+    actor::SyncHandle, metrics::Metrics, Author, AuthorId, Clock, ContentStatus,
+    ContentStatusCallback, Entry, NamespaceId,
 };
 
 mod gossip;
@@ -82,6 +82,31 @@ impl Engine {
         default_author_storage: DefaultAuthorStorage,
         protect_cb: Option<ProtectCallbackHandler>,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_clock(
+            endpoint,
+            gossip,
+            replica_store,
+            bao_store,
+            downloader,
+            default_author_storage,
+            protect_cb,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::spawn`], with a [`Clock`] for local record timestamps and remote screening.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_clock(
+        endpoint: Endpoint,
+        gossip: Gossip,
+        replica_store: crate::store::Store,
+        bao_store: iroh_blobs::api::Store,
+        downloader: Downloader,
+        default_author_storage: DefaultAuthorStorage,
+        protect_cb: Option<ProtectCallbackHandler>,
+        clock: Option<Arc<dyn Clock>>,
+    ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
 
@@ -95,7 +120,12 @@ impl Engine {
                 })
             })
         };
-        let sync = SyncHandle::spawn(replica_store, Some(content_status_cb.clone()), me.clone());
+        let sync = SyncHandle::spawn_with_clock(
+            replica_store,
+            Some(content_status_cb.clone()),
+            me.clone(),
+            clock,
+        );
 
         let sync2 = sync.clone();
         let gc_protect_task = AbortOnDropHandle::new(n0_future::task::spawn(async move {
