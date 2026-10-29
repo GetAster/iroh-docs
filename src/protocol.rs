@@ -1,6 +1,6 @@
 //! [`ProtocolHandler`] implementation for the docs [`Engine`].
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint};
@@ -43,6 +43,7 @@ impl Docs {
             storage: Storage::Persistent(path),
             protect_cb: None,
             clock: None,
+            sync_inactivity_timeout: None,
         }
     }
 
@@ -90,6 +91,7 @@ pub struct Builder {
     protect_cb: Option<ProtectCallbackHandler>,
     #[debug("Clock")]
     clock: Option<Arc<dyn Clock>>,
+    sync_inactivity_timeout: Option<Duration>,
 }
 
 impl Builder {
@@ -107,6 +109,17 @@ impl Builder {
     /// ahead of it are refused.
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Set how long a sync exchange may go without progress before it is abandoned.
+    ///
+    /// The limit applies to every step that depends on the peer and restarts whenever the peer
+    /// makes progress, so it does not bound the total duration of a large sync. The exchange
+    /// fails with a timeout error and the connection is closed, which lets the same peer be
+    /// synced again. Defaults to [`crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT`] (30 seconds).
+    pub fn sync_inactivity_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_inactivity_timeout = Some(timeout);
         self
     }
 
@@ -130,7 +143,7 @@ impl Builder {
             }
         };
         let downloader = blobs.downloader(&endpoint);
-        let engine = Engine::spawn_with_clock(
+        let engine = Engine::spawn_with_options(
             endpoint,
             gossip,
             replica_store,
@@ -139,6 +152,8 @@ impl Builder {
             author_store,
             self.protect_cb,
             self.clock,
+            self.sync_inactivity_timeout
+                .unwrap_or(crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT),
         )
         .await?;
         Ok(Docs::new(engine))

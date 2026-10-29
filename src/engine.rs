@@ -13,7 +13,10 @@ pub enum DownloadStatus {
     NoProvider,
 }
 
-use std::sync::{Arc, RwLock};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::{bail, Result};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
@@ -107,6 +110,37 @@ impl Engine {
         protect_cb: Option<ProtectCallbackHandler>,
         clock: Option<Arc<dyn Clock>>,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_options(
+            endpoint,
+            gossip,
+            replica_store,
+            bao_store,
+            downloader,
+            default_author_storage,
+            protect_cb,
+            clock,
+            crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Like [`Self::spawn_with_clock`], with the inactivity limit of sync exchanges.
+    ///
+    /// An exchange that makes no progress for `sync_inactivity_timeout` is abandoned and the
+    /// peer can be synced again; the limit restarts whenever the peer makes progress. See
+    /// [`crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_options(
+        endpoint: Endpoint,
+        gossip: Gossip,
+        replica_store: crate::store::Store,
+        bao_store: iroh_blobs::api::Store,
+        downloader: Downloader,
+        default_author_storage: DefaultAuthorStorage,
+        protect_cb: Option<ProtectCallbackHandler>,
+        clock: Option<Arc<dyn Clock>>,
+        sync_inactivity_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
 
@@ -156,7 +190,7 @@ impl Engine {
             }
         }));
 
-        let actor = LiveActor::new(
+        let mut actor = LiveActor::new(
             sync.clone(),
             endpoint.clone(),
             gossip.clone(),
@@ -166,6 +200,7 @@ impl Engine {
             live_actor_tx.clone(),
             sync.metrics().clone(),
         )?;
+        actor.set_sync_inactivity_timeout(sync_inactivity_timeout);
         let actor_handle = n0_future::task::spawn(
             async move {
                 if let Err(err) = actor.run().await {

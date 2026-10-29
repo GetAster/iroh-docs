@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
-use n0_future::time::{Duration, Instant};
+use n0_future::time::{timeout, Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error_span, trace, Instrument};
 
@@ -18,8 +18,26 @@ use crate::{
 pub const ALPN: &[u8] = b"/iroh-sync/1";
 
 mod codec;
+mod idle;
+
+use idle::{is_idle_timeout, IdleTimeout};
+
+/// How long a sync exchange may go without any progress before it is abandoned.
+///
+/// This is an inactivity limit, not a limit on the total duration: it restarts whenever the peer
+/// makes progress, so a large exchange that keeps moving is never cut off.
+pub const DEFAULT_SYNC_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Application error code the connection is closed with when an exchange times out.
+const TIMEOUT_CLOSE_CODE: u32 = 0x74_69_6d_65; // "time"
+
+fn close_timed_out(connection: &iroh::endpoint::Connection) {
+    connection.close(TIMEOUT_CLOSE_CODE.into(), b"sync inactivity timeout");
+}
 
 /// Connect to a peer and sync a replica
+///
+/// The exchange is abandoned after [`DEFAULT_SYNC_INACTIVITY_TIMEOUT`] without progress.
 pub async fn connect_and_sync(
     endpoint: &Endpoint,
     sync: &SyncHandle,
@@ -27,28 +45,62 @@ pub async fn connect_and_sync(
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
 ) -> Result<SyncFinished, ConnectError> {
+    connect_and_sync_with_timeout(
+        endpoint,
+        sync,
+        namespace,
+        peer,
+        metrics,
+        DEFAULT_SYNC_INACTIVITY_TIMEOUT,
+    )
+    .await
+}
+
+/// Like [`connect_and_sync`], with an explicit inactivity limit.
+///
+/// Every step that depends on the peer (connecting, opening the stream, each read and write,
+/// closing) fails with [`ConnectError::Timeout`] if it makes no progress within `inactivity`.
+/// The connection is then closed with an error code.
+pub async fn connect_and_sync_with_timeout(
+    endpoint: &Endpoint,
+    sync: &SyncHandle,
+    namespace: NamespaceId,
+    peer: EndpointAddr,
+    metrics: Option<&Metrics>,
+    inactivity: Duration,
+) -> Result<SyncFinished, ConnectError> {
     let t_start = Instant::now();
     let peer_id = peer.id;
     trace!("connect");
-    let connection = endpoint
-        .connect(peer, crate::ALPN)
+    let connection = timeout(inactivity, endpoint.connect(peer, crate::ALPN))
         .await
+        .map_err(|_| ConnectError::timeout(inactivity))?
         .map_err(ConnectError::connect)?;
 
-    let (mut send_stream, mut recv_stream) =
-        connection.open_bi().await.map_err(ConnectError::connect)?;
+    let (mut send_stream, mut recv_stream) = match timeout(inactivity, connection.open_bi()).await {
+        Ok(res) => res.map_err(ConnectError::connect)?,
+        Err(_) => {
+            close_timed_out(&connection);
+            return Err(ConnectError::timeout(inactivity));
+        }
+    };
 
     let t_connect = t_start.elapsed();
     debug!(?t_connect, "connected");
 
-    let res = run_alice(&mut send_stream, &mut recv_stream, sync, namespace, peer_id).await;
+    let res = {
+        let mut writer = IdleTimeout::new(&mut send_stream, inactivity);
+        let mut reader = IdleTimeout::new(&mut recv_stream, inactivity);
+        run_alice(&mut writer, &mut reader, sync, namespace, peer_id).await
+    };
 
-    send_stream.finish().map_err(ConnectError::close)?;
-    send_stream.stopped().await.map_err(ConnectError::close)?;
-    recv_stream
-        .read_to_end(0)
-        .await
-        .map_err(ConnectError::close)?;
+    let closed = if matches!(res, Err(ConnectError::Timeout { .. })) {
+        // The peer is not answering, so the closing handshake would not complete either.
+        close_timed_out(&connection);
+        Err(ConnectError::timeout(inactivity))
+    } else {
+        close_connect(&connection, &mut send_stream, &mut recv_stream, inactivity).await
+    };
 
     if let Some(metrics) = metrics {
         if res.is_ok() {
@@ -74,6 +126,7 @@ pub async fn connect_and_sync(
         }
     }
 
+    closed?;
     let outcome = res?;
 
     let timings = Timings {
@@ -91,6 +144,31 @@ pub async fn connect_and_sync(
     Ok(res)
 }
 
+/// Finishes the dialer's streams and waits for the peer to acknowledge, bounded by `inactivity`.
+async fn close_connect(
+    connection: &iroh::endpoint::Connection,
+    send_stream: &mut iroh::endpoint::SendStream,
+    recv_stream: &mut iroh::endpoint::RecvStream,
+    inactivity: Duration,
+) -> Result<(), ConnectError> {
+    let closing = async {
+        send_stream.finish().map_err(ConnectError::close)?;
+        send_stream.stopped().await.map_err(ConnectError::close)?;
+        recv_stream
+            .read_to_end(0)
+            .await
+            .map_err(ConnectError::close)?;
+        Ok(())
+    };
+    match timeout(inactivity, closing).await {
+        Ok(res) => res,
+        Err(_) => {
+            close_timed_out(connection);
+            Err(ConnectError::timeout(inactivity))
+        }
+    }
+}
+
 /// Whether we want to accept or reject an incoming sync request.
 #[derive(Debug, Clone)]
 pub enum AcceptOutcome {
@@ -101,6 +179,8 @@ pub enum AcceptOutcome {
 }
 
 /// Handle an iroh-docs connection and sync all shared documents in the replica store.
+///
+/// The exchange is abandoned after [`DEFAULT_SYNC_INACTIVITY_TIMEOUT`] without progress.
 pub async fn handle_connection<F, Fut>(
     sync: SyncHandle,
     connection: iroh::endpoint::Connection,
@@ -111,12 +191,42 @@ where
     F: Fn(NamespaceId, PublicKey) -> Fut,
     Fut: Future<Output = AcceptOutcome>,
 {
+    handle_connection_with_timeout(
+        sync,
+        connection,
+        accept_cb,
+        metrics,
+        DEFAULT_SYNC_INACTIVITY_TIMEOUT,
+    )
+    .await
+}
+
+/// Like [`handle_connection`], with an explicit inactivity limit.
+///
+/// Every step that depends on the peer (accepting the stream, each read and write, closing)
+/// fails with [`AcceptError::Timeout`] if it makes no progress within `inactivity`. The
+/// connection is then closed with an error code.
+pub async fn handle_connection_with_timeout<F, Fut>(
+    sync: SyncHandle,
+    connection: iroh::endpoint::Connection,
+    accept_cb: F,
+    metrics: Option<&Metrics>,
+    inactivity: Duration,
+) -> Result<SyncFinished, AcceptError>
+where
+    F: Fn(NamespaceId, PublicKey) -> Fut,
+    Fut: Future<Output = AcceptOutcome>,
+{
     let t_start = Instant::now();
     let peer = connection.remote_id();
-    let (mut send_stream, mut recv_stream) = connection
-        .accept_bi()
-        .await
-        .map_err(|e| AcceptError::open(peer, e))?;
+    let (mut send_stream, mut recv_stream) = match timeout(inactivity, connection.accept_bi()).await
+    {
+        Ok(res) => res.map_err(|e| AcceptError::open(peer, e))?,
+        Err(_) => {
+            close_timed_out(&connection);
+            return Err(AcceptError::timeout(peer, None, inactivity));
+        }
+    };
 
     let t_connect = t_start.elapsed();
     let span = error_span!("accept", peer = %peer.fmt_short(), namespace = tracing::field::Empty);
@@ -125,10 +235,14 @@ where
     });
 
     let mut state = BobState::new(peer);
-    let res = state
-        .run(&mut send_stream, &mut recv_stream, sync, accept_cb)
-        .instrument(span.clone())
-        .await;
+    let res = {
+        let mut writer = IdleTimeout::new(&mut send_stream, inactivity);
+        let mut reader = IdleTimeout::new(&mut recv_stream, inactivity);
+        state
+            .run(&mut writer, &mut reader, sync, accept_cb)
+            .instrument(span.clone())
+            .await
+    };
 
     if let Some(metrics) = metrics {
         if res.is_ok() {
@@ -141,17 +255,32 @@ where
     let namespace = state.namespace();
     let outcome = state.into_outcome();
 
-    send_stream
-        .finish()
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    send_stream
-        .stopped()
-        .await
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    recv_stream
-        .read_to_end(0)
-        .await
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
+    if matches!(res, Err(AcceptError::Timeout { .. })) {
+        // The peer is not answering, so the closing handshake would not complete either.
+        close_timed_out(&connection);
+    } else {
+        let closing = async {
+            send_stream
+                .finish()
+                .map_err(|error| AcceptError::close(peer, namespace, error))?;
+            send_stream
+                .stopped()
+                .await
+                .map_err(|error| AcceptError::close(peer, namespace, error))?;
+            recv_stream
+                .read_to_end(0)
+                .await
+                .map_err(|error| AcceptError::close(peer, namespace, error))?;
+            Ok(())
+        };
+        match timeout(inactivity, closing).await {
+            Ok(closed) => closed?,
+            Err(_) => {
+                close_timed_out(&connection);
+                return Err(AcceptError::timeout(peer, namespace, inactivity));
+            }
+        }
+    }
 
     let t_process = t_start.elapsed() - t_connect;
     span.in_scope(|| match &res {
@@ -247,6 +376,13 @@ pub enum AcceptError {
         #[source]
         error: anyhow::Error,
     },
+    /// The peer made no progress within the inactivity limit.
+    #[error("Sync of {namespace:?} with {peer:?} timed out: no progress for {limit:?}")]
+    Timeout {
+        peer: PublicKey,
+        namespace: Option<NamespaceId>,
+        limit: Duration,
+    },
 }
 
 /// Errors that may occur on outgoing sync requests.
@@ -274,6 +410,9 @@ pub enum ConnectError {
         #[source]
         error: anyhow::Error,
     },
+    /// The peer made no progress within the inactivity limit.
+    #[error("Sync timed out: no progress for {limit:?}")]
+    Timeout { limit: Duration },
 }
 
 /// Reason why we aborted an incoming sync request.
@@ -294,15 +433,27 @@ impl AcceptError {
             error: error.into(),
         }
     }
+    fn timeout(peer: PublicKey, namespace: Option<NamespaceId>, limit: Duration) -> Self {
+        Self::Timeout {
+            peer,
+            namespace,
+            limit,
+        }
+    }
+    /// A failure while exchanging messages; an idle-timeout failure becomes [`Self::Timeout`].
     pub(crate) fn sync(
         peer: PublicKey,
         namespace: Option<NamespaceId>,
         error: impl Into<anyhow::Error>,
     ) -> Self {
+        let error = error.into();
+        if let Some(limit) = is_idle_timeout(&error) {
+            return Self::timeout(peer, namespace, limit);
+        }
         Self::Sync {
             peer,
             namespace,
-            error: error.into(),
+            error,
         }
     }
     fn close(
@@ -324,6 +475,7 @@ impl AcceptError {
             AcceptError::Sync { peer, .. } => Some(*peer),
             AcceptError::Close { peer, .. } => Some(*peer),
             AcceptError::Abort { peer, .. } => Some(*peer),
+            AcceptError::Timeout { peer, .. } => Some(*peer),
         }
     }
 
@@ -335,6 +487,7 @@ impl AcceptError {
             AcceptError::Sync { namespace, .. } => namespace.to_owned(),
             AcceptError::Close { namespace, .. } => namespace.to_owned(),
             AcceptError::Abort { namespace, .. } => Some(*namespace),
+            AcceptError::Timeout { namespace, .. } => namespace.to_owned(),
         }
     }
 }
@@ -350,10 +503,16 @@ impl ConnectError {
             error: error.into(),
         }
     }
+    fn timeout(limit: Duration) -> Self {
+        Self::Timeout { limit }
+    }
+    /// A failure while exchanging messages; an idle-timeout failure becomes [`Self::Timeout`].
     pub(crate) fn sync(error: impl Into<anyhow::Error>) -> Self {
-        Self::Sync {
-            error: error.into(),
+        let error = error.into();
+        if let Some(limit) = is_idle_timeout(&error) {
+            return Self::timeout(limit);
         }
+        Self::Sync { error }
     }
     pub(crate) fn remote_abort(reason: AbortReason) -> Self {
         Self::RemoteAbort(reason)

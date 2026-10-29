@@ -33,8 +33,8 @@ use crate::{
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
-        connect_and_sync, handle_connection, AbortReason, AcceptError, AcceptOutcome, ConnectError,
-        SyncFinished,
+        connect_and_sync_with_timeout, handle_connection_with_timeout, AbortReason, AcceptError,
+        AcceptOutcome, ConnectError, SyncFinished, DEFAULT_SYNC_INACTIVITY_TIMEOUT,
     },
     AuthorHeads, ContentStatus, NamespaceId, SignedEntry,
 };
@@ -211,6 +211,8 @@ pub struct LiveActor {
     /// Sync state per replica and peer
     state: NamespaceStates,
     metrics: Arc<Metrics>,
+    /// How long a sync exchange may make no progress before it is abandoned.
+    sync_inactivity_timeout: Duration,
 }
 impl LiveActor {
     /// Create the live actor.
@@ -261,7 +263,13 @@ impl LiveActor {
             hash_providers: Default::default(),
             pending_downloads: Default::default(),
             metrics,
+            sync_inactivity_timeout: DEFAULT_SYNC_INACTIVITY_TIMEOUT,
         })
+    }
+
+    /// Set how long a sync exchange may make no progress before it is abandoned.
+    pub fn set_sync_inactivity_timeout(&mut self, timeout: Duration) {
+        self.sync_inactivity_timeout = timeout;
     }
 
     /// Run the actor loop.
@@ -458,15 +466,17 @@ impl LiveActor {
         let endpoint = self.endpoint.clone();
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
+        let inactivity = self.sync_inactivity_timeout;
         let fut = async move {
             #[cfg(test)]
             fault::maybe_panic_connect(&namespace);
-            let res = connect_and_sync(
+            let res = connect_and_sync_with_timeout(
                 &endpoint,
                 &sync,
                 namespace,
                 EndpointAddr::new(peer),
                 Some(&metrics),
+                inactivity,
             )
             .await;
             (namespace, peer, reason, res)
@@ -1162,9 +1172,19 @@ impl LiveActor {
         debug!("incoming connection");
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
+        let inactivity = self.sync_inactivity_timeout;
         let task = self.running_sync_accept.spawn(
-            async move { handle_connection(sync, conn, accept_request_cb, Some(&metrics)).await }
-                .instrument(Span::current()),
+            async move {
+                handle_connection_with_timeout(
+                    sync,
+                    conn,
+                    accept_request_cb,
+                    Some(&metrics),
+                    inactivity,
+                )
+                .await
+            }
+            .instrument(Span::current()),
         );
         self.running_sync_accept_ids.insert(task.id(), accepted);
     }
