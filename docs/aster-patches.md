@@ -24,7 +24,7 @@ Historical and current tag schemes in this repository:
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
 | Tag | `aster-iroh-docs-v0.101.1018` |
-| Pinned commit | `ffda84eb3842b902b748851d685c6e11ac497641` |
+| Pinned commit | `42602d7c8c05fae17b73a9840c01bf5c1da460a8` |
 | Crate version | 0.101.1018 (workspace spec `iroh-docs = "0.101.1018"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
@@ -178,7 +178,7 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.101.0` | `aster-iroh-docs-v0.101.1018` | `ffda84eb3842b902b748851d685c6e11ac497641` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1018` | `42602d7c8c05fae17b73a9840c01bf5c1da460a8` | `upgrade/iroh-docs-v0.101` |
 
 - **2026-11-01, 0.101.1018** (`ffda84e`, tag `aster-iroh-docs-v0.101.1018`): the
   portal-sync batch — rows 52 (§E namespace fingerprint/sequence/replay, from
@@ -187,9 +187,10 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   inline values in sync and gossip messages, from `feat/inline-values`),
   landed directly on the integration branch in that order. The patch block is
   unchanged from 0.101.1013-p1. Option E, `n = 18`.
-- **2026-11-01, review fixes before tagging** (`ffda84e`, the pinned commit —
-  the tag names this commit, not the earlier `374d8ed` or the version-bump
-  `ce860fd`, which the inline-values wire change landed after): gossip imports
+- **2026-11-01, review fixes before tagging** (`ffda84e`, then `42602d7` —
+  the pinned commit; the tag names it, not the earlier `374d8ed` or the
+  version-bump `ce860fd`, which the inline-values wire change landed after):
+  gossip imports
   an inline value only after size/hash validation and only on demand
   (PutValue on a values topic, pending-values cache), so an invalid value
   writes no blob; the inline wire format is negotiated over a new ALPN
@@ -202,7 +203,9 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   gossip subscription re-joins with neighbor bootstrap; introspection reads
   go through the open transaction (a snapshot commits batched writes), the
   sequence index keeps one touch row per record key, and `entries_since`
-  takes a page limit. Suite: 177 passed, 4 ignored; clippy/fmt clean.
+  takes a page limit. `42602d7` adds the cross-replica witness: two replicas
+  synced over the network converge on the same fingerprint. Suite: 178
+  passed, 4 ignored; clippy/fmt clean.
 
 ### 0.101.1017 (2026-11-01)
 
