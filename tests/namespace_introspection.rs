@@ -6,9 +6,13 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use iroh::{endpoint::presets, Endpoint, SecretKey};
-use iroh_docs::sync::{Clock, ClockUnavailable};
+use iroh_docs::{
+    api::protocol::{AddrInfoOptions, ShareMode},
+    engine::LiveEvent,
+    sync::{Clock, ClockUnavailable},
+};
 use tracing_test::traced_test;
 
 mod util;
@@ -114,5 +118,65 @@ async fn fingerprint_sequence_and_replay_over_the_api() -> Result<()> {
     assert_eq!(replayed[0].1.content_hash(), iroh_blobs::Hash::new(b"2"));
     assert!(doc.get_exact(author, b"b", false).await?.is_some());
 
+    Ok(())
+}
+
+/// Waits for the join sync that follows a ticket import to finish.
+async fn wait_sync_finished(
+    events: &mut (impl n0_future::Stream<Item = Result<LiveEvent>> + Unpin),
+) -> Result<()> {
+    use n0_future::TryStreamExt;
+    loop {
+        match events.try_next().await? {
+            Some(LiveEvent::SyncFinished(event)) => {
+                if let Err(err) = event.result {
+                    bail!("join sync failed: {err}");
+                }
+                return Ok(());
+            }
+            Some(_) => {}
+            None => bail!("event stream closed before the join sync finished"),
+        }
+    }
+}
+
+/// The §E contract behind portal's steady-state check: two replicas synced
+/// over the network converge on the same fingerprint, and the reader's
+/// replay carries the writer's entries with their latest rows.
+#[tokio::test]
+#[traced_test]
+async fn fingerprint_converges_after_a_network_sync() -> Result<()> {
+    let clock = Arc::new(TestClock::default());
+    let writer = spawn_node(2, clock.clone()).await?;
+    let reader = spawn_node(3, clock.clone()).await?;
+    let docs0 = writer.client().docs().clone();
+    let author = docs0.author_default().await?;
+    let doc0 = docs0.create().await?;
+
+    clock.advance();
+    doc0.set_bytes(author, b"a".to_vec(), b"1".to_vec()).await?;
+    clock.advance();
+    doc0.set_bytes(author, b"b".to_vec(), b"2".to_vec()).await?;
+    let fp0 = doc0.namespace_fingerprint().await?;
+
+    // Share only after the writes: the entries travel via the join sync.
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = reader.client().docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+    wait_sync_finished(&mut events1).await?;
+
+    // Same record set on both sides: same fingerprint, and the reader's
+    // replay carries both keys at their latest rows.
+    assert_eq!(doc1.namespace_fingerprint().await?, fp0);
+    let replay = doc1.entries_since(0, 0).await?;
+    assert_eq!(replay.len(), 2);
+    let mut keys: Vec<_> = replay.iter().map(|(_, entry)| entry.key()).collect();
+    keys.sort();
+    assert_eq!(keys, vec![b"a".as_slice(), b"b".as_slice()]);
+
+    writer.shutdown().await?;
+    reader.shutdown().await?;
     Ok(())
 }
