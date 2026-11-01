@@ -24,7 +24,7 @@ Historical and current tag schemes in this repository:
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
 | Tag | `aster-iroh-docs-v0.101.1018` |
-| Pinned commit | `42602d7c8c05fae17b73a9840c01bf5c1da460a8` |
+| Pinned commit | `d9055d350e20bb187f1fae744c8e5ed57c8798e3` |
 | Crate version | 0.101.1018 (workspace spec `iroh-docs = "0.101.1018"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
@@ -178,7 +178,7 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.101.0` | `aster-iroh-docs-v0.101.1018` | `42602d7c8c05fae17b73a9840c01bf5c1da460a8` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1018` | `d9055d350e20bb187f1fae744c8e5ed57c8798e3` | `upgrade/iroh-docs-v0.101` |
 
 - **2026-11-01, 0.101.1018** (`ffda84e`, tag `aster-iroh-docs-v0.101.1018`): the
   portal-sync batch — rows 52 (§E namespace fingerprint/sequence/replay, from
@@ -204,8 +204,12 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   go through the open transaction (a snapshot commits batched writes), the
   sequence index keeps one touch row per record key, and `entries_since`
   takes a page limit. `42602d7` adds the cross-replica witness: two replicas
-  synced over the network converge on the same fingerprint. Suite: 178
-  passed, 4 ignored; clippy/fmt clean.
+  synced over the network converge on the same fingerprint. `d9055d3`
+  de-flakes `gossip_lag_resubscribes_and_resyncs` (the two concurrent
+  start_sync dials could resolve as one completed round and deadlock the
+  initial wait; the final count raced the repair round's queued inserts):
+  the second initial round is awaited explicitly and the count is a bounded
+  convergence wait. Suite: 178 passed, 4 ignored; clippy/fmt clean.
 
 ### 0.101.1017 (2026-11-01)
 
