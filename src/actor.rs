@@ -3,7 +3,7 @@
 use std::{
     collections::{hash_map, BTreeSet, HashMap},
     num::NonZeroU64,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::sync::system_time_now;
@@ -30,6 +30,7 @@ use crate::{
         RpcError, RpcResult,
     },
     metrics::Metrics,
+    net::WireFormat,
     ranger::Message,
     store::{
         fs::{ContentHashesIterator, StoreInstance},
@@ -161,12 +162,14 @@ enum ReplicaAction {
         entry: SignedEntry,
         from: PeerIdBytes,
         content_status: ContentStatus,
-        /// Value carried inline in the gossip message, if any.
-        value: Option<Bytes>,
         #[debug("reply")]
         reply: oneshot::Sender<Result<(), InsertRemoteError>>,
     },
     SyncInitialMessage {
+        /// The connection's negotiated wire format: values are only attached
+        /// (and imported) on the inline-values wire, so a legacy peer never
+        /// sees the new shape.
+        wire: WireFormat,
         #[debug("reply")]
         reply: oneshot::Sender<Result<Message<SignedEntry>>>,
     },
@@ -174,6 +177,8 @@ enum ReplicaAction {
         message: Message<SignedEntry>,
         from: PeerIdBytes,
         state: SyncOutcome,
+        /// The connection's negotiated wire format; see `SyncInitialMessage`.
+        wire: WireFormat,
         #[debug("reply")]
         reply: oneshot::Sender<Result<(Option<Message<SignedEntry>>, SyncOutcome)>>,
     },
@@ -239,6 +244,7 @@ enum ReplicaAction {
     },
     EntriesSince {
         seq: u64,
+        limit: usize,
         #[debug("reply")]
         reply: oneshot::Sender<Result<Vec<(u64, SignedEntry)>>>,
     },
@@ -366,11 +372,11 @@ impl SyncHandle {
     ///
     /// `max_inline_value_size` enables the inline-value feature: entries at or below this many
     /// bytes of content may carry their value inside sync and gossip messages. `blobs` and
-    /// `protect_notify` wire the feature into the blob store; the notify guards the GC window
-    /// for imported values (see [`crate::api::actor::RpcActor`]'s temp-tag pattern). A
-    /// threshold of 0, or no blob store, disables the feature.
+    /// `tag_hold` wire the feature into the blob store; the shared holder guards the GC window
+    /// for imported values (see [`TagHold`]). A threshold of 0, or no blob store, disables the
+    /// feature.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_options(
+    pub(crate) fn spawn_with_options(
         store: Store,
         content_status_callback: Option<ContentStatusCallback>,
         me: String,
@@ -378,12 +384,12 @@ impl SyncHandle {
         max_future_shift: u64,
         max_inline_value_size: usize,
         blobs: Option<Blobs>,
-        protect_notify: Option<Arc<Notify>>,
+        tag_hold: Option<TagHold>,
     ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
-        let inline = blobs
-            .and_then(|blobs| InlineContent::new(blobs, max_inline_value_size, protect_notify));
+        let inline =
+            blobs.and_then(|blobs| InlineContent::new(blobs, max_inline_value_size, tag_hold));
         let actor = Actor {
             store,
             states: Default::default(),
@@ -507,14 +513,12 @@ impl SyncHandle {
         entry: SignedEntry,
         from: PeerIdBytes,
         content_status: ContentStatus,
-        value: Option<Bytes>,
     ) -> Result<(), InsertRemoteError> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::InsertRemote {
             entry,
             from,
             content_status,
-            value,
             reply,
         };
         self.send_replica(namespace, action)
@@ -527,9 +531,10 @@ impl SyncHandle {
     pub async fn sync_initial_message(
         &self,
         namespace: NamespaceId,
+        wire: WireFormat,
     ) -> Result<Message<SignedEntry>> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::SyncInitialMessage { reply };
+        let action = ReplicaAction::SyncInitialMessage { wire, reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -540,6 +545,7 @@ impl SyncHandle {
         message: Message<SignedEntry>,
         from: PeerIdBytes,
         state: SyncOutcome,
+        wire: WireFormat,
     ) -> Result<(Option<Message<SignedEntry>>, SyncOutcome)> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::SyncProcessMessage {
@@ -547,6 +553,7 @@ impl SyncHandle {
             message,
             from,
             state,
+            wire,
         };
         self.send_replica(namespace, action).await?;
         rx.await?
@@ -773,7 +780,8 @@ impl SyncHandle {
 
     /// Returns the keys touched by puts since `seq`, each with its latest
     /// entry and the sequence at which it was last touched, ordered by touch
-    /// sequence.
+    /// sequence. `limit` bounds the page: at most `limit` pairs, or the whole
+    /// tail when 0.
     ///
     /// Rust-only surface for now (an Aster introspection query); a C ABI and
     /// binding parity pass is planned.
@@ -781,9 +789,10 @@ impl SyncHandle {
         &self,
         namespace: NamespaceId,
         seq: u64,
+        limit: usize,
     ) -> Result<Vec<(u64, SignedEntry)>> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::EntriesSince { seq, reply };
+        let action = ReplicaAction::EntriesSince { seq, limit, reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -850,6 +859,100 @@ impl Drop for SyncHandle {
     }
 }
 
+/// Shared batch holder for the temp tags of freshly published or imported
+/// content.
+///
+/// A publish path's temp tag is the imported blob's GC protection between its
+/// import and the document record naming it becoming visible to the protect
+/// enumeration. The tag must therefore outlive one full enumeration cycle:
+/// it releases only after the enumeration that observes the record has run,
+/// plus the sweep that missed the record has finished marking. Per-tag
+/// waiter tasks would hold one task per publish forever on a default config;
+/// instead every tag joins a batch, and each enumeration-notify fire retires
+/// the batch that was current at the previous fire. Two-phase rotation makes
+/// the retirement safe: a tag enqueued while an enumeration is in flight is
+/// still in `current` when that enumeration fires, moves to `retiring`, and
+/// is only dropped when the *next* enumeration fires — every tag therefore
+/// survives at least one full cycle after it was enqueued. A lost
+/// notification only over-holds (safe); a dropped tag is the GC wedge.
+///
+/// One drain task per engine watches the notifier; the mutexes are held only
+/// for the enqueue/rotation, never across an await. The task holds a weak
+/// reference and exits once the last [`TagHold`] is gone, which notifies it
+/// one final time, so engine shutdown cannot leak the task (or its last
+/// batch of tags) into a silent wait on a notifier nobody will fire again.
+#[derive(Debug, Clone)]
+pub(crate) struct TagHold {
+    inner: Arc<TagHoldInner>,
+}
+
+#[derive(Debug)]
+struct TagHoldInner {
+    notify: Arc<Notify>,
+    current: Mutex<Vec<TempTag>>,
+    retiring: Mutex<Vec<TempTag>>,
+}
+
+impl Drop for TagHoldInner {
+    fn drop(&mut self) {
+        // Wake the drain task one last time so it can observe the weak
+        // upgrade failing and exit. `notify_one` stores a permit when the
+        // task is mid-rotation rather than waiting, so it wakes on its next
+        // `notified().await` either way.
+        self.notify.notify_one();
+    }
+}
+
+impl TagHold {
+    /// Creates the holder and its drain task. `notify` is the engine's
+    /// protect-enumeration notifier; callers enqueue tags and the task
+    /// retires them on the fire cadence described on [`TagHold`].
+    pub(crate) fn new(notify: Arc<Notify>) -> TagHold {
+        let hold = TagHold {
+            inner: Arc::new(TagHoldInner {
+                notify,
+                current: Mutex::new(Vec::new()),
+                retiring: Mutex::new(Vec::new()),
+            }),
+        };
+        let weak = Arc::downgrade(&hold.inner);
+        n0_future::task::spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                inner.notify.notified().await;
+                let Some(inner) = weak.upgrade() else {
+                    // The last holder dropped while this task was waiting,
+                    // and its final notification woke us: nothing holds the
+                    // tags anymore, so nothing can protect them. Exit.
+                    return;
+                };
+                let old = {
+                    let mut retiring = inner.retiring.lock().expect("tag hold poisoned");
+                    let mut current = inner.current.lock().expect("tag hold poisoned");
+                    std::mem::replace(&mut *retiring, std::mem::take(&mut *current))
+                };
+                // The previous retiring batch was observed by the enumeration
+                // that just completed (and the one before it), so it drops now.
+                drop(old);
+            }
+        });
+        hold
+    }
+
+    /// Holds `tag` until the protect enumeration after the next one has
+    /// completed. Callers that see no [`TagHold`] at all (no protect handler
+    /// installed) drop the tag immediately instead.
+    pub(crate) fn hold(&self, tag: TempTag) {
+        self.inner
+            .current
+            .lock()
+            .expect("tag hold poisoned")
+            .push(tag);
+    }
+}
+
 /// Inline-value plumbing for the set-reconciliation and gossip paths.
 ///
 /// Entries whose content fits the configured threshold can carry their value
@@ -861,20 +964,20 @@ pub(crate) struct InlineContent {
     /// Values at or below this many bytes may ride a message.
     max_value_size: usize,
     /// Guards the GC window: a temp tag on an imported value lives until the
-    /// next protect enumeration has observed its document record.
-    protect_notify: Option<Arc<Notify>>,
+    /// protect enumeration after the one that observes its document record.
+    tag_hold: Option<TagHold>,
 }
 
 impl InlineContent {
     pub(crate) fn new(
         blobs: Blobs,
         max_value_size: usize,
-        protect_notify: Option<Arc<Notify>>,
+        tag_hold: Option<TagHold>,
     ) -> Option<Self> {
         (max_value_size > 0).then_some(Self {
             blobs,
             max_value_size,
-            protect_notify,
+            tag_hold,
         })
     }
 
@@ -946,15 +1049,11 @@ impl InlineContent {
     }
 
     fn hold_until_protected(&self, tag: TempTag) {
-        let Some(notify) = &self.protect_notify else {
+        let Some(hold) = &self.tag_hold else {
             drop(tag);
             return;
         };
-        let notify = notify.clone();
-        n0_future::task::spawn(async move {
-            notify.notified().await;
-            drop(tag);
-        });
+        hold.hold(tag);
     }
 }
 
@@ -1172,7 +1271,6 @@ impl Actor {
                 entry,
                 from,
                 content_status,
-                value,
                 reply,
             } => {
                 let res = async {
@@ -1182,16 +1280,6 @@ impl Actor {
                         .map_err(InsertRemoteError::Actor)?;
                     let len = entry.content_len();
                     let timestamp = entry.timestamp();
-                    // Import a value carried inline in the gossip message. On
-                    // success the status becomes Complete, so the live actor's
-                    // normal pending-download path turns into a zero-network
-                    // ContentReady.
-                    let mut content_status = content_status;
-                    if let Some(inline) = &self.inline {
-                        if inline.import(&entry, value).await {
-                            content_status = ContentStatus::Complete;
-                        }
-                    }
                     match replica
                         .insert_remote_entry(entry, from, content_status)
                         .await
@@ -1203,6 +1291,13 @@ impl Actor {
                         }
                         Err(InsertError::Validation(failure)) => {
                             self.metrics.entries_rejected_validation.inc();
+                            // Same rule as the sync path: when a clock is
+                            // configured, its bound decides the retry delay.
+                            let future_bound = self
+                                .clock
+                                .as_deref()
+                                .map(|clock| clock.max_future_shift())
+                                .unwrap_or(self.max_future_shift);
                             Err(InsertRemoteError::Validation {
                                 retry_after: if matches!(
                                     &failure,
@@ -1211,7 +1306,7 @@ impl Actor {
                                     Some(Duration::from_micros(
                                         timestamp
                                             .saturating_sub(system_time_now())
-                                            .saturating_sub(self.max_future_shift),
+                                            .saturating_sub(future_bound),
                                     ))
                                 } else {
                                     None
@@ -1226,14 +1321,18 @@ impl Actor {
                 reply.send(res).map_err(send_reply_error)
             }
 
-            ReplicaAction::SyncInitialMessage { reply } => {
+            ReplicaAction::SyncInitialMessage { wire, reply } => {
                 send_reply_with_async(reply, self, async move |this| {
                     let mut replica = this
                         .states
                         .replica_if_syncing(&namespace, &mut this.store)?;
                     let mut res = replica.sync_initial_message()?;
-                    if let Some(inline) = &this.inline {
-                        inline.attach(&mut res).await;
+                    // Values only ride the inline-values wire; a legacy peer
+                    // must never receive the new message shape.
+                    if wire == WireFormat::Inline {
+                        if let Some(inline) = &this.inline {
+                            inline.attach(&mut res).await;
+                        }
                     }
                     Ok(res)
                 })
@@ -1243,16 +1342,20 @@ impl Actor {
                 message,
                 from,
                 mut state,
+                wire,
                 reply,
             } => {
                 let res = async {
                     let mut replica = self
                         .states
                         .replica_if_syncing(&namespace, &mut self.store)?;
+                    let inline = (wire == WireFormat::Inline)
+                        .then_some(self.inline.as_ref())
+                        .flatten();
                     let mut res = replica
-                        .sync_process_message(message, from, &mut state, self.inline.as_ref())
+                        .sync_process_message(message, from, &mut state, inline)
                         .await?;
-                    if let Some(inline) = &self.inline {
+                    if let Some(inline) = inline {
                         if let Some(ref mut msg) = res {
                             inline.attach(msg).await;
                         }
@@ -1348,10 +1451,12 @@ impl Actor {
                 let mut replica = this.states.replica(namespace, &mut this.store)?;
                 replica.namespace_sequence()
             }),
-            ReplicaAction::EntriesSince { seq, reply } => send_reply_with(reply, self, |this| {
-                let mut replica = this.states.replica(namespace, &mut this.store)?;
-                replica.entries_since(seq)
-            }),
+            ReplicaAction::EntriesSince { seq, limit, reply } => {
+                send_reply_with(reply, self, |this| {
+                    let mut replica = this.states.replica(namespace, &mut this.store)?;
+                    replica.entries_since(seq, limit)
+                })
+            }
         }
     }
 
@@ -1584,7 +1689,7 @@ mod tests {
         sync.set_sync(id, true).await?;
 
         match sync
-            .insert_remote(id, entry, [0u8; 32], ContentStatus::Missing, None)
+            .insert_remote(id, entry, [0u8; 32], ContentStatus::Missing)
             .await
         {
             Err(InsertRemoteError::Validation {
@@ -1592,6 +1697,74 @@ mod tests {
                 retry_after,
             }) => {
                 assert!(retry_after.is_some());
+            }
+            res => panic!("expected a validation failure, got {res:?}"),
+        }
+        Ok(())
+    }
+
+    /// A clock with a tighter `observe` bound than the default future
+    /// shift computes the reject's retry delay from its own bound: an
+    /// entry two seconds ahead of a clock that accepts one second gets
+    /// `retry_after` of about a second, so the deferred re-sync fires when
+    /// the entry is acceptable. Computing the delay from the default
+    /// ten-minute shift instead makes it zero (the entry is already within
+    /// that bound), and the deferred re-sync fires at once, is rejected
+    /// again, and loops as fast as round trips complete.
+    #[tokio::test]
+    async fn insert_remote_clock_reject_retries_on_the_clocks_bound() -> anyhow::Result<()> {
+        /// Accepts remote entries at most one second ahead of system time.
+        #[derive(Debug)]
+        struct TightClock;
+        impl crate::sync::Clock for TightClock {
+            fn now(&self) -> Result<u64, crate::sync::ClockUnavailable> {
+                Ok(system_time_now())
+            }
+            fn observe(&self, remote: u64) -> bool {
+                remote <= system_time_now().saturating_add(1_000_000)
+            }
+            fn max_future_shift(&self) -> u64 {
+                1_000_000
+            }
+        }
+
+        let store = store::Store::memory();
+        let sync = SyncHandle::spawn_with_options(
+            store,
+            None,
+            "foo".into(),
+            Some(std::sync::Arc::new(TightClock)),
+            60 * 1_000_000,
+            0,
+            None,
+            None,
+        );
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let author = Author::new(&mut rand::rng());
+        let entry = SignedEntry::from_parts(
+            &namespace,
+            &author,
+            b"k",
+            crate::Record::from_data(b"v", system_time_now() + 2 * 1_000_000),
+        );
+        let id = namespace.id();
+        sync.import_namespace(namespace.into()).await?;
+        sync.open(id, Default::default()).await?;
+        sync.set_sync(id, true).await?;
+
+        match sync
+            .insert_remote(id, entry, [0u8; 32], ContentStatus::Missing)
+            .await
+        {
+            Err(InsertRemoteError::Validation {
+                failure: ValidationFailure::TooFarInTheFuture,
+                retry_after,
+            }) => {
+                let retry_after = retry_after.expect("a retry delay for a future-stamped entry");
+                assert!(
+                    retry_after <= n0_future::time::Duration::from_secs(1) + n0_future::time::Duration::from_millis(100),
+                    "retry delay must be computed from the clock's own 1 s bound, got {retry_after:?}"
+                );
             }
             res => panic!("expected a validation failure, got {res:?}"),
         }

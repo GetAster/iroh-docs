@@ -37,12 +37,13 @@ pub use self::{
     // a public struct. Without this it cannot be named outside the crate, so a
     // consumer can read a completion but not construct one — which makes
     // `SyncEvent` untestable downstream.
-    live::{SyncDetails, SyncEvent},
+    live::{Op, SyncDetails, SyncEvent},
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, Clock, ContentStatus,
-    ContentStatusCallback, Entry, NamespaceId,
+    actor::{SyncHandle, TagHold},
+    metrics::Metrics,
+    Author, AuthorId, Clock, ContentStatus, ContentStatusCallback, Entry, NamespaceId,
 };
 
 mod gossip;
@@ -76,6 +77,10 @@ pub struct Engine {
     /// `None` when spawned without a protect handler: nothing enumerates
     /// then, and holding would leak the tag.
     protect_notify: Option<Arc<Notify>>,
+    /// Shared batch holder for those temp tags, keyed to `protect_notify`;
+    /// one drain task per engine retires the batch per enumeration, so the
+    /// tags never cost a task each. `None` together with `protect_notify`.
+    tag_hold: Option<TagHold>,
 }
 
 impl Engine {
@@ -176,8 +181,12 @@ impl Engine {
         };
         // One notify per completed protect enumeration; temp tags on inline
         // values are held until the enumeration that observes their document
-        // record has run.
+        // record has run. The tags ride a shared batch holder (one drain
+        // task, not one per tag) keyed to the same notify.
         let protect_notify = protect_cb.as_ref().map(|_| Arc::new(Notify::new()));
+        let tag_hold = protect_notify
+            .as_ref()
+            .map(|notify| TagHold::new(notify.clone()));
         let sync = SyncHandle::spawn_with_options(
             replica_store,
             Some(content_status_cb.clone()),
@@ -186,7 +195,7 @@ impl Engine {
             max_future_shift.as_micros() as u64,
             max_inline_value_size,
             Some(bao_store.blobs().clone()),
-            protect_notify.clone(),
+            tag_hold.clone(),
         );
 
         let sync2 = sync.clone();
@@ -234,6 +243,7 @@ impl Engine {
             live_actor_tx.clone(),
             sync.metrics().clone(),
             max_inline_value_size,
+            tag_hold.clone(),
         )?;
         actor.set_sync_inactivity_timeout(sync_inactivity_timeout);
         let actor_handle = n0_future::task::spawn(
@@ -265,6 +275,7 @@ impl Engine {
             blob_store: bao_store,
             _gc_protect_task: gc_protect_task,
             protect_notify,
+            tag_hold,
         })
     }
 
@@ -283,6 +294,13 @@ impl Engine {
     /// drop; see [`crate::api::actor::RpcActor`].
     pub fn protect_notify(&self) -> Option<Arc<Notify>> {
         self.protect_notify.clone()
+    }
+
+    /// The shared temp-tag batch holder for publish and inline-value import
+    /// paths, or `None` when this engine was spawned without a protect
+    /// handler. See [`TagHold`].
+    pub(crate) fn tag_hold(&self) -> Option<TagHold> {
+        self.tag_hold.clone()
     }
 
     /// Returns the metrics tracked for this engine.

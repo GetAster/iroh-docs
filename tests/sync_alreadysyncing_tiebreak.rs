@@ -93,6 +93,13 @@ async fn spawn_node(key: SecretKey, accept_delay: Duration) -> Result<TestNode> 
                 delay: accept_delay,
             },
         )
+        .accept(
+            iroh_docs::ALPN_INLINE,
+            DelayedDocs {
+                inner: docs.clone(),
+                delay: accept_delay,
+            },
+        )
         .spawn();
     Ok(TestNode { ep, docs, router })
 }

@@ -43,6 +43,7 @@ pub async fn endpoint(
 pub struct Node {
     router: iroh::protocol::Router,
     client: Client,
+    gossip: Gossip,
 }
 
 impl Deref for Node {
@@ -131,13 +132,18 @@ impl Builder {
             );
         }
         router = router.accept(iroh_docs::ALPN, docs.clone());
+        router = router.accept(iroh_docs::ALPN_INLINE, docs.clone());
         router = router.accept(iroh_gossip::ALPN, gossip.clone());
 
         // Build the router
         let router = router.spawn();
 
         let client = Client::new(blobs.clone(), docs.api().clone());
-        Ok(Node { router, client })
+        Ok(Node {
+            router,
+            client,
+            gossip,
+        })
     }
 
     pub fn gc_interval(mut self, value: Option<n0_future::time::Duration>) -> Self {
@@ -253,6 +259,12 @@ impl Node {
     /// Returns the client
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// The raw gossip protocol handle, for subscribing to and broadcasting
+    /// on document topics outside the docs engine.
+    pub fn gossip(&self) -> &Gossip {
+        &self.gossip
     }
 }
 

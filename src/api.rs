@@ -675,8 +675,11 @@ impl Doc {
     /// Returns the XOR aggregate fingerprint over this document's current
     /// record rows.
     ///
-    /// Equal on two replicas if and only if they hold the same record set,
-    /// independent of insert order; it does not cover blob presence.
+    /// Equal on two replicas that hold the same record set, independent of
+    /// insert order; it does not cover blob presence. The guarantee holds
+    /// for honest writers: a replica can always lie about its records, so
+    /// mismatches must be resolved by re-syncing, not by trusting either
+    /// side's fingerprint.
     ///
     /// Rust-only surface for now (an Aster introspection query); a C ABI and
     /// binding parity pass is planned.
@@ -711,17 +714,20 @@ impl Doc {
     /// Returns the keys touched by puts since `seq`, each with its latest
     /// entry and the sequence at which it was last touched, ordered by touch
     /// sequence. `seq` is a value previously returned by
-    /// [`Self::namespace_sequence`] on the same replica.
+    /// [`Self::namespace_sequence`] on the same replica. `limit` bounds the
+    /// page: at most `limit` pairs, or the whole tail when 0; a paging
+    /// consumer passes the last received touch as the next `seq`.
     ///
     /// Rust-only surface for now (an Aster introspection query); a C ABI and
     /// binding parity pass is planned.
-    pub async fn entries_since(&self, seq: u64) -> Result<Vec<(u64, SignedEntry)>> {
+    pub async fn entries_since(&self, seq: u64, limit: usize) -> Result<Vec<(u64, SignedEntry)>> {
         self.ensure_open()?;
         let response = self
             .inner
             .rpc(EntriesSinceRequest {
                 doc_id: self.namespace_id,
                 seq,
+                limit,
             })
             .await??;
         Ok(response

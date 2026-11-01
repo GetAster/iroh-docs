@@ -667,18 +667,17 @@ impl RpcActor {
     /// runs. Holding the tag until the next enumeration closes the window:
     /// the enumeration flushes and reads committed state, so it observes the
     /// record, and the tag's release cannot race the mark phase of the
-    /// sweep whose enumeration missed it. Without a protect handler nothing
-    /// enumerates (and no sweep protects document content at all), so the
-    /// tag is released immediately rather than held forever.
+    /// sweep whose enumeration missed it. The tag joins the engine's shared
+    /// [`crate::actor::TagHold`] batch instead of a per-tag waiter task, so
+    /// publishes do not leak one task each. Without a protect handler nothing enumerates
+    /// (and no sweep protects document content at all), so the tag is
+    /// released immediately rather than held forever.
     fn hold_until_protected(&self, tag: TempTag) {
-        let Some(notify) = self.protect_notify() else {
+        let Some(hold) = self.tag_hold() else {
             drop(tag);
             return;
         };
-        task::spawn(async move {
-            notify.notified().await;
-            drop(tag);
-        });
+        hold.hold(tag);
     }
 
     pub(super) async fn doc_del(&self, req: DelRequest) -> RpcResult<DelResponse> {
@@ -834,7 +833,7 @@ impl RpcActor {
     ) -> RpcResult<EntriesSinceResponse> {
         let entries = self
             .sync
-            .entries_since(req.doc_id, req.seq)
+            .entries_since(req.doc_id, req.seq, req.limit)
             .await
             .map_err(|e| RpcError::new(&*e))?
             .into_iter()

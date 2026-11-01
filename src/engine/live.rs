@@ -30,7 +30,7 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 // use super::gossip::{GossipActor, ToGossipActor};
 use super::state::{is_tiebreak_loss, NamespaceStates, Origin, SyncReason};
 use crate::{
-    actor::{OpenOpts, SyncHandle},
+    actor::{OpenOpts, SyncHandle, TagHold},
     engine::gossip::GossipState,
     metrics::Metrics,
     net::{
@@ -43,6 +43,16 @@ use crate::{
 /// One warning per namespace per interval for events that can arrive in floods: validation
 /// rejects come one per entry, and a wedged gossip subscription lags one tick after another.
 const WARN_LIMITER_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Upper bound on verified inline values held for entries that have not
+/// arrived yet: a forged value can occupy a slot only after its bytes hash
+/// to the announced hash, and never reaches the blob store from the cache.
+const MAX_PENDING_VALUES: usize = 1024;
+
+/// How long a verified inline value is held waiting for its entry. Values
+/// ride a different gossip topic than their entries and either may win the
+/// race; an entry normally arrives within one sync exchange.
+const PENDING_VALUE_TTL: Duration = Duration::from_secs(60);
 
 /// A per-context rate limiter: `allow` returns true once per [`WARN_LIMITER_INTERVAL`].
 #[derive(Debug, Default)]
@@ -82,12 +92,16 @@ fn reaction_allowed(last: &mut HashMap<NamespaceId, Instant>, namespace: Namespa
 /// This is the message that is broadcast over iroh-gossip.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::Display)]
 pub enum Op {
-    /// A new entry was inserted into the document, with the entry's value
-    /// attached when it is small enough to ride the message.
-    Put {
-        entry: SignedEntry,
-        value: Option<Bytes>,
-    },
+    /// A new entry was inserted into the document. The wire shape of this
+    /// variant is frozen (the "version-0" shape): peers that predate inline
+    /// values must keep decoding it, so entries always ride this message
+    /// without their value.
+    Put { entry: SignedEntry },
+    /// A value for a document entry, broadcast on the namespace's
+    /// inline-values topic (see [`crate::engine::gossip::values_topic`]),
+    /// which only inline-value-capable peers subscribe to. Keyed by hash
+    /// because the entry itself travels in [`Op::Put`].
+    PutValue { hash: Hash, value: Bytes },
     /// A peer now has content available for a hash.
     ContentReady(Hash),
     /// We synced with another peer, here's the news.
@@ -150,6 +164,16 @@ pub enum ToLiveActor {
         namespace: NamespaceId,
         node: PublicKey,
         hash: Hash,
+    },
+    /// A value carried on the namespace's inline-values gossip topic. The
+    /// live actor imports it only for content it actually wants (its entry
+    /// is known and the content is missing or being downloaded), so an
+    /// unvalidated gossip message can never write unreferenced blobs.
+    InlineValue {
+        namespace: NamespaceId,
+        node: PublicKey,
+        hash: Hash,
+        value: Bytes,
     },
     NeighborUp {
         namespace: NamespaceId,
@@ -228,6 +252,10 @@ pub struct LiveActor {
     /// Entries at or below this many bytes of content are gossiped with their
     /// value inlined in the message; 0 disables.
     max_inline_value_size: usize,
+    /// Shared temp-tag batch holder for imported inline values, guarding the
+    /// same GC window as the publish paths. `None` when the engine has no
+    /// protect handler: nothing enumerates then, and holding would leak.
+    tag_hold: Option<TagHold>,
     memory_lookup: MemoryLookup,
     replica_events_tx: async_channel::Sender<crate::Event>,
     replica_events_rx: async_channel::Receiver<crate::Event>,
@@ -254,8 +282,18 @@ pub struct LiveActor {
     download_task_ids: HashMap<TaskId, (NamespaceId, Hash)>,
     /// Content hashes which are wanted but not yet queued because no provider was found.
     missing_hashes: MissingHashes,
+    /// Content hashes whose entry arrived but whose download policy forbids
+    /// fetching them. Mirrors [`Self::missing_hashes`] for that gated half:
+    /// only an inline value may fill these (inlining is not a download), so
+    /// they never become download candidates.
+    policy_missing: MissingHashes,
     /// Content hashes queued in downloader.
     queued_hashes: QueuedHashes,
+    /// Verified inline values whose entry has not arrived yet, so a value
+    /// that wins the race against its entry is not lost when no peer can
+    /// serve a download (the author is gone, or the download policy forbids
+    /// fetching). Bounded and TTL'd; see [`Self::cache_pending_value`].
+    pending_values: HashMap<Hash, (Bytes, Instant)>,
     /// Nodes known to have a hash
     hash_providers: ProviderNodes,
     /// Download scheduling candidates collected while draining replica events.
@@ -272,7 +310,11 @@ pub struct LiveActor {
     /// Current gossip neighbors per namespace, for deferred re-syncs.
     neighbors: HashMap<NamespaceId, HashSet<PublicKey>>,
     /// Earliest re-sync time per namespace for entries refused as too far in the future.
-    deferred_resyncs: HashMap<NamespaceId, Instant>,
+    /// Namespaces whose re-sync is deferred until a rejected entry can pass
+    /// validation: the earliest due time and the peers that offered the
+    /// rejected entries. The offerers are dialed when the re-sync fires even
+    /// if they are no longer gossip neighbors.
+    deferred_resyncs: HashMap<NamespaceId, (Instant, HashSet<PublicKey>)>,
     /// When we last warned about validation rejects, per namespace.
     validation_warned: HashMap<NamespaceId, Instant>,
     /// When we last reacted to a gossip lag, per namespace.
@@ -291,6 +333,7 @@ impl LiveActor {
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
         max_inline_value_size: usize,
+        tag_hold: Option<TagHold>,
     ) -> Result<Self> {
         // Unbounded, and it must stay that way. `Subscribers::send` delivers
         // into this channel with a blocking `tx.send(..).await` from inside the
@@ -301,7 +344,12 @@ impl LiveActor {
         // recovered. Bound the work this channel *causes* if it needs bounding
         // (see `MAX_REPLICA_EVENT_BATCH`), never the channel itself.
         let (replica_events_tx, replica_events_rx) = async_channel::unbounded();
-        let gossip_state = GossipState::new(gossip, sync.clone(), sync_actor_tx.clone());
+        let gossip_state = GossipState::new(
+            gossip,
+            sync.clone(),
+            sync_actor_tx.clone(),
+            max_inline_value_size > 0,
+        );
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
         Ok(Self {
@@ -315,6 +363,7 @@ impl LiveActor {
             bao_store,
             downloader,
             max_inline_value_size,
+            tag_hold,
             sync_actor_tx,
             running_sync_connect: Default::default(),
             running_sync_connect_ids: Default::default(),
@@ -325,7 +374,9 @@ impl LiveActor {
             download_task_ids: Default::default(),
             state: Default::default(),
             missing_hashes: Default::default(),
+            policy_missing: Default::default(),
             queued_hashes: Default::default(),
+            pending_values: Default::default(),
             hash_providers: Default::default(),
             pending_downloads: Default::default(),
             metrics,
@@ -498,8 +549,8 @@ impl LiveActor {
             } => {
                 self.deferred_resyncs
                     .entry(namespace)
-                    .and_modify(|at| *at = (*at).min(retry_at))
-                    .or_insert(retry_at);
+                    .and_modify(|(at, _)| *at = (*at).min(retry_at))
+                    .or_insert((retry_at, HashSet::new()));
             }
             ToLiveActor::GossipLagged { namespace } => {
                 self.on_gossip_lagged(namespace).await;
@@ -546,6 +597,14 @@ impl LiveActor {
             } => {
                 self.on_neighbor_content_ready(namespace, node, hash).await;
             }
+            ToLiveActor::InlineValue {
+                namespace,
+                node,
+                hash,
+                value,
+            } => {
+                self.on_inline_value(namespace, node, hash, value).await;
+            }
         };
         Ok(true)
     }
@@ -580,11 +639,13 @@ impl LiveActor {
     }
 
     /// A timer that completes when the earliest deferred re-sync is due.
-    fn deferred_resync_timer(deferred: &HashMap<NamespaceId, Instant>) -> n0_future::time::Sleep {
+    fn deferred_resync_timer(
+        deferred: &HashMap<NamespaceId, (Instant, HashSet<PublicKey>)>,
+    ) -> n0_future::time::Sleep {
         let earliest = deferred
             .values()
+            .map(|(at, _)| *at)
             .min()
-            .copied()
             .unwrap_or_else(Instant::now);
         n0_future::time::sleep_until(earliest)
     }
@@ -595,15 +656,21 @@ impl LiveActor {
         let due: Vec<NamespaceId> = self
             .deferred_resyncs
             .iter()
-            .filter(|(_, at)| **at <= now)
+            .filter(|(_, (at, _))| *at <= now)
             .map(|(namespace, _)| *namespace)
             .collect();
         for namespace in due {
-            self.deferred_resyncs.remove(&namespace);
+            let Some((_, offerers)) = self.deferred_resyncs.remove(&namespace) else {
+                continue;
+            };
             if !self.state.is_syncing(&namespace) {
                 continue;
             }
-            let peers = self.neighbors.get(&namespace).cloned().unwrap_or_default();
+            // Dial the offerers even if they left the swarm: they are the ones
+            // known to hold the refused entries. Gossip neighbors cover the
+            // case where the offerer is gone.
+            let mut peers = self.neighbors.get(&namespace).cloned().unwrap_or_default();
+            peers.extend(offerers);
             for peer in peers {
                 self.sync_with_peer(namespace, peer, SyncReason::DeferredValidation);
             }
@@ -611,11 +678,16 @@ impl LiveActor {
     }
 
     /// Log one warning per interval and schedule re-syncs for entries refused during a sync.
+    ///
+    /// `truncated` counts rejects dropped by the per-exchange cap; the offerer
+    /// is recorded so the deferred re-sync dials it, not just current gossip
+    /// neighbors.
     fn warn_and_schedule_rejected(
         &mut self,
         namespace: NamespaceId,
         peer: PublicKey,
         rejected: &[RejectedEntry],
+        truncated: usize,
     ) {
         let mut earliest: Option<Instant> = None;
         for entry in rejected {
@@ -627,21 +699,33 @@ impl LiveActor {
         if let Some(at) = earliest {
             self.deferred_resyncs
                 .entry(namespace)
-                .and_modify(|prev| *prev = (*prev).min(at))
-                .or_insert(at);
+                .and_modify(|(prev, peers)| {
+                    *prev = (*prev).min(at);
+                    peers.insert(peer);
+                })
+                .or_insert_with(|| (at, HashSet::from([peer])));
         }
         if !reaction_allowed(&mut self.validation_warned, namespace) {
             return;
         }
-        let first = &rejected[0];
-        warn!(
-            peer = %peer.fmt_short(),
-            namespace = %namespace.fmt_short(),
-            hash = %first.hash,
-            reason = %first.failure,
-            count = rejected.len(),
-            "refused remote entries during sync; will re-sync when they can pass validation"
-        );
+        if let Some(first) = rejected.first() {
+            warn!(
+                peer = %peer.fmt_short(),
+                namespace = %namespace.fmt_short(),
+                hash = %first.hash,
+                reason = %first.failure,
+                count = rejected.len(),
+                truncated,
+                "refused remote entries during sync; will re-sync when they can pass validation"
+            );
+        } else if truncated > 0 {
+            warn!(
+                peer = %peer.fmt_short(),
+                namespace = %namespace.fmt_short(),
+                count = truncated,
+                "all refused entries were dropped by the per-exchange cap"
+            );
+        }
     }
 
     /// A subscription dropped events: re-subscribe (the fresh receive loop reports our
@@ -653,17 +737,28 @@ impl LiveActor {
         if !reaction_allowed(&mut self.lagged_reacted, namespace) {
             return;
         }
-        self.metrics.doc_gossip_lagged.inc();
         // A lag report can arrive after the namespace left; its receive loop is gone then.
+        // Count only reactions that actually act, not reports for dead subscriptions.
         if !self.state.is_syncing(&namespace) {
             return;
         }
+        self.metrics.doc_gossip_lagged.inc();
         warn!(
             namespace = %namespace.fmt_short(),
             "gossip subscription dropped events; re-subscribing and re-syncing"
         );
+        // Re-join with the neighbors we already know as bootstrap: the fresh
+        // receive loop only reports neighbors again once they talk to us, and
+        // a quiet swarm would leave the dropped entries un-repaired.
+        let peers: Vec<PublicKey> = self
+            .neighbors
+            .get(&namespace)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         self.gossip.quit(&namespace);
-        if let Err(err) = self.gossip.join(namespace, vec![]).await {
+        if let Err(err) = self.gossip.join(namespace, peers).await {
             warn!(?err, namespace = %namespace.fmt_short(), "failed to re-subscribe after gossip lag");
         }
     }
@@ -949,11 +1044,17 @@ impl LiveActor {
 
                 // Entries refused during the exchange: warn once per interval and re-sync once
                 // the wall clock has caught up enough for them to pass validation.
-                if !details.outcome.rejected.is_empty() {
-                    self.metrics
-                        .entries_rejected_validation
-                        .inc_by(details.outcome.rejected.len() as u64);
-                    self.warn_and_schedule_rejected(namespace, peer, &details.outcome.rejected);
+                if !details.outcome.rejected.is_empty() || details.outcome.rejected_truncated > 0 {
+                    self.metrics.entries_rejected_validation.inc_by(
+                        (details.outcome.rejected.len() + details.outcome.rejected_truncated)
+                            as u64,
+                    );
+                    self.warn_and_schedule_rejected(
+                        namespace,
+                        peer,
+                        &details.outcome.rejected,
+                        details.outcome.rejected_truncated,
+                    );
                 }
             }
         };
@@ -1090,7 +1191,20 @@ impl LiveActor {
     ) {
         let removed = self.queued_hashes.remove_hash(&hash);
         debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), namespaces=removed.namespaces.len(), completed_namespaces=removed.completed_namespaces.len(), "download ready");
-        if res.is_ok() {
+        // A failed download does not mean the content is missing: an inline
+        // value may have completed it while the download was in flight (the
+        // value rides a different gossip topic and wins the race), in which
+        // case the content is already in the store and this is the last
+        // place that could still announce it — flush skipped the announce
+        // because the hash had left missing_hashes when the download was
+        // queued, and the inline import only announces when the hash is
+        // still recorded missing or policy-blocked.
+        let complete = res.is_ok()
+            || matches!(
+                self.bao_store.status(hash).await,
+                Ok(BlobStatus::Complete { .. })
+            );
+        if complete {
             for namespace in removed.namespaces.iter().copied() {
                 self.missing_hashes.remove(hash, &namespace);
                 self.emit_content_ready(namespace, hash).await;
@@ -1117,6 +1231,114 @@ impl LiveActor {
     ) {
         self.queue_download(namespace, hash, node, true);
         self.flush_pending_downloads().await;
+    }
+
+    /// A value arrived on the namespace's inline-values gossip topic.
+    ///
+    /// The import is gated on the content being wanted — an entry for the
+    /// hash is missing, its download policy forbids fetching it
+    /// ([`Self::policy_missing`]), a download is queued, or a download
+    /// candidate is pending. A value whose entry has not arrived yet is not
+    /// dropped: it is held briefly in [`Self::pending_values`] so the entry
+    /// can complete it without a download, which also covers the policy
+    /// case where a download is forbidden and the drop would be permanent.
+    /// Anything that fails hash verification is dropped before any store
+    /// write or cache insert: `PutValue` carries no entry, so verification
+    /// is the only gate between an unvalidated gossip message and the blob
+    /// store, and any swarm member knowing the namespace id could otherwise
+    /// broadcast values that every node writes to disk (the entry itself is
+    /// only validated when `Op::Put` is processed).
+    async fn on_inline_value(
+        &mut self,
+        namespace: NamespaceId,
+        node: PublicKey,
+        hash: Hash,
+        value: Bytes,
+    ) {
+        let wanted = self.missing_hashes.contains(hash, &namespace)
+            || self.policy_missing.contains(hash, &namespace)
+            || self.queued_hashes.contains_hash(&hash)
+            || self
+                .pending_downloads
+                .iter()
+                .any(|candidate| candidate.namespace == namespace && candidate.hash == hash);
+        if value.len() > self.max_inline_value_size || Hash::new(&value) != hash {
+            if wanted && reaction_allowed(&mut self.validation_warned, namespace) {
+                warn!(
+                    peer = %node.fmt_short(),
+                    namespace = %namespace.fmt_short(),
+                    %hash,
+                    "inline value failed verification; ignoring"
+                );
+            }
+            return;
+        }
+        if !wanted {
+            self.cache_pending_value(hash, value);
+            return;
+        }
+        match self.bao_store.status(hash).await {
+            Ok(BlobStatus::Complete { .. }) => {}
+            Ok(_) => match self.bao_store.add_bytes(value).temp_tag().await {
+                Ok(tag) => {
+                    if let Some(hold) = &self.tag_hold {
+                        hold.hold(tag);
+                    }
+                    // Without a protect handler the tag simply drops: nothing
+                    // enumerates, and no sweep protects document content.
+                }
+                Err(err) => {
+                    debug!(?err, %hash, "failed to import inline value");
+                    return;
+                }
+            },
+            Err(err) => {
+                debug!(?err, %hash, "failed to check status before inline value import");
+                return;
+            }
+        }
+        // The content is complete either way now: flush turns any pending
+        // candidate into a zero-network ContentReady instead of a download.
+        self.flush_pending_downloads().await;
+        // If the hash is still recorded as missing after the flush, nothing
+        // was queued or pending for it (its download policy forbids
+        // fetching, or no provider was known), so nothing else will ever
+        // announce it: the inline value completed it.
+        if self.missing_hashes.remove(hash, &namespace)
+            || self.policy_missing.remove(hash, &namespace)
+        {
+            self.emit_content_ready(namespace, hash).await;
+        }
+    }
+
+    /// Hold a verified value whose entry has not arrived yet.
+    ///
+    /// Values ride a different gossip topic than their entries and either
+    /// may win the race. Dropping a value-first arrival loses the content
+    /// for good when no peer can serve a download (the author is gone, or
+    /// the download policy forbids fetching), so the value is held briefly
+    /// instead and imported by the entry's
+    /// [`crate::Event::RemoteInsert`] handling. Only hash-verified values
+    /// are cached — the caller checks before inserting — and the cache is
+    /// bounded to [`MAX_PENDING_VALUES`] entries with a
+    /// [`PENDING_VALUE_TTL`] lifetime, so an unsolicited value can occupy
+    /// memory for a minute at most and never reaches the blob store from
+    /// here.
+    fn cache_pending_value(&mut self, hash: Hash, value: Bytes) {
+        let now = Instant::now();
+        self.pending_values.retain(|_, (_, expires)| *expires > now);
+        if self.pending_values.len() >= MAX_PENDING_VALUES {
+            if let Some(oldest) = self
+                .pending_values
+                .iter()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(hash, _)| *hash)
+            {
+                self.pending_values.remove(&oldest);
+            }
+        }
+        self.pending_values
+            .insert(hash, (value, now + PENDING_VALUE_TTL));
     }
 
     #[instrument("on_sync_report", skip_all, fields(peer = %from.fmt_short(), namespace = %report.namespace.fmt_short()))]
@@ -1150,30 +1372,39 @@ impl LiveActor {
         match event {
             crate::Event::LocalInsert { namespace, entry } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
-                // A new entry was inserted locally. Broadcast a gossip message,
-                // with the entry's value inlined when it fits the threshold.
+                // A new entry was inserted locally. The entry always rides the
+                // namespace topic in the version-0 shape, so peers that
+                // predate inline values keep decoding it; the value rides the
+                // derived inline-values topic, which only inline-value-capable
+                // peers subscribe to. Old and new peers can therefore gossip
+                // with each other across a rolling upgrade.
                 if self.state.is_syncing(&namespace) {
-                    let mut value = None;
+                    let op = Op::Put {
+                        entry: entry.clone(),
+                    };
+                    let message: Bytes = postcard::to_stdvec(&op)?.into();
+                    self.gossip.broadcast(&namespace, message).await;
                     if self.max_inline_value_size > 0
                         && entry.content_len() <= self.max_inline_value_size as u64
                     {
                         match self.bao_store.blobs().get_bytes(entry.content_hash()).await {
-                            Ok(bytes) => value = Some(bytes),
+                            Ok(bytes) => {
+                                let op = Op::PutValue {
+                                    hash: entry.content_hash(),
+                                    value: bytes,
+                                };
+                                let message: Bytes = postcard::to_stdvec(&op)?.into();
+                                // Gossip messages have a size cap; if the
+                                // value pushed the message over it, the entry
+                                // still rode the namespace topic and the
+                                // peers download the value as usual.
+                                if message.len() <= self.gossip.max_message_size() {
+                                    self.gossip.broadcast_values(&namespace, message).await;
+                                }
+                            }
                             Err(err) => debug!(?err, "failed to read value for inline gossip"),
                         }
                     }
-                    let op = Op::Put {
-                        entry: entry.clone(),
-                        value,
-                    };
-                    let mut message: Bytes = postcard::to_stdvec(&op)?.into();
-                    // Gossip messages have a size cap; if the inline value
-                    // pushed the message over it, fall back to the bare entry.
-                    if message.len() > self.gossip.max_message_size() {
-                        let op = Op::Put { entry, value: None };
-                        message = postcard::to_stdvec(&op)?.into();
-                    }
-                    self.gossip.broadcast(&namespace, message).await;
                 }
             }
             crate::Event::RemoteInsert {
@@ -1186,8 +1417,36 @@ impl LiveActor {
                 debug!(namespace=%namespace.fmt_short(), "replica event: RemoteInsert");
                 // A new entry was inserted from initial sync or gossip. Queue downloading the
                 // content.
+                let hash = entry.content_hash();
+                // A verified inline value may have arrived before its entry:
+                // import it now instead of downloading. This is the one path
+                // that can complete content whose download policy forbids
+                // fetching, and it is not a download.
+                if let Some((value, expires)) = self.pending_values.remove(&hash) {
+                    if expires > Instant::now() {
+                        match self.bao_store.status(hash).await {
+                            Ok(BlobStatus::Complete { .. }) => {}
+                            Ok(_) => match self.bao_store.add_bytes(value).temp_tag().await {
+                                Ok(tag) => {
+                                    if let Some(hold) = &self.tag_hold {
+                                        hold.hold(tag);
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!(?err, %hash, "failed to import cached inline value");
+                                }
+                            },
+                            Err(err) => {
+                                debug!(?err, %hash, "failed to check status before cached inline value import");
+                            }
+                        }
+                        self.missing_hashes.remove(hash, &namespace);
+                        self.policy_missing.remove(hash, &namespace);
+                        self.emit_content_ready(namespace, hash).await;
+                        return Ok(());
+                    }
+                }
                 if should_download {
-                    let hash = entry.content_hash();
                     if matches!(remote_content_status, ContentStatus::Complete) {
                         let node_id = PublicKey::from_bytes(&from)?;
                         self.queue_download(namespace, hash, node_id, false);
@@ -1201,6 +1460,13 @@ impl LiveActor {
                             self.queue_download(namespace, hash, node, true);
                         }
                     }
+                } else {
+                    // The download policy forbids fetching this content, so
+                    // nothing is queued. The gap is still recorded either
+                    // way: whatever the remote reports, we cannot download,
+                    // and an inline value may fill it — inlining is not a
+                    // download.
+                    self.policy_missing.insert(hash, namespace);
                 }
             }
         }
@@ -1880,10 +2146,12 @@ mod task_failure_tests {
 
         // Both sides join the gossip topic and run their initial syncs. Both rounds must be
         // done before the burst: an in-flight sync would otherwise repair the loss on its own
-        // and the test would prove nothing.
+        // and the test would prove nothing. This phase runs no fault and proves nothing about
+        // lag, so it gets the same generous bound as the lag and repair waits below: the test
+        // itself needs ~23s even alone, and the full suite runs it in parallel.
         doc_a.start_sync(vec![]).await?;
         doc_b.start_sync(ticket.nodes.clone()).await?;
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             let mut initial = 0;
             while initial < 2 {
                 let Some(ev) = events.next().await else {
@@ -2068,6 +2336,7 @@ mod takeover_tests {
             tx,
             Default::default(),
             0,
+            None,
         )?;
         Ok((actor, endpoint))
     }
@@ -2206,18 +2475,23 @@ mod takeover_tests {
                 Ok(details),
             )
             .await;
-        let scheduled = actor
+        let (scheduled, offerers) = actor
             .deferred_resyncs
             .get(&ns)
-            .copied()
             .expect("a deferred re-sync is scheduled");
         assert!(
-            scheduled >= retry_at && scheduled <= retry_at + Duration::from_secs(1),
+            *scheduled >= retry_at && *scheduled <= retry_at + Duration::from_secs(1),
             "scheduled roughly one minute out: {scheduled:?}"
         );
+        assert!(
+            offerers.contains(&peer),
+            "the entry's offerer is recorded for the deferred re-sync"
+        );
 
-        // The deadline arrives: the fired re-sync starts a connect with the peer.
-        actor.deferred_resyncs.insert(ns, Instant::now());
+        // The deadline arrives: even with no gossip neighbor left, the fired
+        // re-sync dials the recorded offerer.
+        actor.neighbors.get_mut(&ns).expect("neighbor").clear();
+        actor.deferred_resyncs.get_mut(&ns).expect("scheduled").0 = Instant::now();
         actor.fire_deferred_resyncs();
         assert!(
             !actor.running_sync_connect.is_empty(),

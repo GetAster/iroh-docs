@@ -79,13 +79,25 @@ pub const NAMESPACE_SEQUENCE_TABLE: TableDefinition<&[u8; 32], u64> =
 /// Key:   `([u8; 32], u64)`   # (NamespaceId, sequence)
 /// Value: `([u8; 32], &[u8])` # (AuthorId, Key) touched by that put
 ///
-/// Append-only: one row per state-changing put. A key a later put
-/// superseded keeps its earlier rows, so a consumer can replay the touch
-/// history since a sequence and resolve each key to its latest record.
+/// One row per record key, at its latest touch: a new touch removes the
+/// key's previous row, so the table stays bounded by the record count and
+/// a consumer replaying since a sequence sees each key once. (Rows written
+/// before the key index existed keep their duplicates; `entries_since`
+/// dedupes them at read time.)
 pub const RECORDS_BY_SEQ_TABLE: TableDefinition<RecordsBySeqKey, RecordsBySeqValue> =
     TableDefinition::new("records-by-seq-1");
 pub type RecordsBySeqKey<'a> = (&'a [u8; 32], u64);
 pub type RecordsBySeqValue<'a> = (&'a [u8; 32], &'a [u8]);
+
+/// Table: Latest touch sequence per record key.
+/// Key:   `([u8; 32], &[u8], [u8; 32])` # (NamespaceId, Key, AuthorId)
+/// Value: `u64`                         # the key's latest touch sequence
+///
+/// Backs the compaction of [`RECORDS_BY_SEQ_TABLE`]: putting a key reads
+/// its previous touch here and removes that row before inserting the new
+/// one.
+pub const RECORDS_BY_SEQ_KEY_TABLE: TableDefinition<RecordsByKeyId, u64> =
+    TableDefinition::new("records-by-seq-key-1");
 
 /// Table: Peers per document.
 /// Key:   `[u8; 32]`        # NamespaceId
@@ -165,6 +177,7 @@ pub struct Tables<'tx> {
     pub namespace_fingerprint: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
     pub namespace_sequence: Table<'tx, &'static [u8; 32], u64>,
     pub records_by_seq: Table<'tx, RecordsBySeqKey<'static>, RecordsBySeqValue<'static>>,
+    pub records_by_seq_key: Table<'tx, RecordsByKeyId<'static>, u64>,
 }
 
 impl<'tx> Tables<'tx> {
@@ -180,6 +193,7 @@ impl<'tx> Tables<'tx> {
         let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
         let namespace_sequence = tx.open_table(NAMESPACE_SEQUENCE_TABLE)?;
         let records_by_seq = tx.open_table(RECORDS_BY_SEQ_TABLE)?;
+        let records_by_seq_key = tx.open_table(RECORDS_BY_SEQ_KEY_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
@@ -192,6 +206,7 @@ impl<'tx> Tables<'tx> {
             namespace_fingerprint,
             namespace_sequence,
             records_by_seq,
+            records_by_seq_key,
         })
     }
 }
@@ -210,6 +225,7 @@ pub struct ReadOnlyTables {
     pub namespace_fingerprint: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
     pub namespace_sequence: ReadOnlyTable<&'static [u8; 32], u64>,
     pub records_by_seq: ReadOnlyTable<RecordsBySeqKey<'static>, RecordsBySeqValue<'static>>,
+    pub records_by_seq_key: ReadOnlyTable<RecordsByKeyId<'static>, u64>,
     tx: ReadTransaction,
 }
 
@@ -226,6 +242,7 @@ impl ReadOnlyTables {
         let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
         let namespace_sequence = tx.open_table(NAMESPACE_SEQUENCE_TABLE)?;
         let records_by_seq = tx.open_table(RECORDS_BY_SEQ_TABLE)?;
+        let records_by_seq_key = tx.open_table(RECORDS_BY_SEQ_KEY_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
@@ -238,6 +255,7 @@ impl ReadOnlyTables {
             namespace_fingerprint,
             namespace_sequence,
             records_by_seq,
+            records_by_seq_key,
             tx,
         })
     }

@@ -56,7 +56,7 @@ async fn fingerprint_sequence_and_replay_over_the_api() -> Result<()> {
     let empty: [u8; 32] = *blake3::hash(&[]).as_bytes();
     assert_eq!(doc.namespace_fingerprint().await?, empty);
     assert_eq!(doc.namespace_sequence().await?, 0);
-    assert!(doc.entries_since(0).await?.is_empty());
+    assert!(doc.entries_since(0, 0).await?.is_empty());
 
     // Puts bump the sequence and move the fingerprint.
     clock.advance();
@@ -78,7 +78,7 @@ async fn fingerprint_sequence_and_replay_over_the_api() -> Result<()> {
 
     // Replay since seq 1: the b touch at 2 and the a touch at 3, each with
     // its latest entry, ordered by touch sequence.
-    let entries = doc.entries_since(1).await?;
+    let entries = doc.entries_since(1, 0).await?;
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].0, 2);
     assert_eq!(entries[0].1.key(), b"b");
@@ -87,7 +87,7 @@ async fn fingerprint_sequence_and_replay_over_the_api() -> Result<()> {
     assert_eq!(entries[1].1.content_hash(), iroh_blobs::Hash::new(b"3"));
 
     // Replay since the latest sequence is empty.
-    assert!(doc.entries_since(3).await?.is_empty());
+    assert!(doc.entries_since(3, 0).await?.is_empty());
 
     // A delete is a state-changing put too. It leaves a tombstone row, so
     // the replay emits it with the empty-content hash.
@@ -96,7 +96,7 @@ async fn fingerprint_sequence_and_replay_over_the_api() -> Result<()> {
     doc.del(author, b"b".to_vec()).await?;
     assert_eq!(doc.namespace_sequence().await?, 4);
     assert_ne!(doc.namespace_fingerprint().await?, fp_before_delete);
-    let tombstones = doc.entries_since(3).await?;
+    let tombstones = doc.entries_since(3, 0).await?;
     assert_eq!(tombstones.len(), 1);
     assert_eq!(tombstones[0].0, 4);
     assert_eq!(tombstones[0].1.key(), b"b");
@@ -108,7 +108,7 @@ async fn fingerprint_sequence_and_replay_over_the_api() -> Result<()> {
     doc.set_bytes(author, b"b".to_vec(), b"2".to_vec()).await?;
     assert_eq!(doc.namespace_sequence().await?, 5);
     assert_ne!(doc.namespace_fingerprint().await?, fp_before_delete);
-    let replayed = doc.entries_since(3).await?;
+    let replayed = doc.entries_since(3, 0).await?;
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].0, 5);
     assert_eq!(replayed[0].1.content_hash(), iroh_blobs::Hash::new(b"2"));

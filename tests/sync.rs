@@ -743,8 +743,12 @@ async fn test_sync_via_relay() -> Result<()> {
     node2.online().await;
     let doc1 = node1.docs().create().await?;
     let author1 = node1.docs().author_create().await?;
+    // Above the inline-value threshold (1024), so the value does not ride
+    // the sync or gossip messages: the InsertRemote reports Missing and the
+    // download below proves content flows over the relay.
+    let big: Vec<u8> = vec![0xBA; 2048];
     let inserted_hash = doc1
-        .set_bytes(author1, b"foo".to_vec(), b"bar".to_vec())
+        .set_bytes(author1, b"foo".to_vec(), big.clone())
         .await?;
     let mut ticket = doc1
         .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
@@ -771,9 +775,11 @@ async fn test_sync_via_relay() -> Result<()> {
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(n) if *n== node1_id)),
             Box::new(move |e| match_sync_finished(e, node1_id)),
             Box::new(
-                // Small values arrive inline and report Complete; larger ones
-                // report Missing/Incomplete until their download finishes.
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete | ContentStatus::Complete, .. } if *from == node1_id),
+                // Above the inline threshold, so the value is not inlined and
+                // the insert reports Missing until the download completes.
+                // Incomplete is also legitimate: the status lookup races the
+                // downloader, which may already have opened a partial entry.
+                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete, .. } if *from == node1_id),
             ),
             Box::new(
                 move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == inserted_hash),
@@ -790,20 +796,22 @@ async fn test_sync_via_relay() -> Result<()> {
                 .content_hash(),
         )
         .await?;
-    assert_eq!(actual.as_ref(), b"bar");
+    assert_eq!(actual.as_ref(), &big[..]);
 
     // update
+    let big2: Vec<u8> = vec![0xBE; 2048];
     let updated_hash = doc1
-        .set_bytes(author1, b"foo".to_vec(), b"update".to_vec())
+        .set_bytes(author1, b"foo".to_vec(), big2.clone())
         .await?;
     assert_next_unordered_with_optionals(
         &mut events,
         Duration::from_secs(10),
         vec![
             Box::new(
-                // Small values arrive inline and report Complete; larger ones
-                // report Missing/Incomplete until their download finishes.
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete | ContentStatus::Complete, .. } if *from == node1_id),
+                // Above the inline threshold: reports Missing until the
+                // download completes; Incomplete is the same downloader race
+                // as above.
+                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete, .. } if *from == node1_id),
             ),
             Box::new(
                 move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == updated_hash),
@@ -822,7 +830,7 @@ async fn test_sync_via_relay() -> Result<()> {
                 .content_hash(),
         )
         .await?;
-    assert_eq!(actual.as_ref(), b"update");
+    assert_eq!(actual.as_ref(), &big2[..]);
     Ok(())
 }
 

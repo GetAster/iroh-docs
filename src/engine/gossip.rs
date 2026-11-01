@@ -3,9 +3,11 @@ use std::collections::{hash_map, HashMap};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::EndpointId;
+use iroh_blobs::Hash;
 use iroh_gossip::{
     api::{Event, GossipReceiver, GossipSender, JoinOptions},
     net::Gossip,
+    TopicId,
 };
 use n0_future::{
     task::{AbortHandle, JoinSet},
@@ -20,9 +22,33 @@ use crate::{
     ContentStatus, NamespaceId,
 };
 
+/// Suffix hashed together with a namespace id to derive its inline-values
+/// topic; see [`values_topic`].
+const VALUES_TOPIC_SUFFIX: &[u8] = b"|inline-v1";
+
+/// The derived topic a namespace's inline entry values ride on.
+///
+/// Entries themselves keep the frozen version-0 wire shape on the namespace
+/// topic, so peers that predate inline values keep decoding them; the value
+/// rides on this derived topic, and only inline-value-capable peers
+/// subscribe to it, so old peers never see the new wire shape while old and
+/// new peers keep gossiping entries together across a rolling upgrade. The
+/// derivation is a hash of the namespace id and a suffix, so the topic is
+/// stable per namespace and distinct from every real namespace.
+fn values_topic(namespace: NamespaceId) -> TopicId {
+    let mut bytes = [0u8; 32 + VALUES_TOPIC_SUFFIX.len()];
+    bytes[..32].copy_from_slice(namespace.as_ref());
+    bytes[32..].copy_from_slice(VALUES_TOPIC_SUFFIX);
+    TopicId::from_bytes(*Hash::new(bytes).as_bytes())
+}
+
 #[derive(Debug)]
 struct ActiveState {
     sender: GossipSender,
+    /// Sender for the derived inline-values topic; `None` when the engine
+    /// runs with inline values disabled, in which case the topic is neither
+    /// subscribed nor broadcast to.
+    values_sender: Option<GossipSender>,
     abort_handle: AbortHandle,
 }
 
@@ -33,16 +59,25 @@ pub struct GossipState {
     to_live_actor: mpsc::Sender<ToLiveActor>,
     active: HashMap<NamespaceId, ActiveState>,
     active_tasks: JoinSet<(NamespaceId, Result<()>)>,
+    /// Whether the engine runs with inline values enabled: only then is the
+    /// derived values topic joined.
+    inline_values: bool,
 }
 
 impl GossipState {
-    pub fn new(gossip: Gossip, sync: SyncHandle, to_live_actor: mpsc::Sender<ToLiveActor>) -> Self {
+    pub fn new(
+        gossip: Gossip,
+        sync: SyncHandle,
+        to_live_actor: mpsc::Sender<ToLiveActor>,
+        inline_values: bool,
+    ) -> Self {
         Self {
             gossip,
             sync,
             to_live_actor,
             active: Default::default(),
             active_tasks: Default::default(),
+            inline_values,
         }
     }
 
@@ -56,19 +91,39 @@ impl GossipState {
             hash_map::Entry::Vacant(entry) => {
                 let sub = self
                     .gossip
-                    .subscribe_with_opts(namespace.into(), JoinOptions::with_bootstrap(bootstrap))
+                    .subscribe_with_opts(
+                        namespace.into(),
+                        JoinOptions::with_bootstrap(bootstrap.clone()),
+                    )
                     .await?;
 
                 let (sender, stream) = sub.split();
+
+                let (values_sender, values_recv) = if self.inline_values {
+                    let sub = self
+                        .gossip
+                        .subscribe_with_opts(
+                            values_topic(namespace),
+                            JoinOptions::with_bootstrap(bootstrap),
+                        )
+                        .await?;
+                    let (sender, recv) = sub.split();
+                    (Some(sender), Some(recv))
+                } else {
+                    (None, None)
+                };
+
                 let to_live_actor = self.to_live_actor.clone();
                 let sync = self.sync.clone();
                 let abort_handle = self.active_tasks.spawn(async move {
-                    let res = receive_loop(namespace, stream, to_live_actor, sync).await;
+                    let res =
+                        receive_loop(namespace, stream, values_recv, to_live_actor, sync).await;
 
                     (namespace, res)
                 });
                 entry.insert(ActiveState {
                     sender,
+                    values_sender,
                     abort_handle,
                 });
             }
@@ -92,6 +147,16 @@ impl GossipState {
     pub async fn broadcast(&mut self, namespace: &NamespaceId, message: Bytes) {
         if let Some(state) = self.active.get_mut(namespace) {
             state.sender.broadcast(message).await.ok();
+        }
+    }
+
+    /// Broadcast on the namespace's derived inline-values topic. No-op when
+    /// inline values are disabled or the namespace is not joined.
+    pub async fn broadcast_values(&mut self, namespace: &NamespaceId, message: Bytes) {
+        if let Some(state) = self.active.get_mut(namespace) {
+            if let Some(sender) = &state.values_sender {
+                sender.broadcast(message).await.ok();
+            }
         }
     }
 
@@ -145,10 +210,18 @@ impl GossipState {
     }
 }
 
+/// Which of the namespace's two topics a message arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Entries,
+    Values,
+}
+
 #[instrument("gossip-recv", skip_all, fields(namespace=%namespace.fmt_short()))]
 async fn receive_loop(
     namespace: NamespaceId,
     mut recv: GossipReceiver,
+    mut values_recv: Option<GossipReceiver>,
     to_sync_actor: mpsc::Sender<ToLiveActor>,
     sync: SyncHandle,
 ) -> Result<()> {
@@ -158,7 +231,19 @@ async fn receive_loop(
             .send(ToLiveActor::NeighborUp { namespace, peer })
             .await?;
     }
-    while let Some(event) = recv.try_next().await? {
+    loop {
+        let (source, event) = match &mut values_recv {
+            Some(values_recv) => tokio::select! {
+                event = recv.try_next() => (Source::Entries, event),
+                event = values_recv.try_next() => (Source::Values, event),
+            },
+            None => (Source::Entries, recv.try_next().await),
+        };
+        let event = match event {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(err) => return Err(err).context("gossip receive stream failed"),
+        };
         match event {
             Event::Lagged => {
                 // The subscription's buffer overflowed and the skipped events are gone for
@@ -170,9 +255,27 @@ async fn receive_loop(
                 continue;
             }
             Event::Received(msg) => {
-                let op: Op = postcard::from_bytes(&msg.content)?;
+                let op: Op = match postcard::from_bytes(&msg.content) {
+                    Ok(op) => op,
+                    Err(err) => {
+                        // One undecodable message must never end the loop:
+                        // that dropped the namespace from the active set
+                        // with only a warn and never re-joined it, so one
+                        // stray frame from a broken or malicious peer ended
+                        // live gossip for the namespace on every listener
+                        // until restart.
+                        if warn_limiter.allow() {
+                            warn!(
+                                ?err,
+                                namespace = %namespace.fmt_short(),
+                                "failed to decode gossip message; skipping"
+                            );
+                        }
+                        continue;
+                    }
+                };
                 match op {
-                    Op::Put { entry, value } => {
+                    Op::Put { entry } => {
                         debug!(peer = %msg.delivered_from.fmt_short(), namespace = %namespace.fmt_short(), "received entry via gossip");
                         #[cfg(test)]
                         super::live::fault::maybe_delay_remote_insert(&namespace).await;
@@ -181,8 +284,10 @@ async fn receive_loop(
                         // directly from the author, we assume that the content is available at
                         // that peer. Otherwise we don't.
                         // The download is not triggered here, but in the `on_replica_event`
-                        // handler for the `InsertRemote` event. `value` rides inline in the
-                        // message (small entries only) and is imported by the sync actor.
+                        // handler for the `InsertRemote` event. The entry carries no value:
+                        // values ride the derived inline-values topic (see
+                        // `ToLiveActor::InlineValue`), and the entry is validated by the sync
+                        // actor before any import happens.
                         let content_status = match msg.scope.is_direct() {
                             true => ContentStatus::Complete,
                             false => ContentStatus::Missing,
@@ -190,7 +295,7 @@ async fn receive_loop(
                         let from = *msg.delivered_from.as_bytes();
                         let hash = entry.content_hash();
                         match sync
-                            .insert_remote(namespace, entry, from, content_status, value)
+                            .insert_remote(namespace, entry, from, content_status)
                             .await
                         {
                             Ok(()) => {}
@@ -224,6 +329,19 @@ async fn receive_loop(
                             Err(err) => debug!("ignoring entry received via gossip: {err}"),
                         }
                     }
+                    Op::PutValue { hash, value } => {
+                        // Forwarded regardless of which topic it arrived on;
+                        // the live actor imports it only for wanted content
+                        // and verifies it against the hash first.
+                        to_sync_actor
+                            .send(ToLiveActor::InlineValue {
+                                namespace,
+                                node: msg.delivered_from,
+                                hash,
+                                value,
+                            })
+                            .await?;
+                    }
                     Op::ContentReady(hash) => {
                         to_sync_actor
                             .send(ToLiveActor::NeighborContentReady {
@@ -244,14 +362,20 @@ async fn receive_loop(
                 }
             }
             Event::NeighborUp(peer) => {
-                to_sync_actor
-                    .send(ToLiveActor::NeighborUp { namespace, peer })
-                    .await?;
+                // Only the entries topic's neighborhood defines gossip
+                // neighbors; the values topic shares the same peers.
+                if source == Source::Entries {
+                    to_sync_actor
+                        .send(ToLiveActor::NeighborUp { namespace, peer })
+                        .await?;
+                }
             }
             Event::NeighborDown(peer) => {
-                to_sync_actor
-                    .send(ToLiveActor::NeighborDown { namespace, peer })
-                    .await?;
+                if source == Source::Entries {
+                    to_sync_actor
+                        .send(ToLiveActor::NeighborDown { namespace, peer })
+                        .await?;
+                }
             }
         }
     }
@@ -279,7 +403,7 @@ mod tests {
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let sync = SyncHandle::spawn(crate::store::Store::memory(), None, "test".to_string());
         let (tx, _rx) = mpsc::channel(8);
-        let mut state = GossipState::new(gossip, sync, tx);
+        let mut state = GossipState::new(gossip, sync, tx, false);
         let namespace = NamespaceId::from(&[7u8; 32]);
         state.join(namespace, vec![]).await?;
         assert!(!state.is_empty());

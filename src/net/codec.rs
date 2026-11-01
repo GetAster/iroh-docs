@@ -12,17 +12,23 @@ use tracing::{debug, trace, Span};
 
 use crate::{
     actor::SyncHandle,
-    net::{AbortReason, AcceptError, AcceptOutcome, ConnectError},
+    net::{AbortReason, AcceptError, AcceptOutcome, ConnectError, WireFormat},
+    sync::{ProtocolMessage, ProtocolMessageV0},
     NamespaceId, SyncOutcome,
 };
 
-#[derive(Debug, Default)]
-struct SyncCodec;
+/// Codec for one sync connection, encoding and decoding in the wire format
+/// negotiated via ALPN: legacy connections use the frozen version-0 message
+/// shape (entries without values), inline connections carry values.
+#[derive(Debug, Clone, Copy)]
+struct SyncCodec {
+    wire: WireFormat,
+}
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // This is likely too large, but lets have some restrictions
 
 impl Decoder for SyncCodec {
-    type Item = Message;
+    type Item = Message<ProtocolMessage>;
     type Error = anyhow::Error;
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < 4 {
@@ -39,18 +45,48 @@ impl Decoder for SyncCodec {
             return Ok(None);
         }
 
-        let message: Message = postcard::from_bytes(&src[4..4 + frame_len])?;
+        let message = match self.wire {
+            WireFormat::Inline => {
+                postcard::from_bytes::<Message<ProtocolMessage>>(&src[4..4 + frame_len])?
+            }
+            WireFormat::Legacy => {
+                let legacy: Message<ProtocolMessageV0> =
+                    postcard::from_bytes(&src[4..4 + frame_len])?;
+                legacy.map(|message| message.into())
+            }
+        };
         src.advance(4 + frame_len);
         Ok(Some(message))
     }
 }
 
-impl Encoder<Message> for SyncCodec {
+impl Encoder<Message<ProtocolMessage>> for SyncCodec {
     type Error = anyhow::Error;
 
-    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let len =
-            postcard::serialize_with_flavor(&item, postcard::ser_flavors::Size::default()).unwrap();
+    fn encode(
+        &mut self,
+        item: Message<ProtocolMessage>,
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        let (len, bytes) = match self.wire {
+            WireFormat::Inline => {
+                let len =
+                    postcard::serialize_with_flavor(&item, postcard::ser_flavors::Size::default())
+                        .unwrap();
+                let bytes = postcard::to_stdvec(&item)?;
+                (len, bytes)
+            }
+            WireFormat::Legacy => {
+                let legacy = item.map(|message| message.into_legacy());
+                let len = postcard::serialize_with_flavor(
+                    &legacy,
+                    postcard::ser_flavors::Size::default(),
+                )
+                .unwrap();
+                let bytes = postcard::to_stdvec(&legacy)?;
+                (len, bytes)
+            }
+        };
         ensure!(
             len <= MAX_MESSAGE_SIZE,
             "attempting to send message that is too large {}",
@@ -58,10 +94,7 @@ impl Encoder<Message> for SyncCodec {
         );
 
         dst.put_u32(u32::try_from(len).expect("already checked"));
-        if dst.len() < 4 + len {
-            dst.resize(4 + len, 0u8);
-        }
-        postcard::to_slice(&item, &mut dst[4..])?;
+        dst.extend_from_slice(&bytes);
 
         Ok(())
     }
@@ -73,19 +106,37 @@ impl Encoder<Message> for SyncCodec {
 /// - N Sync messages
 ///
 /// On any error and on success the substream is closed.
+///
+/// Generic over the protocol message so one enum decodes both wire shapes:
+/// the version-0 [`ProtocolMessageV0`] on legacy connections and the
+/// inline-values [`ProtocolMessage`] otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum Message {
+enum Message<PM> {
     /// Init message (sent by the dialing peer)
     Init {
         /// Namespace to sync
         namespace: NamespaceId,
         /// Initial message
-        message: crate::sync::ProtocolMessage,
+        message: PM,
     },
     /// Sync messages (sent by both peers)
-    Sync(crate::sync::ProtocolMessage),
+    Sync(PM),
     /// Abort message (sent by the accepting peer to decline a request)
     Abort { reason: AbortReason },
+}
+
+impl<PM> Message<PM> {
+    /// Re-pair the message's protocol messages.
+    fn map<PM2>(self, mut f: impl FnMut(PM) -> PM2) -> Message<PM2> {
+        match self {
+            Message::Init { namespace, message } => Message::Init {
+                namespace,
+                message: f(message),
+            },
+            Message::Sync(message) => Message::Sync(f(message)),
+            Message::Abort { reason } => Message::Abort { reason },
+        }
+    }
 }
 
 /// Runs the initiator side of the sync protocol.
@@ -95,17 +146,18 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     handle: &SyncHandle,
     namespace: NamespaceId,
     peer: PublicKey,
+    wire: WireFormat,
 ) -> Result<SyncOutcome, ConnectError> {
     let peer_bytes = *peer.as_bytes();
-    let mut reader = FramedRead::new(reader, SyncCodec);
-    let mut writer = FramedWrite::new(writer, SyncCodec);
+    let mut reader = FramedRead::new(reader, SyncCodec { wire });
+    let mut writer = FramedWrite::new(writer, SyncCodec { wire });
 
     let mut progress = Some(SyncOutcome::default());
 
     // Init message
 
     let message = handle
-        .sync_initial_message(namespace)
+        .sync_initial_message(namespace, wire)
         .await
         .map_err(ConnectError::sync)?;
     let init_message = Message::Init { namespace, message };
@@ -126,7 +178,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 trace!("recv process message");
                 let current_progress = progress.take().unwrap();
                 let (reply, next_progress) = handle
-                    .sync_process_message(namespace, msg, peer_bytes, current_progress)
+                    .sync_process_message(namespace, msg, peer_bytes, current_progress, wire)
                     .await
                     .map_err(ConnectError::sync)?;
                 progress = Some(next_progress);
@@ -158,6 +210,7 @@ pub(super) async fn run_bob<R, W, F, Fut>(
     handle: SyncHandle,
     accept_cb: F,
     peer: PublicKey,
+    wire: WireFormat,
 ) -> Result<(NamespaceId, SyncOutcome), AcceptError>
 where
     R: AsyncRead + Unpin,
@@ -166,7 +219,7 @@ where
     Fut: Future<Output = AcceptOutcome>,
 {
     let mut state = BobState::new(peer);
-    let namespace = state.run(writer, reader, handle, accept_cb).await?;
+    let namespace = state.run(writer, reader, handle, accept_cb, wire).await?;
     Ok((namespace, state.into_outcome()))
 }
 
@@ -198,6 +251,7 @@ impl BobState {
         reader: R,
         sync: SyncHandle,
         accept_cb: F,
+        wire: WireFormat,
     ) -> Result<NamespaceId, AcceptError>
     where
         R: AsyncRead + Unpin,
@@ -205,8 +259,8 @@ impl BobState {
         F: Fn(NamespaceId, PublicKey) -> Fut,
         Fut: Future<Output = AcceptOutcome>,
     {
-        let mut reader = FramedRead::new(reader, SyncCodec);
-        let mut writer = FramedWrite::new(writer, SyncCodec);
+        let mut reader = FramedRead::new(reader, SyncCodec { wire });
+        let mut writer = FramedWrite::new(writer, SyncCodec { wire });
         while let Some(msg) = reader.next().await {
             let msg = msg.map_err(|e| self.fail(e))?;
             let next = match (msg, self.namespace.as_ref()) {
@@ -239,6 +293,7 @@ impl BobState {
                             message,
                             *self.peer.as_bytes(),
                             last_progress,
+                            wire,
                         )
                         .await;
                     self.namespace = Some(namespace);
@@ -247,8 +302,14 @@ impl BobState {
                 (Message::Sync(msg), Some(namespace)) => {
                     trace!("recv process message");
                     let last_progress = self.progress.take().unwrap();
-                    sync.sync_process_message(*namespace, msg, *self.peer.as_bytes(), last_progress)
-                        .await
+                    sync.sync_process_message(
+                        *namespace,
+                        msg,
+                        *self.peer.as_bytes(),
+                        last_progress,
+                        wire,
+                    )
+                    .await
                 }
                 (Message::Init { .. }, Some(_)) => {
                     return Err(self.fail(anyhow!("double init message")));
@@ -322,6 +383,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_simple() -> Result<()> {
+        test_sync_simple_with(WireFormat::Inline).await
+    }
+
+    /// The same exchange on the frozen version-0 wire: no values inline,
+    /// so a peer that only speaks version 0 still converges. This is the
+    /// wire a mixed-version pair negotiates when the dialer falls back
+    /// from [`crate::net::ALPN_INLINE`].
+    #[tokio::test]
+    async fn test_sync_simple_legacy() -> Result<()> {
+        test_sync_simple_with(WireFormat::Legacy).await
+    }
+
+    async fn test_sync_simple_with(wire: WireFormat) -> Result<()> {
         let mut rng = rand::rng();
         let alice_peer_id = SecretKey::from_bytes(&[1u8; 32]).public();
         let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
@@ -386,6 +460,7 @@ mod tests {
                 &alice_handle2,
                 namespace_id,
                 bob_peer_id,
+                wire,
             )
             .await
         });
@@ -403,6 +478,7 @@ mod tests {
                 bob_handle2,
                 |_namespace, _peer| std::future::ready(AcceptOutcome::Allow),
                 alice_peer_id,
+                wire,
             )
             .await
         });
@@ -571,6 +647,7 @@ mod tests {
                     bob_handle.clone(),
                     bob_node_pubkey,
                     namespace.id(),
+                    WireFormat::Inline,
                 )
                 .await?;
 
@@ -596,6 +673,7 @@ mod tests {
         bob_handle: SyncHandle,
         bob_node_pubkey: PublicKey,
         namespace: NamespaceId,
+        wire: WireFormat,
     ) -> Result<()> {
         alice_handle
             .open(namespace, OpenOpts::default().sync())
@@ -613,6 +691,7 @@ mod tests {
                 &alice_handle,
                 namespace,
                 bob_node_pubkey,
+                wire,
             )
             .await
         });
@@ -625,6 +704,7 @@ mod tests {
                 bob_handle,
                 |_namespace, _peer| std::future::ready(AcceptOutcome::Allow),
                 alice_node_pubkey,
+                wire,
             )
             .await
         });
@@ -699,6 +779,7 @@ mod tests {
             bob_handle.clone(),
             bob_node_pubkey,
             namespace.id(),
+            WireFormat::Inline,
         )
         .await?;
         let mut alice_store = alice_handle.shutdown().await?;

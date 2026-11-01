@@ -60,6 +60,11 @@ pub enum ImportNamespaceOutcome {
 }
 
 /// Download policy to decide which content blobs shall be downloaded.
+///
+/// The policy gates downloads only: a value that arrives inlined in a docs
+/// message is imported regardless of it (inlining is not a download), so a
+/// forbidden key can still become complete from a syncing peer's inline
+/// values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DownloadPolicy {
     /// Do not download any key unless it matches one of the filters.

@@ -161,33 +161,40 @@ pub struct RangeFingerprint<K> {
 }
 
 /// Transfers items inside a range to the other participant.
+///
+/// `V` is the per-entry value element. The version-0 wire carries
+/// `(E, ContentStatus)`; the inline-values wire carries the same plus the
+/// value bytes, `(E, ContentStatus, Option<Bytes>)`, which is the default.
+/// Connections negotiate which shape they use via their ALPN (see
+/// [`crate::net::WireFormat`]), so both shapes coexist across a rolling
+/// upgrade.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RangeItem<E: RangeEntry> {
+pub struct RangeItem<E: RangeEntry, V = (E, ContentStatus, Option<Bytes>)> {
     /// The range out of which the elements are.
     #[serde(bound(
         serialize = "Range<E::Key>: Serialize",
         deserialize = "Range<E::Key>: Deserialize<'de>"
     ))]
     pub(crate) range: Range<E::Key>,
-    #[serde(bound(serialize = "E: Serialize", deserialize = "E: Deserialize<'de>"))]
-    pub(crate) values: Vec<(E, ContentStatus, Option<Bytes>)>,
+    #[serde(bound(serialize = "V: Serialize", deserialize = "V: Deserialize<'de>"))]
+    pub(crate) values: Vec<V>,
     /// If false, requests to send local items in the range.
     /// Otherwise not.
     pub(crate) have_local: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum MessagePart<E: RangeEntry> {
+pub enum MessagePart<E: RangeEntry, V = (E, ContentStatus, Option<Bytes>)> {
     #[serde(bound(
         serialize = "RangeFingerprint<E::Key>: Serialize",
         deserialize = "RangeFingerprint<E::Key>: Deserialize<'de>"
     ))]
     RangeFingerprint(RangeFingerprint<E::Key>),
     #[serde(bound(
-        serialize = "RangeItem<E>: Serialize",
-        deserialize = "RangeItem<E>: Deserialize<'de>"
+        serialize = "RangeItem<E, V>: Serialize",
+        deserialize = "RangeItem<E, V>: Deserialize<'de>"
     ))]
-    RangeItem(RangeItem<E>),
+    RangeItem(RangeItem<E, V>),
 }
 
 impl<E: RangeEntry> MessagePart<E> {
@@ -210,15 +217,15 @@ impl<E: RangeEntry> MessagePart<E> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Message<E: RangeEntry> {
+pub struct Message<E: RangeEntry, V = (E, ContentStatus, Option<Bytes>)> {
     #[serde(bound(
-        serialize = "MessagePart<E>: Serialize",
-        deserialize = "MessagePart<E>: Deserialize<'de>"
+        serialize = "MessagePart<E, V>: Serialize",
+        deserialize = "MessagePart<E, V>: Deserialize<'de>"
     ))]
-    parts: Vec<MessagePart<E>>,
+    parts: Vec<MessagePart<E, V>>,
 }
 
-impl<E: RangeEntry> Message<E> {
+impl<E: RangeEntry, V> Message<E, V> {
     /// Construct the initial message.
     fn init<S: Store<E>>(store: &mut S) -> Result<Self, S::Error> {
         let x = store.get_first()?;
@@ -228,6 +235,25 @@ impl<E: RangeEntry> Message<E> {
         Ok(Message { parts: vec![part] })
     }
 
+    /// Re-pair the message's value elements.
+    pub(crate) fn map_values<W, F: FnMut(V) -> W>(self, mut f: F) -> Message<E, W> {
+        let parts = self
+            .parts
+            .into_iter()
+            .map(|part| match part {
+                MessagePart::RangeFingerprint(fp) => MessagePart::RangeFingerprint(fp),
+                MessagePart::RangeItem(item) => MessagePart::RangeItem(RangeItem {
+                    range: item.range,
+                    values: item.values.into_iter().map(&mut f).collect(),
+                    have_local: item.have_local,
+                }),
+            })
+            .collect();
+        Message { parts }
+    }
+}
+
+impl<E: RangeEntry> Message<E> {
     pub(crate) fn parts(&self) -> &[MessagePart<E>] {
         &self.parts
     }
@@ -250,6 +276,17 @@ impl<E: RangeEntry> Message<E> {
 
     pub(crate) fn value_count(&self) -> usize {
         self.values().count()
+    }
+
+    /// Project into the frozen version-0 wire shape: entries without values.
+    pub(crate) fn into_legacy(self) -> Message<E, (E, ContentStatus)> {
+        self.map_values(|(entry, content_status, _value)| (entry, content_status))
+    }
+}
+
+impl<E: RangeEntry> From<Message<E, (E, ContentStatus)>> for Message<E> {
+    fn from(message: Message<E, (E, ContentStatus)>) -> Self {
+        message.map_values(|(entry, content_status)| (entry, content_status, None))
     }
 }
 

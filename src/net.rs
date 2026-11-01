@@ -17,6 +17,36 @@ use crate::{
 /// The ALPN identifier for the iroh-docs protocol
 pub const ALPN: &[u8] = b"/iroh-sync/1";
 
+/// The ALPN identifier for the iroh-docs protocol with inline values.
+///
+/// Nodes that enable inline values accept both ALPNs; the dialer picks
+/// which wire format the connection uses by dialing [`ALPN_INLINE`] first
+/// and falling back to [`ALPN`]. Peers that predate inline values accept
+/// only [`ALPN`], so a mixed-version pair negotiates the version-0 wire
+/// format and keeps syncing across a rolling upgrade instead of being
+/// partitioned by a version bump.
+pub const ALPN_INLINE: &[u8] = b"/iroh-sync/2";
+
+/// The wire format of a sync connection, negotiated via ALPN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireFormat {
+    /// The frozen version-0 format: entries carry no value inline.
+    Legacy,
+    /// Entries at or below the configured threshold carry their value
+    /// inline in the reconciliation messages.
+    Inline,
+}
+
+impl WireFormat {
+    /// The wire format for a connection, from its negotiated ALPN.
+    pub fn from_alpn(alpn: &[u8]) -> Self {
+        match alpn {
+            alpn if alpn == ALPN_INLINE => Self::Inline,
+            _ => Self::Legacy,
+        }
+    }
+}
+
 mod codec;
 mod idle;
 
@@ -72,10 +102,26 @@ pub async fn connect_and_sync_with_timeout(
     let t_start = Instant::now();
     let peer_id = peer.id;
     trace!("connect");
-    let connection = timeout(inactivity, endpoint.connect(peer, crate::ALPN))
-        .await
-        .map_err(|_| ConnectError::timeout(inactivity))?
-        .map_err(ConnectError::connect)?;
+    // Dial the inline-values ALPN first; a peer that predates the feature
+    // refuses it, and the version-0 ALPN still gets through. The wire
+    // format follows whichever ALPN was negotiated.
+    let (connection, wire) =
+        match timeout(inactivity, endpoint.connect(peer.clone(), ALPN_INLINE)).await {
+            Ok(Ok(connection)) => {
+                let wire = WireFormat::from_alpn(connection.alpn());
+                (connection, wire)
+            }
+            // The peer refused the inline ALPN (it predates the feature) or
+            // the attempt made no progress: fall back to the frozen
+            // version-0 wire on the original ALPN.
+            _ => {
+                let connection = timeout(inactivity, endpoint.connect(peer, ALPN))
+                    .await
+                    .map_err(|_| ConnectError::timeout(inactivity))?
+                    .map_err(ConnectError::connect)?;
+                (connection, WireFormat::Legacy)
+            }
+        };
 
     let (mut send_stream, mut recv_stream) = match timeout(inactivity, connection.open_bi()).await {
         Ok(res) => res.map_err(ConnectError::connect)?,
@@ -91,7 +137,7 @@ pub async fn connect_and_sync_with_timeout(
     let res = {
         let mut writer = IdleTimeout::new(&mut send_stream, inactivity);
         let mut reader = IdleTimeout::new(&mut recv_stream, inactivity);
-        run_alice(&mut writer, &mut reader, sync, namespace, peer_id).await
+        run_alice(&mut writer, &mut reader, sync, namespace, peer_id, wire).await
     };
 
     let closed = if matches!(res, Err(ConnectError::Timeout { .. })) {
@@ -219,6 +265,7 @@ where
 {
     let t_start = Instant::now();
     let peer = connection.remote_id();
+    let wire = WireFormat::from_alpn(connection.alpn());
     let (mut send_stream, mut recv_stream) = match timeout(inactivity, connection.accept_bi()).await
     {
         Ok(res) => res.map_err(|e| AcceptError::open(peer, e))?,
@@ -239,7 +286,7 @@ where
         let mut writer = IdleTimeout::new(&mut send_stream, inactivity);
         let mut reader = IdleTimeout::new(&mut recv_stream, inactivity);
         state
-            .run(&mut writer, &mut reader, sync, accept_cb)
+            .run(&mut writer, &mut reader, sync, accept_cb, wire)
             .instrument(span.clone())
             .await
     };

@@ -52,6 +52,6 @@ mod keys;
 mod ranger;
 
 #[doc(inline)]
-pub use net::ALPN;
+pub use net::{WireFormat, ALPN, ALPN_INLINE};
 
 pub use self::{heads::*, keys::*, sync::*, ticket::DocTicket};

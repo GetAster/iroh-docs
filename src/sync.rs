@@ -40,6 +40,12 @@ use crate::{
 /// Can be serialized to bytes with [serde] to transfer between peers.
 pub type ProtocolMessage = crate::ranger::Message<SignedEntry>;
 
+/// The frozen version-0 wire shape of [`ProtocolMessage`]: entries without
+/// inline values. Peers negotiate which shape a connection uses via its
+/// ALPN (see [`crate::net::WireFormat`]), so both shapes coexist across a
+/// rolling upgrade.
+pub type ProtocolMessageV0 = crate::ranger::Message<SignedEntry, (SignedEntry, ContentStatus)>;
+
 /// Byte representation of an iroh `EndpointId`.
 // TODO: Consider `iroh::EndpointId` instead of raw bytes (`iroh` re-exports it from `iroh-base`).
 pub type PeerIdBytes = [u8; 32];
@@ -66,6 +72,19 @@ pub trait Clock: Send + Sync + 'static {
     /// Returning `false` refuses the entry: it is not stored, and sync continues with the
     /// remaining entries. The sender offers it again on a later sync.
     fn observe(&self, remote: u64) -> bool;
+
+    /// Bound on how far ahead of the wall clock this clock accepts remote
+    /// entries, in microseconds.
+    ///
+    /// Used to compute how long a `TooFarInTheFuture` reject must wait
+    /// before a re-sync can succeed; without an override that is
+    /// [`MAX_TIMESTAMP_FUTURE_SHIFT`]. A clock with a tighter `observe` rule
+    /// must override this to match, or the retry delay is computed from the
+    /// wrong bound and the deferred re-sync can fire while the entry still
+    /// fails validation, looping as fast as round trips complete.
+    fn max_future_shift(&self) -> u64 {
+        MAX_TIMESTAMP_FUTURE_SHIFT
+    }
 }
 
 /// The clock cannot issue a timestamp, for example because it cannot persist its reservation.
@@ -157,9 +176,16 @@ pub struct SyncOutcome {
     /// Remote entries offered during this sync that failed validation.
     ///
     /// The peer offers them again on a later sync; [`RejectedEntry::retry_after`] says when
-    /// that later sync can succeed.
+    /// that later sync can succeed. Capped at [`MAX_REJECTED_PER_EXCHANGE`].
     pub rejected: Vec<RejectedEntry>,
+    /// Rejects beyond [`MAX_REJECTED_PER_EXCHANGE`] that were dropped from [`Self::rejected`].
+    pub rejected_truncated: usize,
 }
+
+/// Upper bound on rejects retained per exchange: enough to schedule the
+/// deferred re-sync and to log, small enough that a flooding peer cannot grow
+/// the sync outcome without bound.
+const MAX_REJECTED_PER_EXCHANGE: usize = 64;
 
 /// A remote entry that failed validation during a sync exchange.
 #[derive(Debug, Clone)]
@@ -659,9 +685,13 @@ where
     ///
     /// Rust-only surface for now (an Aster introspection query); a C ABI
     /// and binding parity pass is planned.
-    pub fn entries_since(&mut self, seq: u64) -> anyhow::Result<Vec<(u64, SignedEntry)>> {
+    pub fn entries_since(
+        &mut self,
+        seq: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(u64, SignedEntry)>> {
         self.info.ensure_open().map_err(anyhow::Error::from)?;
-        self.store.entries_since(seq)
+        self.store.entries_since(seq, limit)
     }
 
     /// Create the initial message for the set reconciliation flow with a remote peer.
@@ -732,13 +762,24 @@ where
                     ) {
                         Ok(()) => true,
                         Err(failure) => {
+                            // The reject came from the configured clock when
+                            // there is one, so the retry delay must be
+                            // computed from its bound, not the 10-minute
+                            // wall-clock default: with an HLC whose `observe`
+                            // only admits entries within ~1 s of its time, an
+                            // entry 2 s ahead got retry-after zero and the
+                            // re-sync looped as fast as round trips completed.
+                            let future_bound = clock
+                                .as_deref()
+                                .map(|clock| clock.max_future_shift())
+                                .unwrap_or(max_future_shift);
                             let retry_after =
                                 if matches!(&failure, ValidationFailure::TooFarInTheFuture) {
                                     Some(Duration::from_micros(
                                         entry
                                             .timestamp()
                                             .saturating_sub(now)
-                                            .saturating_sub(max_future_shift),
+                                            .saturating_sub(future_bound),
                                     ))
                                 } else {
                                     None
@@ -792,12 +833,30 @@ where
             .await?;
 
         // update state with outgoing data.
-        state.rejected.extend(rejected.into_inner());
+        Self::extend_rejected(state, rejected.into_inner());
         if let Some(ref reply) = reply {
             state.num_sent += reply.value_count();
         }
 
         Ok(reply)
+    }
+
+    /// Folds this message's rejects into the exchange total under
+    /// [`MAX_REJECTED_PER_EXCHANGE`]: a peer that floods failing entries must
+    /// not grow the outcome without bound. Entries with a `retry_after` drive
+    /// the deferred re-sync, so they are kept first; undecaying failures are
+    /// only telemetry and yield their slots.
+    fn extend_rejected(state: &mut SyncOutcome, mut rejected: Vec<RejectedEntry>) {
+        let remaining = MAX_REJECTED_PER_EXCHANGE.saturating_sub(state.rejected.len());
+        if rejected.len() <= remaining {
+            state.rejected.extend(rejected);
+            return;
+        }
+        // Keep retry-bearing entries first: they carry the repair schedule.
+        rejected.sort_by_key(|entry| std::cmp::Reverse(entry.retry_after.is_some()));
+        let kept = rejected.len().min(remaining);
+        state.rejected.extend(rejected.drain(0..kept));
+        state.rejected_truncated += rejected.len();
     }
 
     /// Get the namespace identifier for this [`Replica`].
@@ -2319,6 +2378,35 @@ mod tests {
         // The refused entry never landed in alice's store.
         assert!(get_content_hash(&mut alice_store, namespace.id(), author.id(), b"k")?.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn extend_rejected_caps_and_prefers_retry_bearing() {
+        let mk = |retry: bool| RejectedEntry {
+            hash: Hash::new(b"x"),
+            timestamp: 0,
+            failure: ValidationFailure::TooFarInTheFuture,
+            retry_after: retry.then(|| Duration::from_secs(1)),
+        };
+        let mut state = SyncOutcome::default();
+        // Half retry-bearing, half not, well over the cap.
+        let rejected: Vec<RejectedEntry> = (0..MAX_REJECTED_PER_EXCHANGE * 2)
+            .map(|i| mk(i % 2 == 0))
+            .collect();
+        Replica::<Box<ReplicaInfo>>::extend_rejected(&mut state, rejected);
+        assert_eq!(state.rejected.len(), MAX_REJECTED_PER_EXCHANGE);
+        assert_eq!(
+            state.rejected_truncated, MAX_REJECTED_PER_EXCHANGE,
+            "everything beyond the cap is counted"
+        );
+        // Every kept slot holds a retry-bearing entry: they drive the re-sync.
+        assert!(state.rejected.iter().all(|e| e.retry_after.is_some()));
+
+        // A second batch under the cap fills nothing and drops nothing further.
+        let before = state.rejected.len();
+        Replica::<Box<ReplicaInfo>>::extend_rejected(&mut state, vec![mk(true)]);
+        assert_eq!(state.rejected.len(), before);
+        assert_eq!(state.rejected_truncated, MAX_REJECTED_PER_EXCHANGE + 1);
     }
 
     #[tokio::test]

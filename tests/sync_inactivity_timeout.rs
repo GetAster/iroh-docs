@@ -256,7 +256,11 @@ async fn init_frame(capability: iroh_docs::Capability) -> Result<Vec<u8>> {
             5,
         )
         .await?;
-    let message = handle.sync_initial_message(namespace).await?;
+    let message = handle
+        // The tests below dial on `iroh_docs::ALPN`, so this must be the
+        // frozen version-0 wire: the acceptor decodes it as such.
+        .sync_initial_message(namespace, iroh_docs::WireFormat::Legacy)
+        .await?;
     frame(&WireMessage::Init { namespace, message })
 }
 

@@ -320,6 +320,8 @@ pub struct SequenceResponse {
 pub struct EntriesSinceRequest {
     pub doc_id: NamespaceId,
     pub seq: u64,
+    /// Page bound: at most `limit` rows, or the whole tail when 0.
+    pub limit: usize,
 }
 
 /// One row of [`EntriesSinceResponse`]: a touched key and its latest entry.
