@@ -160,6 +160,11 @@ pub enum ToLiveActor {
         namespace: NamespaceId,
         retry_at: Instant,
     },
+    /// The subscription's buffer overflowed and dropped events: re-subscribe and re-sync, or
+    /// the dropped entries stay missing until some later sync trigger.
+    GossipLagged {
+        namespace: NamespaceId,
+    },
 }
 
 /// Events informing about actions of the live sync progress.
@@ -262,6 +267,8 @@ pub struct LiveActor {
     deferred_resyncs: HashMap<NamespaceId, Instant>,
     /// When we last warned about validation rejects, per namespace.
     validation_warned: HashMap<NamespaceId, Instant>,
+    /// When we last reacted to a gossip lag, per namespace.
+    lagged_reacted: HashMap<NamespaceId, Instant>,
 }
 impl LiveActor {
     /// Create the live actor.
@@ -316,6 +323,7 @@ impl LiveActor {
             neighbors: Default::default(),
             deferred_resyncs: Default::default(),
             validation_warned: Default::default(),
+            lagged_reacted: Default::default(),
         })
     }
 
@@ -483,6 +491,9 @@ impl LiveActor {
                     .and_modify(|at| *at = (*at).min(retry_at))
                     .or_insert(retry_at);
             }
+            ToLiveActor::GossipLagged { namespace } => {
+                self.on_gossip_lagged(namespace).await;
+            }
             ToLiveActor::StartSync {
                 namespace,
                 peers,
@@ -623,6 +634,30 @@ impl LiveActor {
         );
     }
 
+    /// A subscription dropped events: re-subscribe (the fresh receive loop reports our
+    /// neighbors again, which triggers the repair syncs) or the dropped entries stay missing
+    /// until some later trigger.
+    async fn on_gossip_lagged(&mut self, namespace: NamespaceId) {
+        // One reaction per interval per namespace: a wedged subscription lags one tick after
+        // another.
+        if !reaction_allowed(&mut self.lagged_reacted, namespace) {
+            return;
+        }
+        self.metrics.doc_gossip_lagged.inc();
+        // A lag report can arrive after the namespace left; its receive loop is gone then.
+        if !self.state.is_syncing(&namespace) {
+            return;
+        }
+        warn!(
+            namespace = %namespace.fmt_short(),
+            "gossip subscription dropped events; re-subscribing and re-syncing"
+        );
+        self.gossip.quit(&namespace);
+        if let Err(err) = self.gossip.join(namespace, vec![]).await {
+            warn!(?err, namespace = %namespace.fmt_short(), "failed to re-subscribe after gossip lag");
+        }
+    }
+
     /// A connect task ended without a result: fail its sync like any error.
     async fn on_sync_connect_task_failed(&mut self, err: JoinError) {
         let Some((namespace, peer, reason)) = self.running_sync_connect_ids.remove(&err.id())
@@ -751,6 +786,7 @@ impl LiveActor {
         self.neighbors.remove(&namespace);
         self.deferred_resyncs.remove(&namespace);
         self.validation_warned.remove(&namespace);
+        self.lagged_reacted.remove(&namespace);
         if kill_subscribers {
             self.subscribers.remove(&namespace);
         }
@@ -1627,6 +1663,8 @@ mod tests {
 pub(crate) mod fault {
     use std::{collections::HashSet, sync::Mutex};
 
+    use n0_future::time::Duration;
+
     use crate::NamespaceId;
 
     static PANIC_CONNECT: Mutex<Option<HashSet<NamespaceId>>> = Mutex::new(None);
@@ -1650,6 +1688,35 @@ pub(crate) mod fault {
             panic!("injected sync connect panic");
         }
     }
+
+    /// Armed stalls for remote inserts (gossip puts): (namespace, remaining, delay).
+    static DELAYED_INSERTS: Mutex<Vec<(NamespaceId, usize, Duration)>> = Mutex::new(Vec::new());
+
+    /// Stall the next `count` remote inserts for `namespace` by `delay` each.
+    pub(crate) fn delay_remote_inserts(namespace: NamespaceId, count: usize, delay: Duration) {
+        DELAYED_INSERTS
+            .lock()
+            .unwrap()
+            .push((namespace, count, delay));
+    }
+
+    /// Stall once if a delayed insert is armed for this namespace.
+    pub(crate) async fn maybe_delay_remote_insert(namespace: &NamespaceId) {
+        let delay = {
+            let mut armed = DELAYED_INSERTS.lock().unwrap();
+            let Some(pos) = armed.iter().position(|(ns, _, _)| ns == namespace) else {
+                return;
+            };
+            let (_, count, delay) = &mut armed[pos];
+            *count -= 1;
+            let delay = *delay;
+            if *count == 0 {
+                armed.remove(pos);
+            }
+            delay
+        };
+        n0_future::time::sleep(delay).await;
+    }
 }
 
 #[cfg(test)]
@@ -1666,15 +1733,26 @@ mod task_failure_tests {
     struct TestNode {
         router: Router,
         docs: Docs,
+        metrics: std::sync::Arc<super::super::Metrics>,
     }
 
     async fn node() -> anyhow::Result<TestNode> {
         let ep = iroh::Endpoint::bind(presets::Minimal).await?;
         let store = iroh_blobs::store::mem::MemStore::new();
         let gossip = iroh_gossip::net::Gossip::builder().spawn(ep.clone());
-        let docs = Docs::memory()
-            .spawn(ep.clone(), (*store).clone(), gossip.clone())
-            .await?;
+        let downloader = store.downloader(&ep);
+        let engine = super::super::Engine::spawn(
+            ep.clone(),
+            gossip.clone(),
+            crate::store::Store::memory(),
+            (*store).clone(),
+            downloader,
+            super::super::DefaultAuthorStorage::Mem,
+            None,
+        )
+        .await?;
+        let metrics = engine.metrics().clone();
+        let docs = Docs::new(engine);
         let router = Router::builder(ep)
             .accept(
                 iroh_blobs::ALPN,
@@ -1683,7 +1761,11 @@ mod task_failure_tests {
             .accept(iroh_gossip::ALPN, gossip)
             .accept(crate::ALPN, docs.clone())
             .spawn();
-        Ok(TestNode { router, docs })
+        Ok(TestNode {
+            router,
+            docs,
+            metrics,
+        })
     }
 
     /// A sync task that panics fails that one sync. The live actor keeps
@@ -1739,6 +1821,99 @@ mod task_failure_tests {
         })
         .await??;
         assert_eq!(entry.content_len(), 5);
+
+        b.router.shutdown().await?;
+        a.router.shutdown().await?;
+        Ok(())
+    }
+
+    /// A subscription whose buffer overflowed (Lagged) re-subscribes and re-syncs, repairing
+    /// the dropped entries. Without the repair the burst's tail would stay missing until some
+    /// unrelated sync trigger.
+    #[tokio::test]
+    async fn gossip_lag_resubscribes_and_resyncs() -> anyhow::Result<()> {
+        // More than the subscription buffer (2048) plus the topic's broadcast channel (256):
+        // the overflow is what produces the Lagged.
+        const N: usize = 3000;
+        let a = node().await?;
+        let b = node().await?;
+        let author = a.docs.api().author_create().await?;
+        let doc_a = a.docs.api().create().await?;
+        let ticket = doc_a
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        let doc_b = b
+            .docs
+            .api()
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        let mut events = doc_b.subscribe().await?;
+
+        // Both sides join the gossip topic and run their initial syncs. Both rounds must be
+        // done before the burst: an in-flight sync would otherwise repair the loss on its own
+        // and the test would prove nothing.
+        doc_a.start_sync(vec![]).await?;
+        doc_b.start_sync(ticket.nodes.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut initial = 0;
+            while initial < 2 {
+                let Some(ev) = events.next().await else {
+                    anyhow::bail!("event stream ended: the live actor stopped");
+                };
+                if let LiveEvent::SyncFinished(ev) = ev? {
+                    if ev.peer == a.router.endpoint().id() {
+                        initial += 1;
+                    }
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+
+        // Stall the receiver's first remote insert: the burst then fills its subscription
+        // buffer (2048) while it drains nothing, the topic's broadcast channel (256) overflows,
+        // and a Lagged goes on the wire for everything the burst dropped.
+        super::fault::delay_remote_inserts(doc_b.id(), 1, Duration::from_secs(20));
+        for i in 0..N {
+            doc_a
+                .set_bytes(
+                    author,
+                    format!("key{i}").into_bytes(),
+                    format!("value{i}").into_bytes(),
+                )
+                .await?;
+        }
+
+        // The lag must have happened, or the test proves nothing.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if b.metrics.doc_gossip_lagged.get() >= 1 {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await??;
+
+        // The fix-driven repair round runs and succeeds.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = events.next().await {
+                if let LiveEvent::SyncFinished(ev) = ev? {
+                    if ev.peer == a.router.endpoint().id() && ev.result.is_ok() {
+                        return anyhow::Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("event stream ended: the live actor stopped")
+        })
+        .await??;
+
+        // Every entry of the burst is present.
+        let count = doc_b
+            .get_many_vec(crate::store::Query::author(author))
+            .await?
+            .len();
+        assert_eq!(count, N, "the repair round restores every dropped entry");
 
         b.router.shutdown().await?;
         a.router.shutdown().await?;
@@ -1994,7 +2169,12 @@ mod takeover_tests {
         });
         let retry_at = Instant::now() + Duration::from_secs(60);
         actor
-            .on_sync_finished(ns, peer, Origin::Connect(SyncReason::DirectJoin), Ok(details))
+            .on_sync_finished(
+                ns,
+                peer,
+                Origin::Connect(SyncReason::DirectJoin),
+                Ok(details),
+            )
             .await;
         let scheduled = actor
             .deferred_resyncs

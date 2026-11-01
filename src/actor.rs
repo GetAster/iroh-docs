@@ -6,12 +6,12 @@ use std::{
     sync::Arc,
 };
 
+use crate::sync::system_time_now;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use irpc::channel::mpsc;
 use n0_future::{task::JoinSet, time::Duration, TryFutureExt};
-use crate::sync::system_time_now;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 #[cfg(wasm_browser)]
@@ -1337,8 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn insert_remote_reports_validation_failure() -> anyhow::Result<()> {
         let store = store::Store::memory();
-        let sync =
-            SyncHandle::spawn_with_options(store, None, "foo".into(), None, 60 * 1_000_000);
+        let sync = SyncHandle::spawn_with_options(store, None, "foo".into(), None, 60 * 1_000_000);
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let author = Author::new(&mut rand::rng());
         // Build the entry before the namespace secret moves into the store.

@@ -161,7 +161,12 @@ async fn receive_loop(
     while let Some(event) = recv.try_next().await? {
         match event {
             Event::Lagged => {
-                debug!("gossip loop lagged - dropping gossip event");
+                // The subscription's buffer overflowed and the skipped events are gone for
+                // good unless a sync round runs. Ask the live actor to re-subscribe (the fresh
+                // receive loop re-reports our neighbors) and re-sync.
+                to_sync_actor
+                    .send(ToLiveActor::GossipLagged { namespace })
+                    .await?;
                 continue;
             }
             Event::Received(msg) => {
@@ -169,6 +174,8 @@ async fn receive_loop(
                 match op {
                     Op::Put(entry) => {
                         debug!(peer = %msg.delivered_from.fmt_short(), namespace = %namespace.fmt_short(), "received entry via gossip");
+                        #[cfg(test)]
+                        super::live::fault::maybe_delay_remote_insert(&namespace).await;
                         // Insert the entry into our replica.
                         // If the message was broadcast with neighbor scope, or is received
                         // directly from the author, we assume that the content is available at
@@ -186,7 +193,10 @@ async fn receive_loop(
                             .await
                         {
                             Ok(()) => {}
-                            Err(InsertRemoteError::Validation { failure, retry_after }) => {
+                            Err(InsertRemoteError::Validation {
+                                failure,
+                                retry_after,
+                            }) => {
                                 // One warning per interval: a reject flood would otherwise log
                                 // per entry.
                                 if warn_limiter.allow() {
@@ -205,8 +215,7 @@ async fn receive_loop(
                                     to_sync_actor
                                         .send(ToLiveActor::DeferredResync {
                                             namespace,
-                                            retry_at: n0_future::time::Instant::now()
-                                                + retry_after,
+                                            retry_at: n0_future::time::Instant::now() + retry_after,
                                         })
                                         .await?;
                                 }

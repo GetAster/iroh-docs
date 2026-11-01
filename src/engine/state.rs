@@ -237,7 +237,9 @@ impl PeerState {
                 // other trigger fires.
                 if matches!(
                     reason,
-                    SyncReason::SyncReport | SyncReason::NewNeighbor | SyncReason::DeferredValidation
+                    SyncReason::SyncReport
+                        | SyncReason::NewNeighbor
+                        | SyncReason::DeferredValidation
                 ) {
                     debug!("resync queued");
                     self.resync_requested = true;

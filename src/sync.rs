@@ -693,19 +693,17 @@ where
                     ) {
                         Ok(()) => true,
                         Err(failure) => {
-                            let retry_after = if matches!(
-                                &failure,
-                                ValidationFailure::TooFarInTheFuture
-                            ) {
-                                Some(Duration::from_micros(
-                                    entry
-                                        .timestamp()
-                                        .saturating_sub(now)
-                                        .saturating_sub(max_future_shift),
-                                ))
-                            } else {
-                                None
-                            };
+                            let retry_after =
+                                if matches!(&failure, ValidationFailure::TooFarInTheFuture) {
+                                    Some(Duration::from_micros(
+                                        entry
+                                            .timestamp()
+                                            .saturating_sub(now)
+                                            .saturating_sub(max_future_shift),
+                                    ))
+                                } else {
+                                    None
+                                };
                             rejected.borrow_mut().push(RejectedEntry {
                                 hash: entry.content_hash(),
                                 timestamp: entry.timestamp(),
@@ -2209,13 +2207,7 @@ mod tests {
             let mut bob = bob_store.new_replica(namespace.clone())?;
             sync(&mut alice, &mut bob).await?;
         }
-        assert!(get_content_hash(
-            &mut alice_store,
-            namespace.id(),
-            author.id(),
-            b"k"
-        )?
-        .is_some());
+        assert!(get_content_hash(&mut alice_store, namespace.id(), author.id(), b"k")?.is_some());
 
         // With the ten-minute default the same exchange refuses the entry: a fresh replica
         // takes the default, and the entry never lands in its store.
@@ -2225,13 +2217,7 @@ mod tests {
             let mut bob = bob_store.new_replica(namespace.clone())?;
             sync(&mut alice, &mut bob).await?;
         }
-        assert!(get_content_hash(
-            &mut alice2_store,
-            namespace.id(),
-            author.id(),
-            b"k"
-        )?
-        .is_none());
+        assert!(get_content_hash(&mut alice2_store, namespace.id(), author.id(), b"k")?.is_none());
         Ok(())
     }
 
@@ -2269,7 +2255,10 @@ mod tests {
         assert_eq!(alice_state.rejected.len(), 1, "alice refuses the entry");
         let entry = &alice_state.rejected[0];
         assert_eq!(entry.timestamp, ahead);
-        assert!(matches!(entry.failure, ValidationFailure::TooFarInTheFuture));
+        assert!(matches!(
+            entry.failure,
+            ValidationFailure::TooFarInTheFuture
+        ));
         let retry_after = entry
             .retry_after
             .expect("a future-stamped entry has a retry time");
@@ -2279,13 +2268,7 @@ mod tests {
         assert!(retry_after <= Duration::from_micros(ahead - t0 - MAX_TIMESTAMP_FUTURE_SHIFT));
 
         // The refused entry never landed in alice's store.
-        assert!(get_content_hash(
-            &mut alice_store,
-            namespace.id(),
-            author.id(),
-            b"k"
-        )?
-        .is_none());
+        assert!(get_content_hash(&mut alice_store, namespace.id(), author.id(), b"k")?.is_none());
         Ok(())
     }
 
