@@ -177,7 +177,9 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 |---|---|---|---|
 | `v0.101.0` | `aster-iroh-docs-v0.101.1017` | `258358e15829fe7f5e9ed7b2c6220ec04395476b` | `upgrade/iroh-docs-v0.101` |
 
-- **2026-11-01, 0.101.1017** (`258358e`, tag `aster-iroh-docs-v0.101.1017`): `fix/hold-publish-tag-until-protected` cherry-picked with `-x` from `f70f78a`. Row 51: the §D ask from portal-sync's aster-request.md (blobs-GC deletes freshly published entries). The patch block is unchanged from 0.101.1013-p1. Option E, `n = 17`. Aster trial: pending the re-pin and release candidate.
+- **2026-11-01, 0.101.1017** (`258358e`, tag `aster-iroh-docs-v0.101.1017`): `fix/hold-publish-tag-until-protected` cherry-picked with `-x` from `f70f78a`. Row 51: the §D ask from portal-sync's aster-request.md (blobs-GC deletes freshly published entries). The patch block is unchanged from 0.101.1013-p1. Option E, `n = 17`. Aster trial: local suites green on the re-pinned tree
+(`aster_transport_core` 673, `aster` 2019, Python 1616, clippy/fmt clean,
+fork_compat green); the release candidate is recorded here once it runs.
 
 ### 0.101.1016 (2026-11-01)
 
