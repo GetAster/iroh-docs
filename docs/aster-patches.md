@@ -179,7 +179,12 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 - **2026-11-01, 0.101.1017** (`258358e`, tag `aster-iroh-docs-v0.101.1017`): `fix/hold-publish-tag-until-protected` cherry-picked with `-x` from `f70f78a`. Row 51: the §D ask from portal-sync's aster-request.md (blobs-GC deletes freshly published entries). The patch block is unchanged from 0.101.1013-p1. Option E, `n = 17`. Aster trial: local suites green on the re-pinned tree
 (`aster_transport_core` 673, `aster` 2019, Python 1616, clippy/fmt clean,
-fork_compat green); the release candidate is recorded here once it runs.
+fork_compat green). The release ran as Forgejo run 352 on commit `60518734`
+(`test(it): gate capture_log helpers on their consumers' features`, the only
+Aster change after the re-pin: preflight's clippy-coordination graph flagged
+the shared test subscriber's helpers as dead code under a graph without
+`enrollment`+`docs`), and went green with the whole suite — linux 351, release
+352, advisories 353.
 
 ### 0.101.1016 (2026-11-01)
 
@@ -187,7 +192,7 @@ fork_compat green); the release candidate is recorded here once it runs.
 |---|---|---|---|
 | `v0.101.0` | `aster-iroh-docs-v0.101.1016` | `c8d006e8860fbb0b2c2de63d6ae5556961c8ad4e` | `upgrade/iroh-docs-v0.101` |
 
-- **2026-11-01, 0.101.1016** (`c8d006e`, tag `aster-iroh-docs-v0.101.1016`): `feat/future-shift-tolerance`, `feat/observable-repairable-rejects` and `fix/lagged-resubscribe-resync` cherry-picked with `-x` (`b4c46f6`, `e61db46`, `ff98698`), then the version bump (`c8d006e`). Rows 48-50: the B-2/B-3/C asks from portal-sync's aster-request.md. The patch block is unchanged from 0.101.1013-p1. Option E, `n = 16`. Aster trial: local suites green on the re-pinned tree (`aster_transport_core` 518, `aster` 2034, pytest to follow); the release candidate is recorded here once it runs.
+- **2026-11-01, 0.101.1016** (`c8d006e`, tag `aster-iroh-docs-v0.101.1016`): `feat/future-shift-tolerance`, `feat/observable-repairable-rejects` and `fix/lagged-resubscribe-resync` cherry-picked with `-x` (`b4c46f6`, `e61db46`, `ff98698`), then the version bump (`c8d006e`). Rows 48-50: the B-2/B-3/C asks from portal-sync's aster-request.md. The patch block is unchanged from 0.101.1013-p1. Option E, `n = 16`. Aster trial: local suites green on the re-pinned tree (`aster_transport_core` 518, `aster` 2034, Python 1616); the release carrying it ran as Forgejo run 352 on commit `60518734` and went green (linux 351, release 352, advisories 353).
 
 ### 0.101.1015 (2026-10-29)
 
