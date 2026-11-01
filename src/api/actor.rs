@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use iroh_blobs::api::TempTag;
 use irpc::{channel::mpsc, LocalSender, WithChannels};
 use n0_future::{task, StreamExt};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -569,6 +570,7 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?
             .ok_or_else(|| RpcError::new(&*anyhow!("failed to get entry after insertion")))?;
+        self.hold_until_protected(tag);
         Ok(SetResponse { entry })
     }
 
@@ -619,7 +621,33 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?
             .ok_or_else(|| RpcError::new(&*anyhow!("failed to get entry after insertion")))?;
+        self.hold_until_protected(tag);
         Ok(SetResponse { entry })
+    }
+
+    /// Hold a publish's temp tag until a GC protect enumeration has run.
+    ///
+    /// The tag is the imported blob's GC protection between its import and
+    /// the document record naming it becoming visible to the protect
+    /// enumeration. Dropping the tag when this call returns opens a window
+    /// in which a sweep that enumerated before the record was inserted —
+    /// and traverses tags after the tag is gone — can collect a freshly
+    /// published blob, because the sweep's candidate list is read when it
+    /// runs. Holding the tag until the next enumeration closes the window:
+    /// the enumeration flushes and reads committed state, so it observes the
+    /// record, and the tag's release cannot race the mark phase of the
+    /// sweep whose enumeration missed it. Without a protect handler nothing
+    /// enumerates (and no sweep protects document content at all), so the
+    /// tag is released immediately rather than held forever.
+    fn hold_until_protected(&self, tag: TempTag) {
+        let Some(notify) = self.protect_notify() else {
+            drop(tag);
+            return;
+        };
+        task::spawn(async move {
+            notify.notified().await;
+            drop(tag);
+        });
     }
 
     pub(super) async fn doc_del(&self, req: DelRequest) -> RpcResult<DelResponse> {

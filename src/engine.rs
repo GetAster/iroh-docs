@@ -28,7 +28,7 @@ use iroh_blobs::{
 use iroh_gossip::net::Gossip;
 use n0_future::{task::AbortOnDropHandle, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, error, error_span, Instrument};
 
 use self::live::{LiveActor, ToLiveActor};
@@ -69,6 +69,13 @@ pub struct Engine {
     content_status_cb: ContentStatusCallback,
     blob_store: iroh_blobs::api::Store,
     _gc_protect_task: AbortOnDropHandle<()>,
+    /// Woken after each GC protect enumeration. The publish paths hold the
+    /// temp tag of an imported blob until an enumeration has observed the
+    /// document record naming it, so no sweep can collect the blob in the
+    /// gap between the tag's release and the enumeration seeing the record.
+    /// `None` when spawned without a protect handler: nothing enumerates
+    /// then, and holding would leak the tag.
+    protect_notify: Option<Arc<Notify>>,
 }
 
 impl Engine {
@@ -170,6 +177,8 @@ impl Engine {
         );
 
         let sync2 = sync.clone();
+        let protect_notify = protect_cb.as_ref().map(|_| Arc::new(Notify::new()));
+        let protect_notify2 = protect_notify.clone();
         let gc_protect_task = AbortOnDropHandle::new(n0_future::task::spawn(async move {
             let Some(mut protect_handler) = protect_cb else {
                 return;
@@ -189,6 +198,11 @@ impl Engine {
                         continue;
                     }
                 };
+                // The enumeration completed: everything committed before it
+                // is now observed, so publish tags held since then release.
+                if let Some(notify) = &protect_notify2 {
+                    notify.notify_waiters();
+                }
                 for hash in hashes {
                     if let Err(_err) = tx.send(hash).await {
                         debug!("protect task: failed to forward hash");
@@ -237,12 +251,25 @@ impl Engine {
             default_author,
             blob_store: bao_store,
             _gc_protect_task: gc_protect_task,
+            protect_notify,
         })
     }
 
     /// Get the blob store.
     pub fn blob_store(&self) -> &Store {
         &self.blob_store
+    }
+
+    /// The notifier woken after each GC protect enumeration, or `None` when
+    /// this engine was spawned without a protect handler.
+    ///
+    /// [`crate::api::Doc`]'s publish paths hold the temp tag of an imported
+    /// blob until the first enumeration after the document record naming it
+    /// was inserted. The enumeration flushes and reads committed state, so
+    /// that first wakeup guarantees the record is observed and the tag can
+    /// drop; see [`crate::api::actor::RpcActor`].
+    pub fn protect_notify(&self) -> Option<Arc<Notify>> {
+        self.protect_notify.clone()
     }
 
     /// Returns the metrics tracked for this engine.
