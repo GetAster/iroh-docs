@@ -154,6 +154,26 @@ pub struct SyncOutcome {
     pub num_recv: usize,
     /// Number of entries we sent.
     pub num_sent: usize,
+    /// Remote entries offered during this sync that failed validation.
+    ///
+    /// The peer offers them again on a later sync; [`RejectedEntry::retry_after`] says when
+    /// that later sync can succeed.
+    pub rejected: Vec<RejectedEntry>,
+}
+
+/// A remote entry that failed validation during a sync exchange.
+#[derive(Debug, Clone)]
+pub struct RejectedEntry {
+    /// Hash of the entry's content.
+    pub hash: Hash,
+    /// The entry's timestamp, in microseconds since the Unix epoch.
+    pub timestamp: u64,
+    /// Why validation failed.
+    pub failure: ValidationFailure,
+    /// When the entry can pass validation: for a future-stamped entry, once the wall clock
+    /// has advanced to `timestamp - max_future_shift`. `None` when the failure cannot decay
+    /// (a bad signature, a foreign namespace, a non-allowed author).
+    pub retry_after: Option<Duration>,
 }
 
 fn get_as_ptr<T>(value: &T) -> Option<usize> {
@@ -648,6 +668,8 @@ where
             .unwrap_or_default();
         // Read once per message: the actor applies a change to the allowlist between messages.
         let allowed_writers = self.store.allowed_writers()?;
+        // RefCell: the validate callback is `Fn`, so it can only mutate through shared state.
+        let rejected = std::cell::RefCell::new(Vec::new());
         let reply = self
             .store
             .process_message(
@@ -659,7 +681,7 @@ where
                         from: from_peer,
                         remote_content_status: content_status,
                     };
-                    validate_entry(
+                    match validate_entry(
                         now,
                         clock.as_deref(),
                         max_future_shift,
@@ -668,8 +690,31 @@ where
                         allowed_writers.as_ref(),
                         entry,
                         &origin,
-                    )
-                    .is_ok()
+                    ) {
+                        Ok(()) => true,
+                        Err(failure) => {
+                            let retry_after = if matches!(
+                                &failure,
+                                ValidationFailure::TooFarInTheFuture
+                            ) {
+                                Some(Duration::from_micros(
+                                    entry
+                                        .timestamp()
+                                        .saturating_sub(now)
+                                        .saturating_sub(max_future_shift),
+                                ))
+                            } else {
+                                None
+                            };
+                            rejected.borrow_mut().push(RejectedEntry {
+                                hash: entry.content_hash(),
+                                timestamp: entry.timestamp(),
+                                retry_after,
+                                failure,
+                            });
+                            false
+                        }
+                    }
                 },
                 // on_insert callback: is called when an entry was actually inserted in the store
                 async |_store, entry, content_status| {
@@ -700,6 +745,7 @@ where
             .await?;
 
         // update state with outgoing data.
+        state.rejected.extend(rejected.into_inner());
         if let Some(ref reply) = reply {
             state.num_sent += reply.value_count();
         }
@@ -824,7 +870,7 @@ pub enum SignedEntryVerifyError {
 }
 
 /// Reason why entry validation failed
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum ValidationFailure {
     /// Entry namespace does not match the current replica.
     #[error("Entry namespace does not match the current replica")]
@@ -1178,7 +1224,7 @@ impl RangeKey for RecordIdentifier {
     }
 }
 
-fn system_time_now() -> u64 {
+pub(crate) fn system_time_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("time drift")
@@ -2181,6 +2227,60 @@ mod tests {
         }
         assert!(get_content_hash(
             &mut alice2_store,
+            namespace.id(),
+            author.id(),
+            b"k"
+        )?
+        .is_none());
+        Ok(())
+    }
+
+    /// Entries refused during a sync exchange are reported in the outcome, with a retry time
+    /// for future-stamped ones.
+    #[tokio::test]
+    async fn test_sync_reports_rejected_entries() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut rng = rand::rng();
+        let mut alice_store = store::Store::memory();
+        let mut bob_store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ahead = system_time_now() + 60 * 60 * 1_000_000; // one hour ahead
+
+        // Bob stamps a local entry an hour ahead with a clock.
+        let clock = Arc::new(TestClock::default());
+        clock.now.store(ahead, SeqCst);
+        clock.limit.store(ahead, SeqCst);
+        {
+            let mut bob = bob_store.new_replica(namespace.clone())?;
+            bob.info.set_clock(clock.clone());
+            bob.hash_and_insert(b"k", &author, b"v").await?;
+        }
+
+        let t0 = system_time_now();
+        let alice_state = {
+            let mut alice = alice_store.new_replica(namespace.clone())?;
+            let mut bob = bob_store.new_replica(namespace.clone())?;
+            let (alice_state, _bob_state) = sync(&mut alice, &mut bob).await?;
+            alice_state
+        };
+        let t1 = system_time_now();
+
+        assert_eq!(alice_state.rejected.len(), 1, "alice refuses the entry");
+        let entry = &alice_state.rejected[0];
+        assert_eq!(entry.timestamp, ahead);
+        assert!(matches!(entry.failure, ValidationFailure::TooFarInTheFuture));
+        let retry_after = entry
+            .retry_after
+            .expect("a future-stamped entry has a retry time");
+        // The entry becomes valid once the wall clock has advanced to timestamp - shift.
+        // `now` in the exchange lies between t0 and t1.
+        assert!(retry_after >= Duration::from_micros(ahead - t1 - MAX_TIMESTAMP_FUTURE_SHIFT));
+        assert!(retry_after <= Duration::from_micros(ahead - t0 - MAX_TIMESTAMP_FUTURE_SHIFT));
+
+        // The refused entry never landed in alice's store.
+        assert!(get_content_hash(
+            &mut alice_store,
             namespace.id(),
             author.id(),
             b"k"

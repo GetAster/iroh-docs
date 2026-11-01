@@ -11,6 +11,7 @@ use bytes::Bytes;
 use iroh_blobs::Hash;
 use irpc::channel::mpsc;
 use n0_future::{task::JoinSet, time::Duration, TryFutureExt};
+use crate::sync::system_time_now;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 #[cfg(wasm_browser)]
@@ -29,8 +30,9 @@ use crate::{
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
     Author, AuthorHeads, AuthorId, Capability, Clock, ContentStatus, ContentStatusCallback, Event,
-    NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, RetireWriteAuthorityOutcome,
-    SignedEntry, SyncOutcome, MAX_TIMESTAMP_FUTURE_SHIFT,
+    InsertError, NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo,
+    RetireWriteAuthorityOutcome, SignedEntry, SyncOutcome, ValidationFailure,
+    MAX_TIMESTAMP_FUTURE_SHIFT,
 };
 
 const ACTION_CAP: usize = 1024;
@@ -154,7 +156,7 @@ enum ReplicaAction {
         from: PeerIdBytes,
         content_status: ContentStatus,
         #[debug("reply")]
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<(), InsertRemoteError>>,
     },
     SyncInitialMessage {
         #[debug("reply")]
@@ -282,6 +284,25 @@ impl OpenOpts {
         self.subscribe = Some(subscribe);
         self
     }
+}
+
+/// Why a remote insert received via gossip was refused.
+#[derive(thiserror::Error, derive_more::Debug)]
+pub enum InsertRemoteError {
+    /// The sync actor could not be reached.
+    #[error("sync actor error")]
+    Actor(#[source] anyhow::Error),
+    /// The entry failed validation and was not stored.
+    #[error("entry failed validation: {failure}")]
+    Validation {
+        /// Why validation failed.
+        failure: ValidationFailure,
+        /// When the entry can pass validation; see [`crate::RejectedEntry::retry_after`].
+        retry_after: Option<Duration>,
+    },
+    /// The entry failed to insert for another reason.
+    #[error("insert failed")]
+    Insert(#[source] InsertError),
 }
 
 #[allow(missing_docs)]
@@ -448,7 +469,7 @@ impl SyncHandle {
         entry: SignedEntry,
         from: PeerIdBytes,
         content_status: ContentStatus,
-    ) -> Result<()> {
+    ) -> Result<(), InsertRemoteError> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::InsertRemote {
             entry,
@@ -456,8 +477,11 @@ impl SyncHandle {
             content_status,
             reply,
         };
-        self.send_replica(namespace, action).await?;
-        rx.await?
+        self.send_replica(namespace, action)
+            .await
+            .map_err(InsertRemoteError::Actor)?;
+        rx.await
+            .map_err(|_| InsertRemoteError::Actor(anyhow!("sync actor closed")))?
     }
 
     pub async fn sync_initial_message(
@@ -960,19 +984,45 @@ impl Actor {
                 content_status,
                 reply,
             } => {
-                send_reply_with_async(reply, self, async move |this| {
-                    let mut replica = this
+                let res = async {
+                    let mut replica = self
                         .states
-                        .replica_if_syncing(&namespace, &mut this.store)?;
+                        .replica_if_syncing(&namespace, &mut self.store)
+                        .map_err(InsertRemoteError::Actor)?;
                     let len = entry.content_len();
-                    replica
+                    let timestamp = entry.timestamp();
+                    match replica
                         .insert_remote_entry(entry, from, content_status)
-                        .await?;
-                    this.metrics.new_entries_remote.inc();
-                    this.metrics.new_entries_remote_size.inc_by(len);
-                    Ok(())
-                })
-                .await
+                        .await
+                    {
+                        Ok(_removed) => {
+                            self.metrics.new_entries_remote.inc();
+                            self.metrics.new_entries_remote_size.inc_by(len);
+                            Ok(())
+                        }
+                        Err(InsertError::Validation(failure)) => {
+                            self.metrics.entries_rejected_validation.inc();
+                            Err(InsertRemoteError::Validation {
+                                retry_after: if matches!(
+                                    &failure,
+                                    ValidationFailure::TooFarInTheFuture
+                                ) {
+                                    Some(Duration::from_micros(
+                                        timestamp
+                                            .saturating_sub(system_time_now())
+                                            .saturating_sub(self.max_future_shift),
+                                    ))
+                                } else {
+                                    None
+                                },
+                                failure,
+                            })
+                        }
+                        Err(err) => Err(InsertRemoteError::Insert(err)),
+                    }
+                }
+                .await;
+                reply.send(res).map_err(send_reply_error)
             }
 
             ReplicaAction::SyncInitialMessage { reply } => {
@@ -1279,6 +1329,42 @@ mod tests {
         sync.subscribe(id, tx).await?;
         sync.close(id).await?;
         assert!(rx.recv().await.is_err());
+        Ok(())
+    }
+
+    /// A validation failure from `insert_remote` is reported with the reason and, for
+    /// future-stamped entries, a retry time.
+    #[tokio::test]
+    async fn insert_remote_reports_validation_failure() -> anyhow::Result<()> {
+        let store = store::Store::memory();
+        let sync =
+            SyncHandle::spawn_with_options(store, None, "foo".into(), None, 60 * 1_000_000);
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let author = Author::new(&mut rand::rng());
+        // Build the entry before the namespace secret moves into the store.
+        let entry = SignedEntry::from_parts(
+            &namespace,
+            &author,
+            b"k",
+            crate::Record::from_data(b"v", system_time_now() + 120 * 1_000_000),
+        );
+        let id = namespace.id();
+        sync.import_namespace(namespace.into()).await?;
+        sync.open(id, Default::default()).await?;
+        sync.set_sync(id, true).await?;
+
+        match sync
+            .insert_remote(id, entry, [0u8; 32], ContentStatus::Missing)
+            .await
+        {
+            Err(InsertRemoteError::Validation {
+                failure: ValidationFailure::TooFarInTheFuture,
+                retry_after,
+            }) => {
+                assert!(retry_after.is_some());
+            }
+            res => panic!("expected a validation failure, got {res:?}"),
+        }
         Ok(())
     }
 

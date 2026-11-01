@@ -21,6 +21,8 @@ pub struct Metrics {
     pub sync_via_connect_success: Counter,
     /// Number of failed syncs (via connect)
     pub sync_via_connect_failure: Counter,
+    /// Number of remote entries refused by validation
+    pub entries_rejected_validation: Counter,
 
     /// Number of times the main actor loop ticked
     pub actor_tick_main: Counter,

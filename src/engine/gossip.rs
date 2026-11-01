@@ -14,8 +14,11 @@ use n0_future::{
 use tokio::sync::mpsc;
 use tracing::{debug, instrument, warn};
 
-use super::live::{Op, ToLiveActor};
-use crate::{actor::SyncHandle, ContentStatus, NamespaceId};
+use super::live::{Op, ToLiveActor, WarnLimiter};
+use crate::{
+    actor::{InsertRemoteError, SyncHandle},
+    ContentStatus, NamespaceId,
+};
 
 #[derive(Debug)]
 struct ActiveState {
@@ -149,6 +152,7 @@ async fn receive_loop(
     to_sync_actor: mpsc::Sender<ToLiveActor>,
     sync: SyncHandle,
 ) -> Result<()> {
+    let warn_limiter = WarnLimiter::default();
     for peer in recv.neighbors() {
         to_sync_actor
             .send(ToLiveActor::NeighborUp { namespace, peer })
@@ -176,11 +180,38 @@ async fn receive_loop(
                             false => ContentStatus::Missing,
                         };
                         let from = *msg.delivered_from.as_bytes();
-                        if let Err(err) = sync
+                        let hash = entry.content_hash();
+                        match sync
                             .insert_remote(namespace, entry, from, content_status)
                             .await
                         {
-                            debug!("ignoring entry received via gossip: {err}");
+                            Ok(()) => {}
+                            Err(InsertRemoteError::Validation { failure, retry_after }) => {
+                                // One warning per interval: a reject flood would otherwise log
+                                // per entry.
+                                if warn_limiter.allow() {
+                                    warn!(
+                                        peer = %msg.delivered_from.fmt_short(),
+                                        namespace = %namespace.fmt_short(),
+                                        %hash,
+                                        %failure,
+                                        "refused remote entry received via gossip"
+                                    );
+                                }
+                                // A future-stamped entry becomes valid once the wall clock has
+                                // caught up: re-sync then, or the entry stays missing until
+                                // some unrelated trigger.
+                                if let Some(retry_after) = retry_after {
+                                    to_sync_actor
+                                        .send(ToLiveActor::DeferredResync {
+                                            namespace,
+                                            retry_at: n0_future::time::Instant::now()
+                                                + retry_after,
+                                        })
+                                        .await?;
+                                }
+                            }
+                            Err(err) => debug!("ignoring entry received via gossip: {err}"),
                         }
                     }
                     Op::ContentReady(hash) => {

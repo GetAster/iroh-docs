@@ -19,7 +19,7 @@ use iroh_blobs::{
 use iroh_gossip::net::Gossip;
 use n0_future::{
     task::{Id as TaskId, JoinError, JoinSet},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
     FutureExt,
 };
 use serde::{Deserialize, Serialize};
@@ -36,8 +36,45 @@ use crate::{
         connect_and_sync_with_timeout, handle_connection_with_timeout, AbortReason, AcceptError,
         AcceptOutcome, ConnectError, SyncFinished, DEFAULT_SYNC_INACTIVITY_TIMEOUT,
     },
-    AuthorHeads, ContentStatus, NamespaceId, SignedEntry,
+    AuthorHeads, ContentStatus, NamespaceId, RejectedEntry, SignedEntry,
 };
+
+/// One warning per namespace per interval for events that can arrive in floods: validation
+/// rejects come one per entry, and a wedged gossip subscription lags one tick after another.
+const WARN_LIMITER_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A per-context rate limiter: `allow` returns true once per [`WARN_LIMITER_INTERVAL`].
+#[derive(Debug, Default)]
+pub(super) struct WarnLimiter {
+    last: std::sync::Mutex<Option<Instant>>,
+}
+
+impl WarnLimiter {
+    /// Whether the interval has passed since the last time this returned true.
+    pub(super) fn allow(&self) -> bool {
+        let mut last = self.last.lock().expect("warn limiter poisoned");
+        let now = Instant::now();
+        match *last {
+            Some(prev) if now.duration_since(prev) < WARN_LIMITER_INTERVAL => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Whether an action for `namespace` may proceed: one per [`WARN_LIMITER_INTERVAL`].
+fn reaction_allowed(last: &mut HashMap<NamespaceId, Instant>, namespace: NamespaceId) -> bool {
+    let now = Instant::now();
+    match last.get(&namespace) {
+        Some(prev) if now.duration_since(*prev) < WARN_LIMITER_INTERVAL => false,
+        _ => {
+            last.insert(namespace, now);
+            true
+        }
+    }
+}
 
 /// An iroh-docs operation
 ///
@@ -116,6 +153,12 @@ pub enum ToLiveActor {
     NeighborDown {
         namespace: NamespaceId,
         peer: PublicKey,
+    },
+    /// A remote entry was refused as too far in the future: re-sync once the wall clock has
+    /// caught up enough for it to pass validation.
+    DeferredResync {
+        namespace: NamespaceId,
+        retry_at: Instant,
     },
 }
 
@@ -213,6 +256,12 @@ pub struct LiveActor {
     metrics: Arc<Metrics>,
     /// How long a sync exchange may make no progress before it is abandoned.
     sync_inactivity_timeout: Duration,
+    /// Current gossip neighbors per namespace, for deferred re-syncs.
+    neighbors: HashMap<NamespaceId, HashSet<PublicKey>>,
+    /// Earliest re-sync time per namespace for entries refused as too far in the future.
+    deferred_resyncs: HashMap<NamespaceId, Instant>,
+    /// When we last warned about validation rejects, per namespace.
+    validation_warned: HashMap<NamespaceId, Instant>,
 }
 impl LiveActor {
     /// Create the live actor.
@@ -264,6 +313,9 @@ impl LiveActor {
             pending_downloads: Default::default(),
             metrics,
             sync_inactivity_timeout: DEFAULT_SYNC_INACTIVITY_TIMEOUT,
+            neighbors: Default::default(),
+            deferred_resyncs: Default::default(),
+            validation_warned: Default::default(),
         })
     }
 
@@ -358,6 +410,12 @@ impl LiveActor {
                         warn!(?error, "gossip state failed");
                     }
                 }
+                // Entries refused as too far in the future are worth re-syncing once the wall
+                // clock has caught up: sleep until the earliest such deadline.
+                _ = Self::deferred_resync_timer(&self.deferred_resyncs), if !self.deferred_resyncs.is_empty() => {
+                    trace!(?i, "tick: deferred resync");
+                    self.fire_deferred_resyncs();
+                }
             }
         }
     }
@@ -401,6 +459,7 @@ impl LiveActor {
             }
             ToLiveActor::NeighborUp { namespace, peer } => {
                 debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor up");
+                self.neighbors.entry(namespace).or_default().insert(peer);
                 self.sync_with_peer(namespace, peer, SyncReason::NewNeighbor);
                 self.subscribers
                     .send(&namespace, Event::NeighborUp(peer))
@@ -408,9 +467,21 @@ impl LiveActor {
             }
             ToLiveActor::NeighborDown { namespace, peer } => {
                 debug!(peer = %peer.fmt_short(), namespace = %namespace.fmt_short(), "neighbor down");
+                if let Some(neighbors) = self.neighbors.get_mut(&namespace) {
+                    neighbors.remove(&peer);
+                }
                 self.subscribers
                     .send(&namespace, Event::NeighborDown(peer))
                     .await;
+            }
+            ToLiveActor::DeferredResync {
+                namespace,
+                retry_at,
+            } => {
+                self.deferred_resyncs
+                    .entry(namespace)
+                    .and_modify(|at| *at = (*at).min(retry_at))
+                    .or_insert(retry_at);
             }
             ToLiveActor::StartSync {
                 namespace,
@@ -485,6 +556,71 @@ impl LiveActor {
         let task = self.running_sync_connect.spawn(fut);
         self.running_sync_connect_ids
             .insert(task.id(), (namespace, peer, reason));
+    }
+
+    /// A timer that completes when the earliest deferred re-sync is due.
+    fn deferred_resync_timer(deferred: &HashMap<NamespaceId, Instant>) -> n0_future::time::Sleep {
+        let earliest = deferred
+            .values()
+            .min()
+            .copied()
+            .unwrap_or_else(Instant::now);
+        n0_future::time::sleep_until(earliest)
+    }
+
+    /// Start re-syncs for the namespaces whose deferred re-sync time has arrived.
+    fn fire_deferred_resyncs(&mut self) {
+        let now = Instant::now();
+        let due: Vec<NamespaceId> = self
+            .deferred_resyncs
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(namespace, _)| *namespace)
+            .collect();
+        for namespace in due {
+            self.deferred_resyncs.remove(&namespace);
+            if !self.state.is_syncing(&namespace) {
+                continue;
+            }
+            let peers = self.neighbors.get(&namespace).cloned().unwrap_or_default();
+            for peer in peers {
+                self.sync_with_peer(namespace, peer, SyncReason::DeferredValidation);
+            }
+        }
+    }
+
+    /// Log one warning per interval and schedule re-syncs for entries refused during a sync.
+    fn warn_and_schedule_rejected(
+        &mut self,
+        namespace: NamespaceId,
+        peer: PublicKey,
+        rejected: &[RejectedEntry],
+    ) {
+        let mut earliest: Option<Instant> = None;
+        for entry in rejected {
+            if let Some(retry_after) = entry.retry_after {
+                let at = Instant::now() + retry_after;
+                earliest = Some(earliest.map_or(at, |prev| prev.min(at)));
+            }
+        }
+        if let Some(at) = earliest {
+            self.deferred_resyncs
+                .entry(namespace)
+                .and_modify(|prev| *prev = (*prev).min(at))
+                .or_insert(at);
+        }
+        if !reaction_allowed(&mut self.validation_warned, namespace) {
+            return;
+        }
+        let first = &rejected[0];
+        warn!(
+            peer = %peer.fmt_short(),
+            namespace = %namespace.fmt_short(),
+            hash = %first.hash,
+            reason = %first.failure,
+            count = rejected.len(),
+            "refused remote entries during sync; will re-sync when they can pass validation"
+        );
     }
 
     /// A connect task ended without a result: fail its sync like any error.
@@ -612,6 +748,9 @@ impl LiveActor {
             self.sync.close(namespace).await?;
             self.gossip.quit(&namespace);
         }
+        self.neighbors.remove(&namespace);
+        self.deferred_resyncs.remove(&namespace);
+        self.validation_warned.remove(&namespace);
         if kill_subscribers {
             self.subscribers.remove(&namespace);
         }
@@ -760,6 +899,15 @@ impl LiveActor {
                                 .await;
                         }
                     }
+                }
+
+                // Entries refused during the exchange: warn once per interval and re-sync once
+                // the wall clock has caught up enough for them to pass validation.
+                if !details.outcome.rejected.is_empty() {
+                    self.metrics
+                        .entries_rejected_validation
+                        .inc_by(details.outcome.rejected.len() as u64);
+                    self.warn_and_schedule_rejected(namespace, peer, &details.outcome.rejected);
                 }
             }
         };
@@ -1822,6 +1970,48 @@ mod takeover_tests {
         assert!(
             !actor.state.start_connect(&ns, peer, SyncReason::Resync),
             "connect A must still own the slot"
+        );
+        Ok(())
+    }
+
+    /// Rejects reported by a finished sync schedule a deferred re-sync with the peer, and the
+    /// fired re-sync starts a connect.
+    #[tokio::test]
+    async fn rejected_entries_schedule_a_deferred_resync() -> Result<()> {
+        use crate::ValidationFailure;
+        let (mut actor, _endpoint) = actor().await?;
+        let peer = SecretKey::from_bytes(&[3u8; 32]).public();
+        let ns = NamespaceId::from(&[9u8; 32]);
+        actor.state.insert(ns);
+        actor.neighbors.entry(ns).or_default().insert(peer);
+
+        let mut details = finished(ns, peer);
+        details.outcome.rejected.push(RejectedEntry {
+            hash: Hash::new(b"content"),
+            timestamp: 0,
+            failure: ValidationFailure::TooFarInTheFuture,
+            retry_after: Some(Duration::from_secs(60)),
+        });
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        actor
+            .on_sync_finished(ns, peer, Origin::Connect(SyncReason::DirectJoin), Ok(details))
+            .await;
+        let scheduled = actor
+            .deferred_resyncs
+            .get(&ns)
+            .copied()
+            .expect("a deferred re-sync is scheduled");
+        assert!(
+            scheduled >= retry_at && scheduled <= retry_at + Duration::from_secs(1),
+            "scheduled roughly one minute out: {scheduled:?}"
+        );
+
+        // The deadline arrives: the fired re-sync starts a connect with the peer.
+        actor.deferred_resyncs.insert(ns, Instant::now());
+        actor.fire_deferred_resyncs();
+        assert!(
+            !actor.running_sync_connect.is_empty(),
+            "the deferred re-sync starts a connect"
         );
         Ok(())
     }

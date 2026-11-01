@@ -22,6 +22,9 @@ pub enum SyncReason {
     SyncReport,
     /// We received a sync report while a sync was running, so run again afterwars
     Resync,
+    /// We refused remote entries as too far in the future; re-sync once the wall clock has
+    /// caught up enough for them to pass validation
+    DeferredValidation,
 }
 
 /// Why we performed a sync exchange
@@ -228,8 +231,14 @@ impl PeerState {
                 debug!("abort connect: sync already running");
                 // A NewNeighbor edge can race the initial DirectJoin. Dropping it
                 // leaves writes made after the initial reconciliation snapshot but
-                // before gossip is ready without another reconciliation trigger.
-                if matches!(reason, SyncReason::SyncReport | SyncReason::NewNeighbor) {
+                // before gossip is ready without another reconciliation trigger. A
+                // deferred validation re-sync needs the same treatment: the entry is
+                // not valid yet, and dropping the request would lose it until some
+                // other trigger fires.
+                if matches!(
+                    reason,
+                    SyncReason::SyncReport | SyncReason::NewNeighbor | SyncReason::DeferredValidation
+                ) {
                     debug!("resync queued");
                     self.resync_requested = true;
                 }
@@ -308,6 +317,16 @@ mod tests {
 
         assert!(state.start_connect(SyncReason::DirectJoin));
         assert!(!state.start_connect(SyncReason::NewNeighbor));
+        assert!(state.resync_requested);
+    }
+
+    /// A deferred-validation re-sync that races a running sync must also queue, not vanish.
+    #[test]
+    fn deferred_validation_during_running_sync_queues_a_resync() {
+        let mut state = PeerState::default();
+
+        assert!(state.start_connect(SyncReason::DirectJoin));
+        assert!(!state.start_connect(SyncReason::DeferredValidation));
         assert!(state.resync_requested);
     }
 
