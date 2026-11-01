@@ -557,11 +557,16 @@ impl Store {
             let _ = tables
                 .records_by_key
                 .retain_in(bounds.as_ref(), |_k, _v| false);
-            tables.namespaces.remove(namespace.as_bytes())?;
-            tables.namespace_peers.remove_all(namespace.as_bytes())?;
-            tables.download_policy.remove(namespace.as_bytes())?;
-            tables.writer_allowlist.remove(namespace.as_bytes())?;
-            tables.namespace_fingerprint.remove(namespace.as_bytes())?;
+            let ns = namespace.as_bytes();
+            tables.namespaces.remove(ns)?;
+            tables.namespace_peers.remove_all(ns)?;
+            tables.download_policy.remove(ns)?;
+            tables.writer_allowlist.remove(ns)?;
+            tables.namespace_fingerprint.remove(ns)?;
+            tables.namespace_sequence.remove(ns)?;
+            let _ = tables
+                .records_by_seq
+                .retain_in((ns, 0u64)..=(ns, u64::MAX), |_k, _v| false);
             Ok(())
         })
     }
@@ -872,6 +877,84 @@ impl StoreInstance<'_> {
             Ok(fp)
         })
     }
+
+    /// Build the insertion-sequence index if it does not exist yet: assign
+    /// the namespace's current record rows sequence numbers 1..=N in
+    /// records-table order and store N. Until this runs, `entry_put` skips
+    /// sequence maintenance, so a replica written before the sequence
+    /// tables existed replays its pre-existing rows first.
+    fn ensure_sequence_index(&mut self) -> Result<()> {
+        let ns = self.namespace.as_bytes();
+        let built = {
+            let tables = self.store.as_mut().snapshot()?;
+            tables.namespace_sequence.get(ns)?.is_some()
+        };
+        if built {
+            return Ok(());
+        }
+        self.store.as_mut().modify(|tables| {
+            if tables.namespace_sequence.get(ns)?.is_some() {
+                return Ok(());
+            }
+            let mut seq = 0u64;
+            let bounds = RecordsBounds::namespace(self.namespace);
+            let records = tables.records.range(bounds.as_ref())?;
+            for row in records {
+                let (compound_key, _value) = row?;
+                let (ns_row, author, key) = compound_key.value();
+                debug_assert_eq!(ns_row, ns);
+                seq += 1;
+                tables.records_by_seq.insert((ns, seq), (author, key))?;
+            }
+            tables.namespace_sequence.insert(ns, seq)?;
+            Ok(())
+        })
+    }
+
+    /// The insertion sequence of this namespace: the sequence number of the
+    /// last state-changing put, or 0 for an empty namespace. Strictly
+    /// increases with each state-changing put and never bumps on a
+    /// byte-identical re-insert.
+    pub fn namespace_sequence(&mut self) -> Result<u64> {
+        self.ensure_sequence_index()?;
+        let tables = self.store.as_mut().snapshot()?;
+        Ok(tables
+            .namespace_sequence
+            .get(self.namespace.as_bytes())?
+            .map(|v| v.value())
+            .unwrap_or(0))
+    }
+
+    /// The records touched by puts with sequence numbers greater than
+    /// `seq`, as `(touch_sequence, record)` pairs ordered by touch
+    /// sequence. A key touched several times appears once, with its latest
+    /// touch and latest record, so a consumer tracking the last seen
+    /// sequence converges on the current state. Tombstones replay as empty
+    /// records; a key whose put was superseded by a later remove is
+    /// naturally absent from the records table and is skipped.
+    pub fn entries_since(&mut self, seq: u64) -> Result<Vec<(u64, SignedEntry)>> {
+        use std::collections::BTreeMap;
+        self.ensure_sequence_index()?;
+        let tables = self.store.as_mut().snapshot()?;
+        let ns = self.namespace.as_bytes();
+        let start = (ns, seq.saturating_add(1));
+        let end = (ns, u64::MAX);
+        let index = tables.records_by_seq.range(start..=end)?;
+        let mut latest: BTreeMap<(Vec<u8>, Vec<u8>), (u64, SignedEntry)> = BTreeMap::new();
+        for row in index {
+            let (compound_key, target) = row?;
+            let (_, touch) = compound_key.value();
+            let (author, key) = target.value();
+            let id = (ns, author, key);
+            if let Some(record) = tables.records.get(id)? {
+                let entry = into_entry(id, record.value());
+                latest.insert((author.to_vec(), key.to_vec()), (touch, entry));
+            }
+        }
+        let mut out: Vec<_> = latest.into_values().collect();
+        out.sort_by_key(|(touch, _)| *touch);
+        Ok(out)
+    }
 }
 
 impl PublicKeyStore for StoreInstance<'_> {
@@ -951,12 +1034,6 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     fn entry_put(&mut self, e: SignedEntry) -> Result<()> {
         let id = e.id();
         self.store.as_mut().modify(|tables| {
-            // insert into record table
-            let key = (
-                &id.namespace().to_bytes(),
-                &id.author().to_bytes(),
-                id.key(),
-            );
             let hash = e.content_hash(); // let binding is needed
             let value = (
                 e.timestamp(),
@@ -965,6 +1042,32 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 e.content_len(),
                 hash.as_bytes(),
             );
+            // Insert into record table
+            let key = (
+                &id.namespace().to_bytes(),
+                &id.author().to_bytes(),
+                id.key(),
+            );
+            // A byte-identical re-insert changes nothing: skip it entirely
+            // so the fingerprint stays put and the insertion sequence does
+            // not bump on a no-op. A different value at the same key
+            // supersedes the old row: XOR it out of the maintained
+            // fingerprint before the new one goes in (a `put` has already
+            // removed it via `remove_prefix_filtered`, so this only fires
+            // for direct overwrites).
+            let superseded = {
+                let old = tables.records.get(key)?;
+                match old {
+                    None => None,
+                    Some(existing) => {
+                        if existing.value() == value {
+                            return Ok(());
+                        }
+                        let (timestamp, _sig_ns, _sig_author, _len, hash) = existing.value();
+                        Some((timestamp, *hash))
+                    }
+                }
+            };
             tables.records.insert(key, value)?;
 
             // insert into by key index table
@@ -980,29 +1083,54 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             let value = (e.timestamp(), e.id().key());
             tables.latest_per_author.insert(key, value)?;
 
-            // Maintain the namespace fingerprint: XOR the new entry in. A
-            // missing row means the aggregate has not been built yet (a
-            // replica written before this table existed) and the first
-            // query builds it from the records table, so maintenance skips
-            // here rather than building a partial aggregate.
+            // Maintain the namespace fingerprint: XOR the new entry in and
+            // a superseded one out. A missing row means the aggregate has
+            // not been built yet (a replica written before this table
+            // existed) and the first query builds it from the records
+            // table, so maintenance skips here rather than building a
+            // partial aggregate.
             let stored = tables
                 .namespace_fingerprint
                 .get(id.namespace().as_bytes())?
                 .map(|fp| *fp.value());
             if let Some(mut bytes) = stored {
-                let entry_fp = crate::ranger::record_fingerprint(
+                let mut delta = crate::ranger::record_fingerprint(
                     id.namespace().as_ref(),
                     id.author().as_ref(),
                     id.key(),
                     e.timestamp(),
                     hash.as_bytes(),
                 );
-                for (acc, add) in bytes.iter_mut().zip(entry_fp.0) {
+                if let Some((old_timestamp, old_hash)) = superseded {
+                    delta ^= crate::ranger::record_fingerprint(
+                        id.namespace().as_ref(),
+                        id.author().as_ref(),
+                        id.key(),
+                        old_timestamp,
+                        &old_hash,
+                    );
+                }
+                for (acc, add) in bytes.iter_mut().zip(delta.0) {
                     *acc ^= add;
                 }
                 tables
                     .namespace_fingerprint
                     .insert(id.namespace().as_bytes(), &bytes)?;
+            }
+
+            // Maintain the insertion sequence: bump it and record which key
+            // this state-changing put touched. A missing sequence row means
+            // the index has not been built yet; the first query builds it
+            // from the records table, so maintenance skips here rather than
+            // leaving a partial index.
+            let ns = id.namespace().to_bytes();
+            let current = tables.namespace_sequence.get(&ns)?.map(|v| v.value());
+            if let Some(current) = current {
+                let next = current + 1;
+                tables
+                    .records_by_seq
+                    .insert((&ns, next), (&id.author().to_bytes(), id.key()))?;
+                tables.namespace_sequence.insert(&ns, next)?;
             }
             Ok(())
         })
@@ -1268,7 +1396,7 @@ fn into_entry(key: RecordsId, value: RecordsValue) -> SignedEntry {
 #[cfg(all(test, feature = "fs-store"))]
 mod tests {
     use super::*;
-    use crate::ranger::Store as _;
+    use crate::ranger::{InsertOutcome, Store as _};
 
     /// Retiring write authority keeps the entries, commits before returning,
     /// and survives a process that never gets to shut down cleanly.
@@ -1840,6 +1968,249 @@ mod tests {
                 "after op {op}"
             );
         }
+        Ok(())
+    }
+
+    /// The insertion sequence builds lazily over pre-existing rows, bumps
+    /// exactly once per state-changing put (overwrites and tombstones
+    /// included, byte-identical re-inserts not), and replays via
+    /// `entries_since` — surviving a reopen.
+    #[test]
+    fn namespace_sequence_builds_bumps_and_replays() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let path = dbfile.path().to_path_buf();
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        let author = {
+            let mut store = Store::persistent(&path)?;
+            store.new_author(&mut rand::rng())?
+        };
+
+        let mut store = Store::persistent(&path)?;
+        store.import_author(author.clone())?;
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(id);
+        let mut wrapper = StoreInstance::new(id, &mut store);
+
+        // Rows written before any sequence query: the first query builds
+        // the index from the records table.
+        for i in 0..10u64 {
+            wrapper.put(fixed_entry(
+                &namespace,
+                &author,
+                &format!("k{i}"),
+                b"v0",
+                i + 1,
+            ))?;
+        }
+        assert_eq!(wrapper.namespace_sequence()?, 10);
+        let replay = wrapper.entries_since(0)?;
+        assert_eq!(replay.len(), 10);
+        for (i, (touch, entry)) in replay.iter().enumerate() {
+            assert_eq!(*touch, i as u64 + 1);
+            assert_eq!(entry.key(), format!("k{i}").as_bytes());
+        }
+
+        // A state-changing overwrite bumps once and replays after the old
+        // sequence.
+        wrapper.put(fixed_entry(&namespace, &author, "k0", b"v1", 100))?;
+        assert_eq!(wrapper.namespace_sequence()?, 11);
+        let replay = wrapper.entries_since(10)?;
+        assert_eq!(replay.len(), 1);
+        let (touch, entry) = &replay[0];
+        assert_eq!(*touch, 11);
+        assert_eq!(entry.key(), b"k0");
+        assert_eq!(entry.content_len(), 2);
+
+        // A byte-identical re-insert is a no-op: no bump, no replay row.
+        let outcome = wrapper.put(fixed_entry(&namespace, &author, "k0", b"v1", 100))?;
+        assert!(matches!(outcome, InsertOutcome::NotInserted));
+        assert_eq!(wrapper.namespace_sequence()?, 11);
+        assert_eq!(wrapper.entries_since(10)?.len(), 1);
+
+        // A tombstone removes the covered keys and is itself a record row,
+        // so it bumps and replays as an empty record.
+        wrapper.put(fixed_entry(&namespace, &author, "k", &[], 200))?;
+        assert_eq!(wrapper.namespace_sequence()?, 12);
+        let replay = wrapper.entries_since(11)?;
+        assert_eq!(replay.len(), 1);
+        let (touch, entry) = &replay[0];
+        assert_eq!(*touch, 12);
+        assert_eq!(entry.key(), b"k");
+        assert_eq!(entry.content_len(), 0);
+
+        // The sequence and index survive a reopen.
+        {
+            let _wrapper = wrapper;
+        }
+        store.close_replica(id);
+        drop(store);
+        let mut store = Store::persistent(&path)?;
+        let mut wrapper = StoreInstance::new(id, &mut store);
+        assert_eq!(wrapper.namespace_sequence()?, 12);
+        let replay = wrapper.entries_since(11)?;
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].1.key(), b"k");
+        Ok(())
+    }
+
+    /// A direct `entry_put` overwrite (no preceding `remove_prefix_filtered`)
+    /// still keeps the fingerprint equal to a scan, and a byte-identical
+    /// direct re-insert neither moves the fingerprint nor bumps the
+    /// sequence.
+    #[test]
+    fn direct_entry_put_overwrite_keeps_fingerprint_and_bumps_once() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+
+        wrapper.put(fixed_entry(&namespace, &author, "k0", b"v0", 1))?;
+        // Build both aggregates up front, as a consumer would.
+        assert_eq!(wrapper.namespace_sequence()?, 1);
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+
+        // Overwrite through the low-level path, skipping prefix removal.
+        wrapper.entry_put(fixed_entry(&namespace, &author, "k0", b"v1", 2))?;
+        assert_eq!(wrapper.namespace_sequence()?, 2);
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+        let replay = wrapper.entries_since(1)?;
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].0, 2);
+        assert_eq!(replay[0].1.key(), b"k0");
+        assert_eq!(replay[0].1.content_len(), 2);
+
+        // Byte-identical direct re-insert: nothing changes.
+        wrapper.entry_put(fixed_entry(&namespace, &author, "k0", b"v1", 2))?;
+        assert_eq!(wrapper.namespace_sequence()?, 2);
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+        assert_eq!(wrapper.entries_since(1)?.len(), 1);
+        Ok(())
+    }
+
+    /// Random inserts, overwrites, duplicate re-inserts and tombstones: the
+    /// sequence tracks exactly the state-changing puts, and replaying from
+    /// zero yields the current records with each key's latest touch.
+    #[test]
+    fn namespace_sequence_tracks_random_ops() -> Result<()> {
+        use rand::{RngExt, SeedableRng};
+        use std::collections::BTreeMap;
+
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut expected_seq = 0u64;
+        let mut last_touch: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut last = vec![0u8; 0];
+        for op in 0..200u64 {
+            let key = format!("k{}", rng.random_range(0..8usize));
+            let mut changed = false;
+            let mut put_key = key.clone();
+            match rng.random_range(0..4usize) {
+                // New version at the key.
+                0 => {
+                    let data = vec![op as u8; 1 + (op % 7) as usize];
+                    wrapper.put(fixed_entry(&namespace, &author, &key, &data, op + 1))?;
+                    last = data;
+                    changed = true;
+                }
+                // Duplicate re-insert of the previous version.
+                1 => {
+                    let data = last.clone();
+                    if !data.is_empty() {
+                        let outcome =
+                            wrapper.put(fixed_entry(&namespace, &author, &key, &data, op))?;
+                        changed = !matches!(outcome, InsertOutcome::NotInserted);
+                    }
+                }
+                // Tombstone at a prefix, removing everything under it.
+                _ => {
+                    let prefix = key[..1].to_string();
+                    wrapper.put(fixed_entry(&namespace, &author, &prefix, &[], op + 1))?;
+                    last = Vec::new();
+                    put_key = prefix;
+                    changed = true;
+                }
+            }
+            if changed {
+                expected_seq += 1;
+                last_touch.insert(put_key.into_bytes(), expected_seq);
+            }
+            assert_eq!(wrapper.namespace_sequence()?, expected_seq, "after op {op}");
+            // Replay from zero converges on the current records, each key
+            // carrying its latest touch.
+            let replay = wrapper.entries_since(0)?;
+            let first = wrapper.get_first()?;
+            let current: Vec<_> = wrapper
+                .get_range(crate::ranger::Range::new(first.clone(), first))?
+                .collect::<Result<_>>()?;
+            assert_eq!(replay.len(), current.len(), "after op {op}");
+            let mut by_key: BTreeMap<Vec<u8>, (u64, SignedEntry)> = replay
+                .into_iter()
+                .map(|(touch, entry)| (entry.key().to_vec(), (touch, entry)))
+                .collect();
+            let mut current_by_key: BTreeMap<Vec<u8>, SignedEntry> = current
+                .into_iter()
+                .map(|entry| (entry.key().to_vec(), entry))
+                .collect();
+            for (key, current_entry) in &current_by_key {
+                let (touch, replay_entry) = by_key.remove(key).expect("replayed key missing");
+                let tracked = last_touch.get(key);
+                assert_eq!(
+                    touch,
+                    tracked.copied().unwrap_or(0),
+                    "touch for {key:?} after op {op}"
+                );
+                assert_eq!(
+                    &replay_entry, current_entry,
+                    "entry for {key:?} after op {op}"
+                );
+            }
+            assert!(by_key.is_empty(), "replay has keys absent from the store");
+            let _ = &mut current_by_key;
+        }
+        Ok(())
+    }
+
+    /// Removing a replica clears the sequence tables with it.
+    #[test]
+    fn remove_replica_clears_sequence_tables() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(id);
+        {
+            let mut wrapper = StoreInstance::new(id, &mut store);
+            wrapper.put(fixed_entry(&namespace, &author, "k0", b"v0", 1))?;
+            assert_eq!(wrapper.namespace_sequence()?, 1);
+        }
+        store.remove_replica(&id)?;
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(id);
+        let mut wrapper = StoreInstance::new(id, &mut store);
+        assert_eq!(wrapper.namespace_sequence()?, 0);
+        assert!(wrapper.entries_since(0)?.is_empty());
         Ok(())
     }
 }

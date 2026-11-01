@@ -65,6 +65,28 @@ pub type RecordsByKeyIdOwned = ([u8; 32], Bytes, [u8; 32]);
 pub const NAMESPACE_FINGERPRINT_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
     TableDefinition::new("namespace-fingerprint-1");
 
+/// Table: Namespace insertion sequence
+/// Key:   `[u8; 32]`   # NamespaceId
+/// Value: `u64`        # sequence of the last state-changing put
+///
+/// A missing row means the sequence index has not been built yet (a
+/// replica written before this table existed): the first query builds it
+/// from the records table.
+pub const NAMESPACE_SEQUENCE_TABLE: TableDefinition<&[u8; 32], u64> =
+    TableDefinition::new("namespace-sequence-1");
+
+/// Table: Records by insertion sequence
+/// Key:   `([u8; 32], u64)`   # (NamespaceId, sequence)
+/// Value: `([u8; 32], &[u8])` # (AuthorId, Key) touched by that put
+///
+/// Append-only: one row per state-changing put. A key a later put
+/// superseded keeps its earlier rows, so a consumer can replay the touch
+/// history since a sequence and resolve each key to its latest record.
+pub const RECORDS_BY_SEQ_TABLE: TableDefinition<RecordsBySeqKey, RecordsBySeqValue> =
+    TableDefinition::new("records-by-seq-1");
+pub type RecordsBySeqKey<'a> = (&'a [u8; 32], u64);
+pub type RecordsBySeqValue<'a> = (&'a [u8; 32], &'a [u8]);
+
 /// Table: Peers per document.
 /// Key:   `[u8; 32]`        # NamespaceId
 /// Value: `(u64, [u8; 32])` # ([`Nanos`], &[`PeerIdBytes`]) representing the last time a peer was used.
@@ -141,6 +163,8 @@ pub struct Tables<'tx> {
     pub writer_allowlist: Table<'tx, &'static [u8; 32], &'static [u8]>,
     pub authors: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
     pub namespace_fingerprint: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
+    pub namespace_sequence: Table<'tx, &'static [u8; 32], u64>,
+    pub records_by_seq: Table<'tx, RecordsBySeqKey<'static>, RecordsBySeqValue<'static>>,
 }
 
 impl<'tx> Tables<'tx> {
@@ -154,6 +178,8 @@ impl<'tx> Tables<'tx> {
         let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
+        let namespace_sequence = tx.open_table(NAMESPACE_SEQUENCE_TABLE)?;
+        let records_by_seq = tx.open_table(RECORDS_BY_SEQ_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
@@ -164,6 +190,8 @@ impl<'tx> Tables<'tx> {
             writer_allowlist,
             authors,
             namespace_fingerprint,
+            namespace_sequence,
+            records_by_seq,
         })
     }
 }
@@ -180,6 +208,8 @@ pub struct ReadOnlyTables {
     pub writer_allowlist: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
     pub authors: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
     pub namespace_fingerprint: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
+    pub namespace_sequence: ReadOnlyTable<&'static [u8; 32], u64>,
+    pub records_by_seq: ReadOnlyTable<RecordsBySeqKey<'static>, RecordsBySeqValue<'static>>,
     tx: ReadTransaction,
 }
 
@@ -194,6 +224,8 @@ impl ReadOnlyTables {
         let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
+        let namespace_sequence = tx.open_table(NAMESPACE_SEQUENCE_TABLE)?;
+        let records_by_seq = tx.open_table(RECORDS_BY_SEQ_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
@@ -204,6 +236,8 @@ impl ReadOnlyTables {
             writer_allowlist,
             authors,
             namespace_fingerprint,
+            namespace_sequence,
+            records_by_seq,
             tx,
         })
     }

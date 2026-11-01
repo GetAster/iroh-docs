@@ -642,6 +642,28 @@ where
         self.store.namespace_fingerprint()
     }
 
+    /// The insertion sequence of this namespace: the sequence number of the
+    /// last state-changing put, strictly increasing with each one.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI
+    /// and binding parity pass is planned.
+    pub fn namespace_sequence(&mut self) -> anyhow::Result<u64> {
+        self.info.ensure_open().map_err(anyhow::Error::from)?;
+        self.store.namespace_sequence()
+    }
+
+    /// The records touched by puts after `seq`, as `(touch_sequence,
+    /// record)` pairs ordered by touch sequence, each key once with its
+    /// latest touch and record. See
+    /// [`StoreInstance::entries_since`](crate::store::fs::StoreInstance::entries_since).
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI
+    /// and binding parity pass is planned.
+    pub fn entries_since(&mut self, seq: u64) -> anyhow::Result<Vec<(u64, SignedEntry)>> {
+        self.info.ensure_open().map_err(anyhow::Error::from)?;
+        self.store.entries_since(seq)
+    }
+
     /// Create the initial message for the set reconciliation flow with a remote peer.
     pub fn sync_initial_message(&mut self) -> anyhow::Result<crate::ranger::Message<SignedEntry>> {
         self.info.ensure_open().map_err(anyhow::Error::from)?;
