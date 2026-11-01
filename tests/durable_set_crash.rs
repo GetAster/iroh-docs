@@ -58,7 +58,9 @@ async fn crash_child_writer() -> Result<()> {
     };
 
     // The parent kills us on this line; stdout must actually carry it.
-    println!("{READY_PREFIX}{}", hash.to_hex());
+    // Alongside the hash it carries the document id and author so the
+    // parent can demand the record itself on reopen.
+    println!("{READY_PREFIX}{} {} {}", hash.to_hex(), doc.id(), author);
     use std::io::Write;
     std::io::stdout().flush().ok();
     std::future::pending::<()>().await;
@@ -86,26 +88,35 @@ fn a_hard_kill_after_set_bytes_durable_never_leaves_the_blob_uncommitted() {
         // Kill the instant the durable write reports done: everything the
         // contract promises must already be on disk.
         let stdout = child.stdout.take().expect("child stdout");
-        let mut hash_hex = None;
+        let mut ready = None;
         for line in BufReader::new(stdout).lines() {
             let line = line.expect("child stdout line");
             if let Some(rest) = line.strip_prefix(READY_PREFIX) {
-                hash_hex = Some(rest.trim().to_string());
+                ready = Some(rest.trim().to_string());
                 break;
             }
         }
-        let hash_hex = hash_hex.expect("child printed the READY line before exiting");
+        let ready = ready.expect("child printed the READY line before exiting");
+        let mut fields = ready.split_whitespace();
+        let hash_hex = fields.next().expect("hash field").to_string();
+        let ns_hex = fields.next().expect("namespace field").to_string();
+        let author_hex = fields.next().expect("author field").to_string();
         child.kill().expect("SIGKILL child");
         child.wait().expect("reap child");
 
         // Reopen the blob store alone (same layout as util::Node::persistent)
         // and demand committed, complete metadata for the hash.
+        // The TempDir must stay alive for the whole round: moving it into
+        // either reopen closure would drop (and delete) the store files
+        // before the node reopen.
         let hash: iroh_blobs::Hash = hash_hex.parse().expect("hash from child");
-        let db_path = dir.path().join("blobs.db");
+        let dir_path = dir.path().to_path_buf();
+        let db_path = dir_path.join("blobs.db");
+        let opts_path = dir_path.clone();
         let status = tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async move {
-                let opts = iroh_blobs::store::fs::options::Options::new(dir.path());
+                let opts = iroh_blobs::store::fs::options::Options::new(&opts_path);
                 let store = iroh_blobs::store::fs::FsStore::load_with_opts(db_path, opts)
                     .await
                     .expect("reopen blob store after kill");
@@ -117,6 +128,36 @@ fn a_hard_kill_after_set_bytes_durable_never_leaves_the_blob_uncommitted() {
             matches!(status, iroh_blobs::api::blobs::BlobStatus::Complete { .. }),
             "round {round}: reopened store reports {status:?} for the durably \
              published hash — the barrier failed to commit before the record",
+        );
+
+        // Reopen the whole node and demand the document record itself: the
+        // durable insert must flush the record, not just the blob metadata.
+        let ns: iroh_docs::NamespaceId = ns_hex.parse().expect("namespace from child");
+        let author: iroh_docs::AuthorId = author_hex.parse().expect("author from child");
+        let recorded = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async move {
+                let endpoint = util::empty_endpoint().await.expect("endpoint");
+                let node = util::Node::persistent(&dir_path, endpoint)
+                    .spawn()
+                    .await
+                    .expect("reopen node after kill");
+                let entry = node
+                    .docs()
+                    .open(ns)
+                    .await
+                    .expect("open document")
+                    .expect("document exists")
+                    .get_exact(author, "the-key", false)
+                    .await
+                    .expect("read record");
+                node.shutdown().await.ok();
+                entry
+            });
+        assert!(
+            recorded.is_some(),
+            "round {round}: the document record is missing after the kill — \
+             set_bytes_durable did not flush the record",
         );
     }
 }

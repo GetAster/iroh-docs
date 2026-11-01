@@ -638,6 +638,14 @@ impl RpcActor {
             .insert_local(doc_id, author_id, key.clone(), tag.hash(), len as u64)
             .await
             .map_err(|e| RpcError::new(&*e))?;
+        // The document record must be durable when this call returns, not
+        // merely present in the actor's open write transaction: a hard kill
+        // right after the acknowledgement otherwise loses the record while
+        // its blob metadata is already committed.
+        self.sync
+            .flush_store()
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
         let entry = self
             .sync
             .get_exact(doc_id, author_id, key, false)
