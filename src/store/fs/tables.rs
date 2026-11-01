@@ -55,6 +55,16 @@ pub const RECORDS_BY_KEY_TABLE: TableDefinition<RecordsByKeyId, ()> =
 pub type RecordsByKeyId<'a> = (&'a [u8; 32], &'a [u8], &'a [u8; 32]);
 pub type RecordsByKeyIdOwned = ([u8; 32], Bytes, [u8; 32]);
 
+/// Table: Namespace fingerprint
+/// Key:   `[u8; 32]`   # NamespaceId
+/// Value: `[u8; 32]`   # XOR aggregate over the namespace's record rows
+///
+/// Maintained on insert; a missing row means the aggregate has not been
+/// built yet (a replica written before this table existed): the first
+/// query builds it from the records table.
+pub const NAMESPACE_FINGERPRINT_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
+    TableDefinition::new("namespace-fingerprint-1");
+
 /// Table: Peers per document.
 /// Key:   `[u8; 32]`        # NamespaceId
 /// Value: `(u64, [u8; 32])` # ([`Nanos`], &[`PeerIdBytes`]) representing the last time a peer was used.
@@ -130,6 +140,7 @@ pub struct Tables<'tx> {
     pub download_policy: Table<'tx, &'static [u8; 32], &'static [u8]>,
     pub writer_allowlist: Table<'tx, &'static [u8; 32], &'static [u8]>,
     pub authors: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
+    pub namespace_fingerprint: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
 }
 
 impl<'tx> Tables<'tx> {
@@ -142,6 +153,7 @@ impl<'tx> Tables<'tx> {
         let download_policy = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
         let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
+        let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
@@ -151,6 +163,7 @@ impl<'tx> Tables<'tx> {
             download_policy,
             writer_allowlist,
             authors,
+            namespace_fingerprint,
         })
     }
 }
@@ -166,6 +179,7 @@ pub struct ReadOnlyTables {
     pub download_policy: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
     pub writer_allowlist: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
     pub authors: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
+    pub namespace_fingerprint: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
     tx: ReadTransaction,
 }
 
@@ -179,6 +193,7 @@ impl ReadOnlyTables {
         let download_policy = tx.open_table(DOWNLOAD_POLICY_TABLE)?;
         let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
+        let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
         Ok(Self {
             records,
             records_by_key,
@@ -188,6 +203,7 @@ impl ReadOnlyTables {
             download_policy,
             writer_allowlist,
             authors,
+            namespace_fingerprint,
             tx,
         })
     }

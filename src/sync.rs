@@ -630,6 +630,18 @@ where
         RecordIdentifier::new(self.info.capability.id(), author.id(), key)
     }
 
+    /// The namespace fingerprint: the XOR aggregate over this replica's
+    /// record rows, maintained on insert, readable in O(1) in the namespace
+    /// size. Two replicas holding the same record rows agree, independent
+    /// of insertion order or consumer-side filtering.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI
+    /// and binding parity pass is planned.
+    pub fn namespace_fingerprint(&mut self) -> anyhow::Result<crate::ranger::Fingerprint> {
+        self.info.ensure_open().map_err(anyhow::Error::from)?;
+        self.store.namespace_fingerprint()
+    }
+
     /// Create the initial message for the set reconciliation flow with a remote peer.
     pub fn sync_initial_message(&mut self) -> anyhow::Result<crate::ranger::Message<SignedEntry>> {
         self.info.ensure_open().map_err(anyhow::Error::from)?;
@@ -1015,14 +1027,14 @@ impl RangeEntry for SignedEntry {
         &self.entry.record
     }
 
-    fn as_fingerprint(&self) -> crate::ranger::Fingerprint {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.namespace().as_ref());
-        hasher.update(self.author_bytes().as_ref());
-        hasher.update(self.key());
-        hasher.update(&self.timestamp().to_be_bytes());
-        hasher.update(self.content_hash().as_bytes());
-        Fingerprint(hasher.finalize().into())
+    fn as_fingerprint(&self) -> Fingerprint {
+        crate::ranger::record_fingerprint(
+            self.namespace().as_ref(),
+            self.author_bytes().as_ref(),
+            self.key(),
+            self.timestamp(),
+            self.content_hash().as_bytes(),
+        )
     }
 }
 

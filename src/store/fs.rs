@@ -561,6 +561,7 @@ impl Store {
             tables.namespace_peers.remove_all(namespace.as_bytes())?;
             tables.download_policy.remove(namespace.as_bytes())?;
             tables.writer_allowlist.remove(namespace.as_bytes())?;
+            tables.namespace_fingerprint.remove(namespace.as_bytes())?;
             Ok(())
         })
     }
@@ -829,6 +830,48 @@ impl StoreInstance<'_> {
     pub(crate) fn allowed_writers(&mut self) -> Result<Option<BTreeSet<AuthorId>>> {
         self.store.get_allowed_writers(&self.namespace)
     }
+
+    /// The namespace fingerprint: the XOR aggregate over this namespace's
+    /// record rows, maintained on insert (see [`crate::ranger::Fingerprint`]
+    /// for the exact per-row bytes), readable in O(1).
+    ///
+    /// Two replicas that hold the same record rows produce the same
+    /// fingerprint, independent of insertion order and of any consumer-side
+    /// filtering (grants filter consumers, not the store). The first query
+    /// on a replica written before the fingerprint table existed builds the
+    /// aggregate once from the records table.
+    pub fn namespace_fingerprint(&mut self) -> Result<Fingerprint> {
+        let namespace = self.namespace.as_bytes();
+        let cached = {
+            let tables = self.store.as_mut().snapshot()?;
+            tables
+                .namespace_fingerprint
+                .get(namespace)?
+                .map(|fp| Fingerprint(*fp.value()))
+        };
+        if let Some(fp) = cached {
+            return Ok(fp);
+        }
+        // Build once, inside the write transaction, so the stored row and
+        // the records it covers agree.
+        self.store.as_mut().modify(|tables| {
+            if let Some(fp) = tables.namespace_fingerprint.get(namespace)? {
+                return Ok(Fingerprint(*fp.value()));
+            }
+            let mut fp = Fingerprint::empty();
+            let bounds = RecordsBounds::namespace(self.namespace);
+            let records = tables.records.range(bounds.as_ref())?;
+            for row in records {
+                let (compound_key, value) = row?;
+                let (ns, author, key) = compound_key.value();
+                let (timestamp, _sig_ns, _sig_author, _len, hash) = value.value();
+                fp ^= crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
+            }
+            let bytes = fp.0;
+            tables.namespace_fingerprint.insert(namespace, &bytes)?;
+            Ok(fp)
+        })
+    }
 }
 
 impl PublicKeyStore for StoreInstance<'_> {
@@ -936,6 +979,31 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             let key = (&e.id().namespace().to_bytes(), &e.id().author().to_bytes());
             let value = (e.timestamp(), e.id().key());
             tables.latest_per_author.insert(key, value)?;
+
+            // Maintain the namespace fingerprint: XOR the new entry in. A
+            // missing row means the aggregate has not been built yet (a
+            // replica written before this table existed) and the first
+            // query builds it from the records table, so maintenance skips
+            // here rather than building a partial aggregate.
+            let stored = tables
+                .namespace_fingerprint
+                .get(id.namespace().as_bytes())?
+                .map(|fp| *fp.value());
+            if let Some(mut bytes) = stored {
+                let entry_fp = crate::ranger::record_fingerprint(
+                    id.namespace().as_ref(),
+                    id.author().as_ref(),
+                    id.key(),
+                    e.timestamp(),
+                    hash.as_bytes(),
+                );
+                for (acc, add) in bytes.iter_mut().zip(entry_fp.0) {
+                    *acc ^= add;
+                }
+                tables
+                    .namespace_fingerprint
+                    .insert(id.namespace().as_bytes(), &bytes)?;
+            }
             Ok(())
         })
     }
@@ -1022,6 +1090,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         predicate: impl Fn(&Record) -> bool,
     ) -> Result<usize> {
         let bounds = RecordsBounds::author_prefix(id.namespace(), id.author(), id.key_bytes());
+        let namespace = id.namespace().to_bytes();
         self.store.as_mut().modify(|tables| {
             let cb = |_k: RecordsId, v: RecordsValue| {
                 let (timestamp, _namespace_sig, _author_sig, len, hash) = v;
@@ -1030,7 +1099,37 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 predicate(&record)
             };
             let iter = tables.records.extract_from_if(bounds.as_ref(), cb)?;
-            let count = iter.count();
+            let mut count = 0usize;
+            // XOR the removed entries out of the maintained namespace
+            // fingerprint, so the aggregate stays equal to a scan of the
+            // records table. A missing row means the aggregate has not been
+            // built yet; the first query builds it, so skip here.
+            //
+            // The accumulator starts from all-zero bytes, not
+            // `Fingerprint::empty()`: the stored aggregate carries the
+            // ranger's empty-set base (`blake3("")`), and removing entries
+            // must cancel exactly the rows that were XORed in, base
+            // untouched.
+            let mut removed_fp = Fingerprint([0u8; 32]);
+            for removed in iter {
+                let (compound_key, value) = removed?;
+                let (ns, author, key) = compound_key.value();
+                let (timestamp, _sig_ns, _sig_author, _len, hash) = value.value();
+                removed_fp ^= crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
+                count += 1;
+            }
+            if count > 0 {
+                let stored = tables
+                    .namespace_fingerprint
+                    .get(&namespace)?
+                    .map(|fp| *fp.value());
+                if let Some(mut bytes) = stored {
+                    for (acc, sub) in bytes.iter_mut().zip(removed_fp.0) {
+                        *acc ^= sub;
+                    }
+                    tables.namespace_fingerprint.insert(&namespace, &bytes)?;
+                }
+            }
             Ok(count)
         })
     }
@@ -1553,6 +1652,194 @@ mod tests {
 
         let _store = Store::persistent(&path)?;
         assert!(!backup.exists());
+        Ok(())
+    }
+
+    /// The full-namespace fingerprint computed the independent way: the
+    /// ranger's range scan over the identity range, exactly what the sync
+    /// protocol's initial message carries.
+    fn scan_namespace_fingerprint(wrapper: &mut StoreInstance) -> Result<Fingerprint> {
+        let first = wrapper.get_first()?;
+        wrapper.get_fingerprint(&Range::new(first.clone(), first))
+    }
+
+    /// A signed entry at `key` with fixed data and timestamp, so replicas
+    /// built from it are byte-identical.
+    fn fixed_entry(
+        namespace: &NamespaceSecret,
+        author: &Author,
+        key: &str,
+        data: &[u8],
+        timestamp: u64,
+    ) -> SignedEntry {
+        let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+        let hash = Hash::new(data);
+        let record = Record::new(hash, data.len() as u64, timestamp);
+        SignedEntry::from_entry(Entry::new(id, record), namespace, author)
+    }
+
+    /// The maintained fingerprint equals a scan over every reachable state:
+    /// entries written before the aggregate existed (the migration path),
+    /// later inserts, overwrites, tombstones and duplicate re-inserts.
+    #[test]
+    fn namespace_fingerprint_migrates_and_matches_scan() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let path = dbfile.path().to_path_buf();
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+
+        let author = {
+            let mut store = Store::persistent(&path)?;
+            store.new_author(&mut rand::rng())?
+        };
+
+        let mut store = Store::persistent(&path)?;
+        store.import_author(author.clone())?;
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(id);
+
+        let mut wrapper = StoreInstance::new(id, &mut store);
+        // Entries land before any query: no maintained row exists, exactly
+        // the state of a replica written before the fingerprint table.
+        for i in 0..10u64 {
+            wrapper.put(fixed_entry(
+                &namespace,
+                &author,
+                &format!("k{i}"),
+                b"v0",
+                i + 1,
+            ))?;
+        }
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+
+        // Maintained path: more inserts, an overwrite, a duplicate re-insert
+        // and a tombstone all keep the aggregate equal to the scan.
+        wrapper.put(fixed_entry(&namespace, &author, "k0", b"v1", 100))?;
+        wrapper.put(fixed_entry(&namespace, &author, "k11", b"v0", 11))?;
+        wrapper.put(fixed_entry(&namespace, &author, "k0", b"v1", 100))?;
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+        // A tombstone at "k" removes k0, k1, k11 and is itself a record row.
+        wrapper.put(fixed_entry(&namespace, &author, "k", &[], 200))?;
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+
+        // The built aggregate survives a reopen: a second open reads it back
+        // without rebuilding.
+        {
+            let _wrapper = wrapper;
+        }
+        store.close_replica(id);
+        drop(store);
+        let mut store = Store::persistent(&path)?;
+        let mut wrapper = StoreInstance::new(id, &mut store);
+        assert_eq!(
+            wrapper.namespace_fingerprint()?,
+            scan_namespace_fingerprint(&mut wrapper)?
+        );
+        Ok(())
+    }
+
+    /// Two replicas holding the same rows produce the same fingerprint,
+    /// independent of insertion order and of consumer-side filtering.
+    #[test]
+    fn namespace_fingerprint_is_order_independent_and_view_independent() -> Result<()> {
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let author = {
+            let dbfile = tempfile::NamedTempFile::new()?;
+            let mut store = Store::persistent(dbfile.path())?;
+            store.new_author(&mut rand::rng())?
+        };
+        let entries: Vec<_> = (0..20u64)
+            .map(|i| fixed_entry(&namespace, &author, &format!("k{i}"), &[i as u8; 3], i + 1))
+            .collect();
+
+        let build = |order: &[usize]| -> Result<(Fingerprint, Fingerprint)> {
+            let dbfile = tempfile::NamedTempFile::new()?;
+            let mut store = Store::persistent(dbfile.path())?;
+            store.import_author(author.clone())?;
+            let _replica = store.new_replica(namespace.clone())?;
+            store.close_replica(namespace.id());
+            {
+                let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+                for &i in order {
+                    wrapper.put(entries[i].clone())?;
+                }
+            }
+            // A consumer-side read with an arbitrary filter must not move
+            // the fingerprint: grants filter consumers, not the store.
+            let _filtered: Vec<_> = store
+                .get_many(namespace.id(), Query::author(author.id()).key_prefix(b"k1"))?
+                .collect::<Result<_>>()?;
+            let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+            let maintained = wrapper.namespace_fingerprint()?;
+            let scanned = scan_namespace_fingerprint(&mut wrapper)?;
+            Ok((maintained, scanned))
+        };
+
+        let forward: Vec<_> = (0..20).collect();
+        let mut reverse = forward.clone();
+        reverse.reverse();
+        let (fp_a, scan_a) = build(&forward)?;
+        let (fp_b, scan_b) = build(&reverse)?;
+        assert_eq!(fp_a, scan_a);
+        assert_eq!(fp_b, scan_b);
+        assert_eq!(fp_a, fp_b);
+        Ok(())
+    }
+
+    /// Random inserts, overwrites, duplicate re-inserts and tombstones: the
+    /// maintained fingerprint equals a scan after every operation.
+    #[test]
+    fn namespace_fingerprint_tracks_random_ops() -> Result<()> {
+        use rand::{RngExt, SeedableRng};
+
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut last = vec![0u8; 0];
+        for op in 0..200u64 {
+            let key = format!("k{}", rng.random_range(0..8usize));
+            match rng.random_range(0..4usize) {
+                // New version at the key.
+                0 => {
+                    let data = vec![op as u8; 1 + (op % 7) as usize];
+                    wrapper.put(fixed_entry(&namespace, &author, &key, &data, op + 1))?;
+                    last = data;
+                }
+                // Duplicate re-insert of the previous version.
+                1 => {
+                    let data = last.clone();
+                    if !data.is_empty() {
+                        wrapper.put(fixed_entry(&namespace, &author, &key, &data, op))?;
+                    }
+                }
+                // Tombstone at a prefix, removing everything under it.
+                _ => {
+                    let prefix = key[..1].to_string();
+                    wrapper.put(fixed_entry(&namespace, &author, &prefix, &[], op + 1))?;
+                    last = Vec::new();
+                }
+            }
+            assert_eq!(
+                wrapper.namespace_fingerprint()?,
+                scan_namespace_fingerprint(&mut wrapper)?,
+                "after op {op}"
+            );
+        }
         Ok(())
     }
 }

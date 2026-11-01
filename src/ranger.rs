@@ -119,6 +119,27 @@ impl Fingerprint {
     }
 }
 
+/// The fingerprint contribution of one record: the bytes
+/// [`RangeEntry::as_fingerprint`] hashes for a signed entry. One function
+/// keeps the maintained namespace fingerprint and the per-entry fingerprints
+/// agreeing on every path, including store rows that are not (or no longer)
+/// full [`SignedEntry`]s.
+pub(crate) fn record_fingerprint(
+    namespace: &[u8],
+    author: &[u8],
+    key: &[u8],
+    timestamp: u64,
+    content_hash: &[u8; 32],
+) -> Fingerprint {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(namespace);
+    hasher.update(author);
+    hasher.update(key);
+    hasher.update(&timestamp.to_be_bytes());
+    hasher.update(content_hash);
+    Fingerprint(hasher.finalize().into())
+}
+
 impl std::ops::BitXorAssign for Fingerprint {
     fn bitxor_assign(&mut self, rhs: Self) {
         for (a, b) in self.0.iter_mut().zip(rhs.0.iter()) {
