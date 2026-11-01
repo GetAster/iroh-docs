@@ -30,7 +30,7 @@ use crate::{
     },
     Author, AuthorHeads, AuthorId, Capability, Clock, ContentStatus, ContentStatusCallback, Event,
     NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, RetireWriteAuthorityOutcome,
-    SignedEntry, SyncOutcome,
+    SignedEntry, SyncOutcome, MAX_TIMESTAMP_FUTURE_SHIFT,
 };
 
 const ACTION_CAP: usize = 1024;
@@ -302,6 +302,28 @@ impl SyncHandle {
         me: String,
         clock: Option<Arc<dyn Clock>>,
     ) -> SyncHandle {
+        Self::spawn_with_options(
+            store,
+            content_status_callback,
+            me,
+            clock,
+            MAX_TIMESTAMP_FUTURE_SHIFT,
+        )
+    }
+
+    /// Like [`Self::spawn_with_clock`], with the future-shift limit applied to every replica
+    /// the actor opens.
+    ///
+    /// `max_future_shift` is how far ahead of the wall clock a remote entry may be stamped
+    /// before it is refused, in microseconds. It only applies without a [`Clock`]; see
+    /// [`MAX_TIMESTAMP_FUTURE_SHIFT`].
+    pub fn spawn_with_options(
+        store: Store,
+        content_status_callback: Option<ContentStatusCallback>,
+        me: String,
+        clock: Option<Arc<dyn Clock>>,
+        max_future_shift: u64,
+    ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
         let actor = Actor {
@@ -310,6 +332,7 @@ impl SyncHandle {
             action_rx,
             content_status_callback,
             clock,
+            max_future_shift,
             tasks: Default::default(),
             metrics: metrics.clone(),
         };
@@ -728,6 +751,7 @@ struct Actor {
     action_rx: async_channel::Receiver<Action>,
     content_status_callback: Option<ContentStatusCallback>,
     clock: Option<Arc<dyn Clock>>,
+    max_future_shift: u64,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
 }
@@ -1082,6 +1106,7 @@ impl Actor {
             if let Some(clock) = &self.clock {
                 info.set_clock(Arc::clone(clock));
             }
+            info.set_max_future_shift(self.max_future_shift);
             Ok(info)
         };
         self.states.open_with(namespace, opts, open_cb)

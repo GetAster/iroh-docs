@@ -341,6 +341,11 @@ pub struct ReplicaInfo {
     content_status_cb: Option<ContentStatusCallback>,
     #[debug("Clock")]
     clock: Option<Arc<dyn Clock>>,
+    /// How far ahead of the wall clock a remote entry may be stamped before it is refused.
+    ///
+    /// Only applies without a [`Clock`]: a configured clock owns the timestamp rules. Defaults
+    /// to [`MAX_TIMESTAMP_FUTURE_SHIFT`] (ten minutes).
+    max_future_shift: u64,
     closed: bool,
 }
 
@@ -353,8 +358,16 @@ impl ReplicaInfo {
             // on_insert_sender: RwLock::new(None),
             content_status_cb: None,
             clock: None,
+            max_future_shift: MAX_TIMESTAMP_FUTURE_SHIFT,
             closed: false,
         }
+    }
+
+    /// Set how far ahead of the wall clock a remote entry may be stamped before it is refused.
+    ///
+    /// In microseconds. Only applies without a [`Clock`]; see [`Self::max_future_shift`].
+    pub(crate) fn set_max_future_shift(&mut self, micros: u64) {
+        self.max_future_shift = micros;
     }
 
     /// Subscribe to insert events.
@@ -533,6 +546,7 @@ where
         validate_entry(
             system_time_now(),
             self.info.clock.as_deref(),
+            self.info.max_future_shift,
             store,
             namespace,
             allowed_writers.as_ref(),
@@ -615,6 +629,7 @@ where
         let my_namespace = self.id();
         let now = system_time_now();
         let clock = self.info.clock.clone();
+        let max_future_shift = self.info.max_future_shift;
 
         // update state with incoming data.
         state.num_recv += message.value_count();
@@ -647,6 +662,7 @@ where
                     validate_entry(
                         now,
                         clock.as_deref(),
+                        max_future_shift,
                         store,
                         my_namespace,
                         allowed_writers.as_ref(),
@@ -724,9 +740,11 @@ pub struct ReadOnly;
 /// * local entries are not checked against the future limit when a clock is configured: the clock
 ///   stamped them, and a clock may run ahead of system time
 /// * the entry is newer than an existing entry for the same key and author, if such exists.
+#[allow(clippy::too_many_arguments)]
 fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     now: u64,
     clock: Option<&dyn Clock>,
+    max_future_shift: u64,
     store: &S,
     expected_namespace: NamespaceId,
     allowed_writers: Option<&BTreeSet<AuthorId>>,
@@ -761,7 +779,7 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     }
 
     // Verify that the timestamp of the entry is not too far in the future.
-    if entry.timestamp() > now + MAX_TIMESTAMP_FUTURE_SHIFT {
+    if entry.timestamp() > now + max_future_shift {
         return Err(ValidationFailure::TooFarInTheFuture);
     }
     Ok(())
@@ -2067,6 +2085,107 @@ mod tests {
                 ValidationFailure::TooFarInTheFuture
             ))
         ));
+        Ok(())
+    }
+
+    /// A replica can be given its own future-shift tolerance, replacing the fixed default.
+    #[tokio::test]
+    async fn test_custom_future_shift() -> Result<()> {
+        let shift = 60 * 1_000_000; // one minute, tighter than the ten-minute default
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica.info.set_max_future_shift(shift);
+
+        // Just inside the custom tolerance: accepted.
+        let record = Record::from_data(b"in", system_time_now() + shift - 10_000);
+        let entry = SignedEntry::from_parts(&namespace, &author, b"in", record);
+        replica
+            .insert_entry(
+                entry,
+                InsertOrigin::Sync {
+                    from: [0u8; 32],
+                    remote_content_status: ContentStatus::Missing,
+                },
+            )
+            .await?;
+
+        // Just outside it: refused, even though the default tolerance would accept it.
+        let record = Record::from_data(b"out", system_time_now() + shift + 10_000);
+        let entry = SignedEntry::from_parts(&namespace, &author, b"out", record);
+        let res = replica
+            .insert_entry(
+                entry,
+                InsertOrigin::Sync {
+                    from: [0u8; 32],
+                    remote_content_status: ContentStatus::Missing,
+                },
+            )
+            .await;
+        assert!(matches!(
+            res,
+            Err(InsertError::Validation(
+                ValidationFailure::TooFarInTheFuture
+            ))
+        ));
+        Ok(())
+    }
+
+    /// The custom shift also applies to entries received over the sync exchange, not just to
+    /// direct inserts.
+    #[tokio::test]
+    async fn test_custom_future_shift_in_sync() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut rng = rand::rng();
+        let mut alice_store = store::Store::memory();
+        let mut bob_store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ahead = system_time_now() + 60 * 60 * 1_000_000; // one hour ahead
+
+        // Bob stamps a local entry an hour ahead with a clock (local inserts with a clock are
+        // not screened against the wall clock).
+        let clock = Arc::new(TestClock::default());
+        clock.now.store(ahead, SeqCst);
+        clock.limit.store(ahead, SeqCst);
+        {
+            let mut bob = bob_store.new_replica(namespace.clone())?;
+            bob.info.set_clock(clock.clone());
+            bob.hash_and_insert(b"k", &author, b"v").await?;
+        }
+
+        // Alice has no clock and a one-hour tolerance: the entry is accepted.
+        {
+            let mut alice = alice_store.new_replica(namespace.clone())?;
+            alice.info.set_max_future_shift(2 * 60 * 60 * 1_000_000);
+            let mut bob = bob_store.new_replica(namespace.clone())?;
+            sync(&mut alice, &mut bob).await?;
+        }
+        assert!(get_content_hash(
+            &mut alice_store,
+            namespace.id(),
+            author.id(),
+            b"k"
+        )?
+        .is_some());
+
+        // With the ten-minute default the same exchange refuses the entry: a fresh replica
+        // takes the default, and the entry never lands in its store.
+        let mut alice2_store = store::Store::memory();
+        {
+            let mut alice = alice2_store.new_replica(namespace.clone())?;
+            let mut bob = bob_store.new_replica(namespace.clone())?;
+            sync(&mut alice, &mut bob).await?;
+        }
+        assert!(get_content_hash(
+            &mut alice2_store,
+            namespace.id(),
+            author.id(),
+            b"k"
+        )?
+        .is_none());
         Ok(())
     }
 

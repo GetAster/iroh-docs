@@ -44,6 +44,7 @@ impl Docs {
             protect_cb: None,
             clock: None,
             sync_inactivity_timeout: None,
+            max_future_shift: None,
         }
     }
 
@@ -92,6 +93,7 @@ pub struct Builder {
     #[debug("Clock")]
     clock: Option<Arc<dyn Clock>>,
     sync_inactivity_timeout: Option<Duration>,
+    max_future_shift: Option<Duration>,
 }
 
 impl Builder {
@@ -120,6 +122,15 @@ impl Builder {
     /// synced again. Defaults to [`crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT`] (30 seconds).
     pub fn sync_inactivity_timeout(mut self, timeout: Duration) -> Self {
         self.sync_inactivity_timeout = Some(timeout);
+        self
+    }
+
+    /// Set how far ahead of the wall clock a remote entry may be stamped before it is refused.
+    ///
+    /// The default is [`crate::MAX_TIMESTAMP_FUTURE_SHIFT`] (ten minutes). Only applies without
+    /// a [`Clock`]: a configured clock owns the timestamp rules, and this limit is then ignored.
+    pub fn max_future_shift(mut self, shift: Duration) -> Self {
+        self.max_future_shift = Some(shift);
         self
     }
 
@@ -154,6 +165,8 @@ impl Builder {
             self.clock,
             self.sync_inactivity_timeout
                 .unwrap_or(crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT),
+            self.max_future_shift
+                .unwrap_or(Duration::from_micros(crate::MAX_TIMESTAMP_FUTURE_SHIFT)),
         )
         .await?;
         Ok(Docs::new(engine))

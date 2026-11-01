@@ -120,15 +120,21 @@ impl Engine {
             protect_cb,
             clock,
             crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT,
+            Duration::from_micros(crate::MAX_TIMESTAMP_FUTURE_SHIFT),
         )
         .await
     }
 
-    /// Like [`Self::spawn_with_clock`], with the inactivity limit of sync exchanges.
+    /// Like [`Self::spawn_with_clock`], with the inactivity limit of sync exchanges and the
+    /// future-shift limit for remote entry timestamps.
     ///
     /// An exchange that makes no progress for `sync_inactivity_timeout` is abandoned and the
     /// peer can be synced again; the limit restarts whenever the peer makes progress. See
     /// [`crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT`].
+    ///
+    /// `max_future_shift` is how far ahead of the wall clock a remote entry may be stamped
+    /// before it is refused. It only applies without a [`Clock`]; see
+    /// [`crate::MAX_TIMESTAMP_FUTURE_SHIFT`].
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_with_options(
         endpoint: Endpoint,
@@ -140,6 +146,7 @@ impl Engine {
         protect_cb: Option<ProtectCallbackHandler>,
         clock: Option<Arc<dyn Clock>>,
         sync_inactivity_timeout: Duration,
+        max_future_shift: Duration,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -154,11 +161,12 @@ impl Engine {
                 })
             })
         };
-        let sync = SyncHandle::spawn_with_clock(
+        let sync = SyncHandle::spawn_with_options(
             replica_store,
             Some(content_status_cb.clone()),
             me.clone(),
             clock,
+            max_future_shift.as_micros() as u64,
         );
 
         let sync2 = sync.clone();
