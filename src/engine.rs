@@ -128,6 +128,7 @@ impl Engine {
             clock,
             crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT,
             Duration::from_micros(crate::MAX_TIMESTAMP_FUTURE_SHIFT),
+            crate::protocol::DEFAULT_MAX_INLINE_VALUE_SIZE,
         )
         .await
     }
@@ -142,6 +143,10 @@ impl Engine {
     /// `max_future_shift` is how far ahead of the wall clock a remote entry may be stamped
     /// before it is refused. It only applies without a [`Clock`]; see
     /// [`crate::MAX_TIMESTAMP_FUTURE_SHIFT`].
+    ///
+    /// `max_inline_value_size` enables the inline-value feature: entries at or below this many
+    /// bytes of content carry their value inside sync and gossip messages, so receivers skip
+    /// the per-entry value-blob download round trip. 0 disables the feature.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_with_options(
         endpoint: Endpoint,
@@ -154,6 +159,7 @@ impl Engine {
         clock: Option<Arc<dyn Clock>>,
         sync_inactivity_timeout: Duration,
         max_future_shift: Duration,
+        max_inline_value_size: usize,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -168,16 +174,22 @@ impl Engine {
                 })
             })
         };
+        // One notify per completed protect enumeration; temp tags on inline
+        // values are held until the enumeration that observes their document
+        // record has run.
+        let protect_notify = protect_cb.as_ref().map(|_| Arc::new(Notify::new()));
         let sync = SyncHandle::spawn_with_options(
             replica_store,
             Some(content_status_cb.clone()),
             me.clone(),
             clock,
             max_future_shift.as_micros() as u64,
+            max_inline_value_size,
+            Some(bao_store.blobs().clone()),
+            protect_notify.clone(),
         );
 
         let sync2 = sync.clone();
-        let protect_notify = protect_cb.as_ref().map(|_| Arc::new(Notify::new()));
         let protect_notify2 = protect_notify.clone();
         let gc_protect_task = AbortOnDropHandle::new(n0_future::task::spawn(async move {
             let Some(mut protect_handler) = protect_cb else {
@@ -221,6 +233,7 @@ impl Engine {
             to_live_actor_recv,
             live_actor_tx.clone(),
             sync.metrics().clone(),
+            max_inline_value_size,
         )?;
         actor.set_sync_inactivity_timeout(sync_inactivity_timeout);
         let actor_handle = n0_future::task::spawn(

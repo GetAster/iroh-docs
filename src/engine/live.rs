@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use iroh::{address_lookup::memory::MemoryLookup, Endpoint, EndpointAddr, EndpointId, PublicKey};
 use iroh_blobs::{
     api::{
@@ -81,8 +82,12 @@ fn reaction_allowed(last: &mut HashMap<NamespaceId, Instant>, namespace: Namespa
 /// This is the message that is broadcast over iroh-gossip.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::Display)]
 pub enum Op {
-    /// A new entry was inserted into the document.
-    Put(SignedEntry),
+    /// A new entry was inserted into the document, with the entry's value
+    /// attached when it is small enough to ride the message.
+    Put {
+        entry: SignedEntry,
+        value: Option<Bytes>,
+    },
     /// A peer now has content available for a hash.
     ContentReady(Hash),
     /// We synced with another peer, here's the news.
@@ -214,12 +219,15 @@ struct DownloadCandidate {
 
 // Currently peers might double-sync in both directions.
 pub struct LiveActor {
-    /// Receiver for actor messages.
+    /// Inbox for `ToLiveActor` messages.
     inbox: mpsc::Receiver<ToLiveActor>,
     sync: SyncHandle,
     endpoint: Endpoint,
     bao_store: Store,
     downloader: Downloader,
+    /// Entries at or below this many bytes of content are gossiped with their
+    /// value inlined in the message; 0 disables.
+    max_inline_value_size: usize,
     memory_lookup: MemoryLookup,
     replica_events_tx: async_channel::Sender<crate::Event>,
     replica_events_rx: async_channel::Receiver<crate::Event>,
@@ -282,6 +290,7 @@ impl LiveActor {
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
+        max_inline_value_size: usize,
     ) -> Result<Self> {
         // Unbounded, and it must stay that way. `Subscribers::send` delivers
         // into this channel with a blocking `tx.send(..).await` from inside the
@@ -305,6 +314,7 @@ impl LiveActor {
             gossip: gossip_state,
             bao_store,
             downloader,
+            max_inline_value_size,
             sync_actor_tx,
             running_sync_connect: Default::default(),
             running_sync_connect_ids: Default::default(),
@@ -1140,10 +1150,29 @@ impl LiveActor {
         match event {
             crate::Event::LocalInsert { namespace, entry } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
-                // A new entry was inserted locally. Broadcast a gossip message.
+                // A new entry was inserted locally. Broadcast a gossip message,
+                // with the entry's value inlined when it fits the threshold.
                 if self.state.is_syncing(&namespace) {
-                    let op = Op::Put(entry.clone());
-                    let message = postcard::to_stdvec(&op)?.into();
+                    let mut value = None;
+                    if self.max_inline_value_size > 0
+                        && entry.content_len() <= self.max_inline_value_size as u64
+                    {
+                        match self.bao_store.blobs().get_bytes(entry.content_hash()).await {
+                            Ok(bytes) => value = Some(bytes),
+                            Err(err) => debug!(?err, "failed to read value for inline gossip"),
+                        }
+                    }
+                    let op = Op::Put {
+                        entry: entry.clone(),
+                        value,
+                    };
+                    let mut message: Bytes = postcard::to_stdvec(&op)?.into();
+                    // Gossip messages have a size cap; if the inline value
+                    // pushed the message over it, fall back to the bare entry.
+                    if message.len() > self.gossip.max_message_size() {
+                        let op = Op::Put { entry, value: None };
+                        message = postcard::to_stdvec(&op)?.into();
+                    }
                     self.gossip.broadcast(&namespace, message).await;
                 }
             }
@@ -2038,6 +2067,7 @@ mod takeover_tests {
             rx,
             tx,
             Default::default(),
+            0,
         )?;
         Ok((actor, endpoint))
     }

@@ -3,6 +3,7 @@
 
 use std::fmt::Debug;
 
+use bytes::Bytes;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -169,7 +170,7 @@ pub struct RangeItem<E: RangeEntry> {
     ))]
     pub(crate) range: Range<E::Key>,
     #[serde(bound(serialize = "E: Serialize", deserialize = "E: Deserialize<'de>"))]
-    pub(crate) values: Vec<(E, ContentStatus)>,
+    pub(crate) values: Vec<(E, ContentStatus, Option<Bytes>)>,
     /// If false, requests to send local items in the range.
     /// Otherwise not.
     pub(crate) have_local: bool,
@@ -200,7 +201,7 @@ impl<E: RangeEntry> MessagePart<E> {
         matches!(self, MessagePart::RangeItem(_))
     }
 
-    pub(crate) fn values(&self) -> Option<&[(E, ContentStatus)]> {
+    pub(crate) fn values(&self) -> Option<&[(E, ContentStatus, Option<Bytes>)]> {
         match self {
             MessagePart::RangeFingerprint(_) => None,
             MessagePart::RangeItem(RangeItem { values, .. }) => Some(values),
@@ -231,8 +232,20 @@ impl<E: RangeEntry> Message<E> {
         &self.parts
     }
 
-    pub(crate) fn values(&self) -> impl Iterator<Item = &(E, ContentStatus)> {
+    pub(crate) fn values(&self) -> impl Iterator<Item = &(E, ContentStatus, Option<Bytes>)> {
         self.parts().iter().filter_map(|p| p.values()).flatten()
+    }
+
+    pub(crate) fn values_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut (E, ContentStatus, Option<Bytes>)> {
+        self.parts
+            .iter_mut()
+            .filter_map(|p| match p {
+                MessagePart::RangeFingerprint(_) => None,
+                MessagePart::RangeItem(RangeItem { values, .. }) => Some(values.iter_mut()),
+            })
+            .flatten()
     }
 
     pub(crate) fn value_count(&self) -> usize {
@@ -352,7 +365,7 @@ pub trait Store<E: RangeEntry>: Sized {
     ) -> Result<Option<Message<E>>, Self::Error>
     where
         F: Fn(&Self, &E, ContentStatus) -> bool,
-        F2: AsyncFnMut(&Self, E, ContentStatus),
+        F2: AsyncFnMut(&Self, E, ContentStatus, Option<Bytes>),
         F3: for<'a> AsyncFn(&'a E) -> ContentStatus,
     {
         let mut out = Vec::new();
@@ -389,7 +402,7 @@ pub trait Store<E: RangeEntry>: Sized {
                         .get_range(range.clone())?
                         .filter_map(|our_entry| match our_entry {
                             Ok(our_entry) => {
-                                if !values.iter().any(|(their_entry, _)| {
+                                if !values.iter().any(|(their_entry, _, _)| {
                                     our_entry.key() == their_entry.key()
                                         && their_entry.value() >= our_entry.value()
                                 }) {
@@ -404,19 +417,19 @@ pub trait Store<E: RangeEntry>: Sized {
                     // add the content status in a second pass
                     let values = items.into_iter().map(|entry| async {
                         let content_status = content_status_cb(&entry).await;
-                        (entry, content_status)
+                        (entry, content_status, None)
                     });
                     n0_future::FuturesOrdered::from_iter(values).collect().await
                 })
             };
 
             // Store incoming values
-            for (entry, content_status) in values {
+            for (entry, content_status, content) in values {
                 if validate_cb(self, &entry, content_status) {
                     // TODO: Get rid of the clone?
                     let outcome = self.put(entry.clone())?;
                     if let InsertOutcome::Inserted { .. } = outcome {
-                        on_insert_cb(self, entry, content_status).await;
+                        on_insert_cb(self, entry, content_status, content).await;
                     }
                 }
             }
@@ -448,7 +461,7 @@ pub trait Store<E: RangeEntry>: Sized {
                     .collect::<Result<Vec<_>, _>>()?;
                 let values = values.into_iter().map(|entry| async {
                     let content_status = content_status_cb(&entry).await;
-                    (entry, content_status)
+                    (entry, content_status, None)
                 });
                 let values = n0_future::FuturesOrdered::from_iter(values).collect().await;
                 out.push(MessagePart::RangeItem(RangeItem {
@@ -546,7 +559,7 @@ pub trait Store<E: RangeEntry>: Sized {
                             Err(_err) => None,
                             Ok(entry) => Some(async {
                                 let content_status = content_status_cb(&entry).await;
-                                (entry, content_status)
+                                (entry, content_status, None)
                             }),
                         });
                         let values = n0_future::FuturesOrdered::from_iter(values).collect().await;
@@ -1382,7 +1395,7 @@ mod tests {
         for msg in &res.alice_to_bob {
             for part in &msg.parts {
                 if let Some(values) = part.values() {
-                    for (e, _) in values {
+                    for (e, _, _) in values {
                         assert!(
                             alice_sent.insert(e.key(), e).is_none(),
                             "alice: duplicate {e:?}"
@@ -1396,7 +1409,7 @@ mod tests {
         for msg in &res.bob_to_alice {
             for part in &msg.parts {
                 if let Some(values) = part.values() {
-                    for (e, _) in values {
+                    for (e, _, _) in values {
                         assert!(
                             bob_sent.insert(e.key(), e).is_none(),
                             "bob: duplicate {e:?}"
@@ -1438,7 +1451,7 @@ mod tests {
                     &Default::default(),
                     msg,
                     &bob_validate_cb,
-                    async |_, _, _| (),
+                    async |_, _, _, _| (),
                     async |_| ContentStatus::Complete,
                 )
                 .await
@@ -1450,7 +1463,7 @@ mod tests {
                         &Default::default(),
                         msg,
                         &alice_validate_cb,
-                        async |_, _, _| (),
+                        async |_, _, _, _| (),
                         async |_| ContentStatus::Complete,
                     )
                     .await

@@ -771,7 +771,9 @@ async fn test_sync_via_relay() -> Result<()> {
             Box::new(move |e| matches!(e, LiveEvent::NeighborUp(n) if *n== node1_id)),
             Box::new(move |e| match_sync_finished(e, node1_id)),
             Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete, .. } if *from == node1_id),
+                // Small values arrive inline and report Complete; larger ones
+                // report Missing/Incomplete until their download finishes.
+                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete | ContentStatus::Complete, .. } if *from == node1_id),
             ),
             Box::new(
                 move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == inserted_hash),
@@ -799,7 +801,9 @@ async fn test_sync_via_relay() -> Result<()> {
         Duration::from_secs(10),
         vec![
             Box::new(
-                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete, .. } if *from == node1_id),
+                // Small values arrive inline and report Complete; larger ones
+                // report Missing/Incomplete until their download finishes.
+                move |e| matches!(e, LiveEvent::InsertRemote { from, content_status: ContentStatus::Missing | ContentStatus::Incomplete | ContentStatus::Complete, .. } if *from == node1_id),
             ),
             Box::new(
                 move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == updated_hash),
@@ -1008,19 +1012,20 @@ async fn test_download_policies() -> Result<()> {
 
     let mut key_hashes: HashMap<iroh_blobs::Hash, &'static str> = HashMap::default();
 
-    // set content in a
+    // set content in a. Values are padded above the inline-value threshold:
+    // this test is about download policy, not about values riding messages.
     for k in star_wars_movies.iter() {
-        let hash = doc_a
-            .set_bytes(author_a, k.to_owned(), k.to_owned())
-            .await?;
+        let mut v = k.as_bytes().to_vec();
+        v.resize(2048, 0);
+        let hash = doc_a.set_bytes(author_a, k.to_owned(), v).await?;
         key_hashes.insert(hash, k);
     }
 
     // set content in b
     for k in lotr_movies.iter() {
-        let hash = doc_b
-            .set_bytes(author_b, k.to_owned(), k.to_owned())
-            .await?;
+        let mut v = k.as_bytes().to_vec();
+        v.resize(2048, 0);
+        let hash = doc_b.set_bytes(author_b, k.to_owned(), v).await?;
         key_hashes.insert(hash, k);
     }
 

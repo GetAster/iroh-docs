@@ -83,6 +83,12 @@ pub struct Builder {
     register_gc_done_cb: Option<Box<dyn Fn() + Send + 'static>>,
     #[debug(skip)]
     clock: Option<std::sync::Arc<dyn Clock>>,
+    /// Inline-value threshold passed to [`iroh_docs::protocol::Builder`].
+    max_inline_value_size: Option<usize>,
+    /// When false, the node's router does not accept the blobs ALPN, so
+    /// peers cannot download blobs from it (inline values and docs sync
+    /// still work). Used to prove content arrives without a download.
+    accept_blobs: bool,
 }
 
 impl Builder {
@@ -105,6 +111,9 @@ impl Builder {
         if let Some(clock) = self.clock {
             docs_builder = docs_builder.clock(clock);
         }
+        if let Some(size) = self.max_inline_value_size {
+            docs_builder = docs_builder.max_inline_value_size(size);
+        }
         let docs = match docs_builder
             .spawn(self.endpoint.clone(), blobs.clone(), gossip.clone())
             .await
@@ -115,10 +124,12 @@ impl Builder {
                 return Err(err);
             }
         };
-        router = router.accept(
-            iroh_blobs::ALPN,
-            iroh_blobs::BlobsProtocol::new(&blobs, None),
-        );
+        if self.accept_blobs {
+            router = router.accept(
+                iroh_blobs::ALPN,
+                iroh_blobs::BlobsProtocol::new(&blobs, None),
+            );
+        }
         router = router.accept(iroh_docs::ALPN, docs.clone());
         router = router.accept(iroh_gossip::ALPN, gossip.clone());
 
@@ -145,6 +156,19 @@ impl Builder {
         self
     }
 
+    /// Sets the inline-value threshold on the docs builder.
+    pub fn max_inline_value_size(mut self, size: usize) -> Self {
+        self.max_inline_value_size = Some(size);
+        self
+    }
+
+    /// Do not accept the blobs ALPN: peers cannot download blobs from this
+    /// node, while docs sync and gossip (and their inline values) still work.
+    pub fn without_blobs_protocol(mut self) -> Self {
+        self.accept_blobs = false;
+        self
+    }
+
     fn new(storage: Storage, endpoint: Endpoint) -> Self {
         Self {
             endpoint,
@@ -152,6 +176,8 @@ impl Builder {
             gc_interval: None,
             register_gc_done_cb: None,
             clock: None,
+            max_inline_value_size: None,
+            accept_blobs: true,
         }
     }
 }

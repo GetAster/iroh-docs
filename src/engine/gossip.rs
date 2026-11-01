@@ -172,7 +172,7 @@ async fn receive_loop(
             Event::Received(msg) => {
                 let op: Op = postcard::from_bytes(&msg.content)?;
                 match op {
-                    Op::Put(entry) => {
+                    Op::Put { entry, value } => {
                         debug!(peer = %msg.delivered_from.fmt_short(), namespace = %namespace.fmt_short(), "received entry via gossip");
                         #[cfg(test)]
                         super::live::fault::maybe_delay_remote_insert(&namespace).await;
@@ -181,7 +181,8 @@ async fn receive_loop(
                         // directly from the author, we assume that the content is available at
                         // that peer. Otherwise we don't.
                         // The download is not triggered here, but in the `on_replica_event`
-                        // handler for the `InsertRemote` event.
+                        // handler for the `InsertRemote` event. `value` rides inline in the
+                        // message (small entries only) and is imported by the sync actor.
                         let content_status = match msg.scope.is_direct() {
                             true => ContentStatus::Complete,
                             false => ContentStatus::Missing,
@@ -189,7 +190,7 @@ async fn receive_loop(
                         let from = *msg.delivered_from.as_bytes();
                         let hash = entry.content_hash();
                         match sync
-                            .insert_remote(namespace, entry, from, content_status)
+                            .insert_remote(namespace, entry, from, content_status, value)
                             .await
                         {
                             Ok(()) => {}

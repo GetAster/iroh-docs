@@ -14,6 +14,10 @@ use crate::{
     Clock,
 };
 
+/// Default size threshold for inlining entry values in sync and gossip
+/// messages: entries up to 1 KiB of content ride the message with their value.
+pub const DEFAULT_MAX_INLINE_VALUE_SIZE: usize = 1024;
+
 #[derive(Default, Debug)]
 enum Storage {
     #[default]
@@ -45,6 +49,7 @@ impl Docs {
             clock: None,
             sync_inactivity_timeout: None,
             max_future_shift: None,
+            max_inline_value_size: None,
         }
     }
 
@@ -94,6 +99,7 @@ pub struct Builder {
     clock: Option<Arc<dyn Clock>>,
     sync_inactivity_timeout: Option<Duration>,
     max_future_shift: Option<Duration>,
+    max_inline_value_size: Option<usize>,
 }
 
 impl Builder {
@@ -134,6 +140,19 @@ impl Builder {
         self
     }
 
+    /// Set the size threshold for inlining entry values in sync and gossip
+    /// messages.
+    ///
+    /// Entries at or below this many bytes of content carry their value inside
+    /// the message itself; the receiver imports it directly instead of
+    /// downloading the value blob, saving one round trip per small entry. The
+    /// default is [`DEFAULT_MAX_INLINE_VALUE_SIZE`] (1024 bytes). Set to 0 to
+    /// disable the feature.
+    pub fn max_inline_value_size(mut self, size: usize) -> Self {
+        self.max_inline_value_size = Some(size);
+        self
+    }
+
     /// Build a [`Docs`] protocol given a [`BlobsStore`] and [`Gossip`] protocol.
     pub async fn spawn(
         self,
@@ -167,6 +186,8 @@ impl Builder {
                 .unwrap_or(crate::net::DEFAULT_SYNC_INACTIVITY_TIMEOUT),
             self.max_future_shift
                 .unwrap_or(Duration::from_micros(crate::MAX_TIMESTAMP_FUTURE_SHIFT)),
+            self.max_inline_value_size
+                .unwrap_or(DEFAULT_MAX_INLINE_VALUE_SIZE),
         )
         .await?;
         Ok(Docs::new(engine))

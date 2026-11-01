@@ -9,11 +9,17 @@ use std::{
 use crate::sync::system_time_now;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use iroh_blobs::Hash;
+use iroh_blobs::{
+    api::{
+        blobs::{BlobStatus, Blobs},
+        TempTag,
+    },
+    Hash,
+};
 use irpc::channel::mpsc;
 use n0_future::{task::JoinSet, time::Duration, TryFutureExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 #[cfg(wasm_browser)]
 use tracing::Instrument;
 use tracing::{debug, error, error_span, trace, warn};
@@ -155,6 +161,8 @@ enum ReplicaAction {
         entry: SignedEntry,
         from: PeerIdBytes,
         content_status: ContentStatus,
+        /// Value carried inline in the gossip message, if any.
+        value: Option<Bytes>,
         #[debug("reply")]
         reply: oneshot::Sender<Result<(), InsertRemoteError>>,
     },
@@ -342,6 +350,10 @@ impl SyncHandle {
             me,
             clock,
             MAX_TIMESTAMP_FUTURE_SHIFT,
+            // The clock-variant surface predates inline values; it keeps the feature off.
+            0,
+            None,
+            None,
         )
     }
 
@@ -351,15 +363,27 @@ impl SyncHandle {
     /// `max_future_shift` is how far ahead of the wall clock a remote entry may be stamped
     /// before it is refused, in microseconds. It only applies without a [`Clock`]; see
     /// [`MAX_TIMESTAMP_FUTURE_SHIFT`].
+    ///
+    /// `max_inline_value_size` enables the inline-value feature: entries at or below this many
+    /// bytes of content may carry their value inside sync and gossip messages. `blobs` and
+    /// `protect_notify` wire the feature into the blob store; the notify guards the GC window
+    /// for imported values (see [`crate::api::actor::RpcActor`]'s temp-tag pattern). A
+    /// threshold of 0, or no blob store, disables the feature.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_options(
         store: Store,
         content_status_callback: Option<ContentStatusCallback>,
         me: String,
         clock: Option<Arc<dyn Clock>>,
         max_future_shift: u64,
+        max_inline_value_size: usize,
+        blobs: Option<Blobs>,
+        protect_notify: Option<Arc<Notify>>,
     ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
+        let inline = blobs
+            .and_then(|blobs| InlineContent::new(blobs, max_inline_value_size, protect_notify));
         let actor = Actor {
             store,
             states: Default::default(),
@@ -367,6 +391,7 @@ impl SyncHandle {
             content_status_callback,
             clock,
             max_future_shift,
+            inline,
             tasks: Default::default(),
             metrics: metrics.clone(),
         };
@@ -482,12 +507,14 @@ impl SyncHandle {
         entry: SignedEntry,
         from: PeerIdBytes,
         content_status: ContentStatus,
+        value: Option<Bytes>,
     ) -> Result<(), InsertRemoteError> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::InsertRemote {
             entry,
             from,
             content_status,
+            value,
             reply,
         };
         self.send_replica(namespace, action)
@@ -823,6 +850,114 @@ impl Drop for SyncHandle {
     }
 }
 
+/// Inline-value plumbing for the set-reconciliation and gossip paths.
+///
+/// Entries whose content fits the configured threshold can carry their value
+/// inside the sync/gossip message itself; the receiver imports it directly,
+/// avoiding one round trip per entry's value-blob download. The actor holds
+/// `None` when the feature is off (threshold 0, or no blob store wired in).
+pub(crate) struct InlineContent {
+    blobs: Blobs,
+    /// Values at or below this many bytes may ride a message.
+    max_value_size: usize,
+    /// Guards the GC window: a temp tag on an imported value lives until the
+    /// next protect enumeration has observed its document record.
+    protect_notify: Option<Arc<Notify>>,
+}
+
+impl InlineContent {
+    pub(crate) fn new(
+        blobs: Blobs,
+        max_value_size: usize,
+        protect_notify: Option<Arc<Notify>>,
+    ) -> Option<Self> {
+        (max_value_size > 0).then_some(Self {
+            blobs,
+            max_value_size,
+            protect_notify,
+        })
+    }
+
+    /// Import a value carried inline with `entry`. Returns `true` when the
+    /// content is locally complete afterwards. The value is verified against
+    /// the entry before import; a value that fails verification, exceeds the
+    /// threshold or trips a store error leaves the content status untouched.
+    pub(crate) async fn import(&self, entry: &SignedEntry, value: Option<Bytes>) -> bool {
+        let Some(value) = value else {
+            return false;
+        };
+        if value.len() as u64 != entry.content_len() || value.len() > self.max_value_size {
+            return false;
+        }
+        if Hash::new(&value) != entry.content_hash() {
+            debug!(hash = %entry.content_hash(), "inline value failed verification; ignoring");
+            return false;
+        }
+        match self.blobs.status(entry.content_hash()).await {
+            Ok(BlobStatus::Complete { .. }) => true,
+            Ok(_) => match self.blobs.add_bytes(value).temp_tag().await {
+                Ok(tag) => {
+                    self.hold_until_protected(tag);
+                    true
+                }
+                Err(err) => {
+                    debug!(?err, "failed to import inline value");
+                    false
+                }
+            },
+            Err(err) => {
+                debug!(?err, "failed to check status before inline import");
+                false
+            }
+        }
+    }
+
+    /// Attach locally complete values to the entries of an outgoing
+    /// reconciliation message, in one batch read.
+    pub(crate) async fn attach(&self, message: &mut Message<SignedEntry>) {
+        let hashes: Vec<Hash> = message
+            .values()
+            .filter(|(entry, _, _)| entry.content_len() <= self.max_value_size as u64)
+            .map(|(entry, _, _)| entry.content_hash())
+            .collect();
+        if hashes.is_empty() {
+            return;
+        }
+        let results = match self.blobs.get_bytes_many_if_complete(hashes).await {
+            Ok(results) => results,
+            Err(err) => {
+                debug!(?err, "inline value batch read failed");
+                return;
+            }
+        };
+        // The two passes walk the same predicate, so hashes and entries align.
+        let mut results = results.into_iter();
+        for (entry, _, content) in message.values_mut() {
+            if entry.content_len() > self.max_value_size as u64 {
+                continue;
+            }
+            let Some(result) = results.next() else {
+                break;
+            };
+            if let Ok(Some(bytes)) = result {
+                *content = Some(bytes);
+            }
+        }
+    }
+
+    fn hold_until_protected(&self, tag: TempTag) {
+        let Some(notify) = &self.protect_notify else {
+            drop(tag);
+            return;
+        };
+        let notify = notify.clone();
+        n0_future::task::spawn(async move {
+            notify.notified().await;
+            drop(tag);
+        });
+    }
+}
+
 struct Actor {
     store: Store,
     states: OpenReplicas,
@@ -830,6 +965,7 @@ struct Actor {
     content_status_callback: Option<ContentStatusCallback>,
     clock: Option<Arc<dyn Clock>>,
     max_future_shift: u64,
+    inline: Option<InlineContent>,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
 }
@@ -1036,6 +1172,7 @@ impl Actor {
                 entry,
                 from,
                 content_status,
+                value,
                 reply,
             } => {
                 let res = async {
@@ -1045,6 +1182,16 @@ impl Actor {
                         .map_err(InsertRemoteError::Actor)?;
                     let len = entry.content_len();
                     let timestamp = entry.timestamp();
+                    // Import a value carried inline in the gossip message. On
+                    // success the status becomes Complete, so the live actor's
+                    // normal pending-download path turns into a zero-network
+                    // ContentReady.
+                    let mut content_status = content_status;
+                    if let Some(inline) = &self.inline {
+                        if inline.import(&entry, value).await {
+                            content_status = ContentStatus::Complete;
+                        }
+                    }
                     match replica
                         .insert_remote_entry(entry, from, content_status)
                         .await
@@ -1080,13 +1227,17 @@ impl Actor {
             }
 
             ReplicaAction::SyncInitialMessage { reply } => {
-                send_reply_with(reply, self, move |this| {
+                send_reply_with_async(reply, self, async move |this| {
                     let mut replica = this
                         .states
                         .replica_if_syncing(&namespace, &mut this.store)?;
-                    let res = replica.sync_initial_message()?;
+                    let mut res = replica.sync_initial_message()?;
+                    if let Some(inline) = &this.inline {
+                        inline.attach(&mut res).await;
+                    }
                     Ok(res)
                 })
+                .await
             }
             ReplicaAction::SyncProcessMessage {
                 message,
@@ -1098,9 +1249,14 @@ impl Actor {
                     let mut replica = self
                         .states
                         .replica_if_syncing(&namespace, &mut self.store)?;
-                    let res = replica
-                        .sync_process_message(message, from, &mut state)
+                    let mut res = replica
+                        .sync_process_message(message, from, &mut state, self.inline.as_ref())
                         .await?;
+                    if let Some(inline) = &self.inline {
+                        if let Some(ref mut msg) = res {
+                            inline.attach(msg).await;
+                        }
+                    }
                     Ok((res, state))
                 }
                 .await;
@@ -1403,7 +1559,16 @@ mod tests {
     #[tokio::test]
     async fn insert_remote_reports_validation_failure() -> anyhow::Result<()> {
         let store = store::Store::memory();
-        let sync = SyncHandle::spawn_with_options(store, None, "foo".into(), None, 60 * 1_000_000);
+        let sync = SyncHandle::spawn_with_options(
+            store,
+            None,
+            "foo".into(),
+            None,
+            60 * 1_000_000,
+            0,
+            None,
+            None,
+        );
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let author = Author::new(&mut rand::rng());
         // Build the entry before the namespace secret moves into the store.
@@ -1419,7 +1584,7 @@ mod tests {
         sync.set_sync(id, true).await?;
 
         match sync
-            .insert_remote(id, entry, [0u8; 32], ContentStatus::Missing)
+            .insert_remote(id, entry, [0u8; 32], ContentStatus::Missing, None)
             .await
         {
             Err(InsertRemoteError::Validation {

@@ -673,11 +673,16 @@ where
     /// Process a set reconciliation message from a remote peer.
     ///
     /// Returns the next message to be sent to the peer, if any.
-    pub async fn sync_process_message(
+    ///
+    /// `inline`, when present, imports values carried inline in `message`
+    /// before the insert event is emitted, so subscribers see the content as
+    /// complete and skip the download round trip.
+    pub(crate) async fn sync_process_message(
         &mut self,
         message: crate::ranger::Message<SignedEntry>,
         from_peer: PeerIdBytes,
         state: &mut SyncOutcome,
+        inline: Option<&crate::actor::InlineContent>,
     ) -> Result<Option<crate::ranger::Message<SignedEntry>>, anyhow::Error> {
         self.info.ensure_open()?;
         let my_namespace = self.id();
@@ -687,7 +692,7 @@ where
 
         // update state with incoming data.
         state.num_recv += message.value_count();
-        for (entry, _content_status) in message.values() {
+        for (entry, _content_status, _content) in message.values() {
             state
                 .heads_received
                 .insert(entry.author(), entry.timestamp());
@@ -749,7 +754,17 @@ where
                     }
                 },
                 // on_insert callback: is called when an entry was actually inserted in the store
-                async |_store, entry, content_status| {
+                async |_store, entry, content_status, content| {
+                    // Import a value carried inline in the sync message. On
+                    // success the event reports Complete, so the live actor's
+                    // normal pending-download path turns into a zero-network
+                    // ContentReady.
+                    let remote_content_status = match inline {
+                        Some(inline) if inline.import(&entry, content).await => {
+                            ContentStatus::Complete
+                        }
+                        _ => content_status,
+                    };
                     // We use `send_with` to only clone the entry if we have active subscriptions.
                     self.info
                         .subscribers
@@ -760,7 +775,7 @@ where
                                 namespace: my_namespace,
                                 entry: entry.clone(),
                                 should_download,
-                                remote_content_status: content_status,
+                                remote_content_status,
                             }
                         })
                         .await
@@ -2870,12 +2885,12 @@ mod tests {
 
         let from1 = replica1.sync_initial_message()?;
         let from2 = replica2
-            .sync_process_message(from1, peer1, &mut state2)
+            .sync_process_message(from1, peer1, &mut state2, None)
             .await
             .unwrap()
             .unwrap();
         let from1 = replica1
-            .sync_process_message(from2, peer2, &mut state1)
+            .sync_process_message(from2, peer2, &mut state1, None)
             .await
             .unwrap()
             .unwrap();
@@ -2884,7 +2899,7 @@ mod tests {
         // sure that no InsertRemote event is emitted for this entry.
         replica2.hash_and_insert(b"foo", &author, b"update").await?;
         let from2 = replica2
-            .sync_process_message(from1, peer1, &mut state2)
+            .sync_process_message(from1, peer1, &mut state2, None)
             .await
             .unwrap();
         assert!(from2.is_none());
@@ -3368,11 +3383,11 @@ mod tests {
             rounds += 1;
             println!("round {rounds}");
             if let Some(msg) = bob
-                .sync_process_message(msg, alice_peer_id, &mut bob_state)
+                .sync_process_message(msg, alice_peer_id, &mut bob_state, None)
                 .await?
             {
                 next_to_bob = alice
-                    .sync_process_message(msg, bob_peer_id, &mut alice_state)
+                    .sync_process_message(msg, bob_peer_id, &mut alice_state, None)
                     .await?
             }
         }
