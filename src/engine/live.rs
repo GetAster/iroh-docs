@@ -2144,26 +2144,42 @@ mod task_failure_tests {
             .await?;
         let mut events = doc_b.subscribe().await?;
 
-        // Both sides join the gossip topic and run their initial syncs. Both rounds must be
+        // Both sides join the gossip topic and run their initial syncs. The rounds must be
         // done before the burst: an in-flight sync would otherwise repair the loss on its own
-        // and the test would prove nothing. This phase runs no fault and proves nothing about
+        // and the test would prove nothing. The two start_sync calls dial concurrently and
+        // can resolve into a single completed round (the loser of the simultaneous-dial
+        // tie-break resets without reporting), so after the first round a second is started
+        // and awaited explicitly: its SyncFinished arrives only when that round has completed,
+        // after which nothing is in flight. This phase runs no fault and proves nothing about
         // lag, so it gets the same generous bound as the lag and repair waits below: the test
         // itself needs ~23s even alone, and the full suite runs it in parallel.
         doc_a.start_sync(vec![]).await?;
         doc_b.start_sync(ticket.nodes.clone()).await?;
         tokio::time::timeout(Duration::from_secs(60), async {
-            let mut initial = 0;
-            while initial < 2 {
+            loop {
                 let Some(ev) = events.next().await else {
                     anyhow::bail!("event stream ended: the live actor stopped");
                 };
                 if let LiveEvent::SyncFinished(ev) = ev? {
                     if ev.peer == a.router.endpoint().id() {
-                        initial += 1;
+                        return anyhow::Ok(());
                     }
                 }
             }
-            anyhow::Ok(())
+        })
+        .await??;
+        doc_b.start_sync(ticket.nodes.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let Some(ev) = events.next().await else {
+                    anyhow::bail!("event stream ended: the live actor stopped");
+                };
+                if let LiveEvent::SyncFinished(ev) = ev? {
+                    if ev.peer == a.router.endpoint().id() {
+                        return anyhow::Ok(());
+                    }
+                }
+            }
         })
         .await??;
 
@@ -2205,12 +2221,23 @@ mod task_failure_tests {
         })
         .await??;
 
-        // Every entry of the burst is present.
-        let count = doc_b
-            .get_many_vec(crate::store::Query::author(author))
-            .await?
-            .len();
-        assert_eq!(count, N, "the repair round restores every dropped entry");
+        // Every entry of the burst is present. The repair round's SyncFinished
+        // reports the exchange, not the store: its entries still queue behind
+        // the stalled insert, so wait for the count to converge instead of
+        // asserting at the event.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let count = doc_b
+                    .get_many_vec(crate::store::Query::author(author))
+                    .await?
+                    .len();
+                if count == N {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await??;
 
         b.router.shutdown().await?;
         a.router.shutdown().await?;
