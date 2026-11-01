@@ -221,6 +221,19 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<Option<BTreeSet<AuthorId>>>>,
     },
+    Fingerprint {
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<[u8; 32]>>,
+    },
+    Sequence {
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    EntriesSince {
+        seq: u64,
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<Vec<(u64, SignedEntry)>>>,
+    },
 }
 
 /// The state for an open replica.
@@ -707,6 +720,47 @@ impl SyncHandle {
         rx.await?
     }
 
+    /// Returns the XOR aggregate fingerprint over the namespace's current
+    /// record rows.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI and
+    /// binding parity pass is planned.
+    pub async fn namespace_fingerprint(&self, namespace: NamespaceId) -> Result<[u8; 32]> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::Fingerprint { reply };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
+    /// Returns the insertion sequence of the last state-changing put into
+    /// the namespace.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI and
+    /// binding parity pass is planned.
+    pub async fn namespace_sequence(&self, namespace: NamespaceId) -> Result<u64> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::Sequence { reply };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
+    /// Returns the keys touched by puts since `seq`, each with its latest
+    /// entry and the sequence at which it was last touched, ordered by touch
+    /// sequence.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI and
+    /// binding parity pass is planned.
+    pub async fn entries_since(
+        &self,
+        namespace: NamespaceId,
+        seq: u64,
+    ) -> Result<Vec<(u64, SignedEntry)>> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::EntriesSince { seq, reply };
+        self.send_replica(namespace, action).await?;
+        rx.await?
+    }
+
     pub async fn content_hashes(&self) -> Result<ContentHashesIterator> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ContentHashes { reply }).await?;
@@ -1130,6 +1184,18 @@ impl Actor {
             ReplicaAction::GetAllowedWriters { reply } => {
                 send_reply(reply, self.store.get_allowed_writers(&namespace))
             }
+            ReplicaAction::Fingerprint { reply } => send_reply_with(reply, self, |this| {
+                let mut replica = this.states.replica(namespace, &mut this.store)?;
+                Ok(replica.namespace_fingerprint()?.0)
+            }),
+            ReplicaAction::Sequence { reply } => send_reply_with(reply, self, |this| {
+                let mut replica = this.states.replica(namespace, &mut this.store)?;
+                replica.namespace_sequence()
+            }),
+            ReplicaAction::EntriesSince { seq, reply } => send_reply_with(reply, self, |this| {
+                let mut replica = this.states.replica(namespace, &mut this.store)?;
+                replica.entries_since(seq)
+            }),
         }
     }
 

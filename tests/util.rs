@@ -12,7 +12,7 @@ use iroh::{
     Endpoint, EndpointId, RelayMap, RelayMode, SecretKey,
 };
 use iroh_blobs::store::GcConfig;
-use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs};
+use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs, sync::Clock};
 use iroh_gossip::net::Gossip;
 use n0_error::Result;
 
@@ -81,6 +81,8 @@ pub struct Builder {
     gc_interval: Option<n0_future::time::Duration>,
     #[debug(skip)]
     register_gc_done_cb: Option<Box<dyn Fn() + Send + 'static>>,
+    #[debug(skip)]
+    clock: Option<std::sync::Arc<dyn Clock>>,
 }
 
 impl Builder {
@@ -99,6 +101,9 @@ impl Builder {
         };
         if let Some(protect_cb) = protect_cb {
             docs_builder = docs_builder.protect_handler(protect_cb);
+        }
+        if let Some(clock) = self.clock {
+            docs_builder = docs_builder.clock(clock);
         }
         let docs = match docs_builder
             .spawn(self.endpoint.clone(), blobs.clone(), gossip.clone())
@@ -134,12 +139,19 @@ impl Builder {
         self
     }
 
+    /// Stamps local records with this clock instead of system time.
+    pub fn clock(mut self, value: std::sync::Arc<dyn Clock>) -> Self {
+        self.clock = Some(value);
+        self
+    }
+
     fn new(storage: Storage, endpoint: Endpoint) -> Self {
         Self {
             endpoint,
             storage,
             gc_interval: None,
             register_gc_done_cb: None,
+            clock: None,
         }
     }
 }

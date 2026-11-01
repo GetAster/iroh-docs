@@ -28,12 +28,12 @@ use self::{
     protocol::{
         AddrInfoOptions, AuthorCreateRequest, AuthorDeleteRequest, AuthorExportRequest,
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
-        CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
-        GetAllowedWritersRequest, GetDownloadPolicyRequest, GetExactRequest, GetManyRequest,
-        GetManyVecRequest, GetSyncPeersRequest, ImportRequest, LeaveRequest, ListRequest,
-        OpenRequest, RetireWriteAuthorityRequest, SetAllowedWritersRequest,
-        SetDownloadPolicyRequest, SetDurableRequest, SetHashRequest, SetRequest, ShareMode,
-        ShareRequest, StartSyncRequest, StatusRequest, SubscribeRequest,
+        CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest, EntriesSinceRequest,
+        FingerprintRequest, GetAllowedWritersRequest, GetDownloadPolicyRequest, GetExactRequest,
+        GetManyRequest, GetManyVecRequest, GetSyncPeersRequest, ImportRequest, LeaveRequest,
+        ListRequest, OpenRequest, RetireWriteAuthorityRequest, SequenceRequest,
+        SetAllowedWritersRequest, SetDownloadPolicyRequest, SetDurableRequest, SetHashRequest,
+        SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -41,7 +41,7 @@ use crate::{
     engine::{Engine, LiveEvent},
     store::{DownloadPolicy, Query},
     Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
-    RetireWriteAuthorityOutcome,
+    RetireWriteAuthorityOutcome, SignedEntry,
 };
 
 pub(crate) mod actor;
@@ -113,6 +113,9 @@ impl DocsApi {
                     DocsProtocol::SetDownloadPolicy(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetAllowedWriters(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetAllowedWriters(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::Fingerprint(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::Sequence(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::EntriesSince(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetSyncPeers(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorList(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorCreate(msg) => local.send((msg, tx)).await,
@@ -667,6 +670,65 @@ impl Doc {
             })
             .await??;
         Ok(response.writers)
+    }
+
+    /// Returns the XOR aggregate fingerprint over this document's current
+    /// record rows.
+    ///
+    /// Equal on two replicas if and only if they hold the same record set,
+    /// independent of insert order; it does not cover blob presence.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI and
+    /// binding parity pass is planned.
+    pub async fn namespace_fingerprint(&self) -> Result<[u8; 32]> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(FingerprintRequest {
+                doc_id: self.namespace_id,
+            })
+            .await??;
+        Ok(response.fingerprint)
+    }
+
+    /// Returns the insertion sequence of the last state-changing put into
+    /// this document. Per-replica and per-namespace: not comparable across
+    /// replicas.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI and
+    /// binding parity pass is planned.
+    pub async fn namespace_sequence(&self) -> Result<u64> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(SequenceRequest {
+                doc_id: self.namespace_id,
+            })
+            .await??;
+        Ok(response.sequence)
+    }
+
+    /// Returns the keys touched by puts since `seq`, each with its latest
+    /// entry and the sequence at which it was last touched, ordered by touch
+    /// sequence. `seq` is a value previously returned by
+    /// [`Self::namespace_sequence`] on the same replica.
+    ///
+    /// Rust-only surface for now (an Aster introspection query); a C ABI and
+    /// binding parity pass is planned.
+    pub async fn entries_since(&self, seq: u64) -> Result<Vec<(u64, SignedEntry)>> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(EntriesSinceRequest {
+                doc_id: self.namespace_id,
+                seq,
+            })
+            .await??;
+        Ok(response
+            .entries
+            .into_iter()
+            .map(|entry| (entry.seq, entry.entry))
+            .collect())
     }
 
     async fn set_allowed_writers_inner(&self, writers: Option<BTreeSet<AuthorId>>) -> Result<()> {

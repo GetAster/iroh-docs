@@ -14,16 +14,18 @@ use super::{
         AuthorGetDefaultResponse, AuthorImportRequest, AuthorImportResponse, AuthorListRequest,
         AuthorListResponse, AuthorSetDefaultRequest, AuthorSetDefaultResponse, CloseRequest,
         CloseResponse, CreateRequest, CreateResponse, DelRequest, DelResponse, DocsMessage,
-        DocsProtocol, DropRequest, DropResponse, GetAllowedWritersRequest,
+        DocsProtocol, DropRequest, DropResponse, EntriesSinceRequest, EntriesSinceResponse,
+        EntrySeq, FingerprintRequest, FingerprintResponse, GetAllowedWritersRequest,
         GetAllowedWritersResponse, GetDownloadPolicyRequest, GetDownloadPolicyResponse,
         GetExactRequest, GetExactResponse, GetManyRequest, GetManyResponse, GetManyVecRequest,
         GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse, LeaveRequest,
         LeaveResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-        RetireWriteAuthorityRequest, RetireWriteAuthorityResponse, SetAllowedWritersRequest,
-        SetAllowedWritersResponse, SetDownloadPolicyRequest, SetDownloadPolicyResponse,
-        SetDurableRequest, SetHashRequest, SetHashResponse, SetRequest, SetResponse, ShareMode,
-        ShareRequest, ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest,
-        StatusResponse, SubscribeRequest, SubscribeResponse,
+        RetireWriteAuthorityRequest, RetireWriteAuthorityResponse, SequenceRequest,
+        SequenceResponse, SetAllowedWritersRequest, SetAllowedWritersResponse,
+        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetDurableRequest, SetHashRequest,
+        SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse,
+        StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest,
+        SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -214,6 +216,27 @@ impl RpcActor {
                 let result = self.doc_get_allowed_writers(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send GetAllowedWriters response: {}", e);
+                }
+            }
+            DocsMessage::Fingerprint(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self.doc_fingerprint(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send Fingerprint response: {}", e);
+                }
+            }
+            DocsMessage::Sequence(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self.doc_sequence(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send Sequence response: {}", e);
+                }
+            }
+            DocsMessage::EntriesSince(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self.doc_entries_since(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send EntriesSince response: {}", e);
                 }
             }
             DocsMessage::GetSyncPeers(get_peers) => {
@@ -774,5 +797,41 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(GetSyncPeersResponse { peers })
+    }
+
+    pub(super) async fn doc_fingerprint(
+        &self,
+        req: FingerprintRequest,
+    ) -> RpcResult<FingerprintResponse> {
+        let fingerprint = self
+            .sync
+            .namespace_fingerprint(req.doc_id)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(FingerprintResponse { fingerprint })
+    }
+
+    pub(super) async fn doc_sequence(&self, req: SequenceRequest) -> RpcResult<SequenceResponse> {
+        let sequence = self
+            .sync
+            .namespace_sequence(req.doc_id)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(SequenceResponse { sequence })
+    }
+
+    pub(super) async fn doc_entries_since(
+        &self,
+        req: EntriesSinceRequest,
+    ) -> RpcResult<EntriesSinceResponse> {
+        let entries = self
+            .sync
+            .entries_since(req.doc_id, req.seq)
+            .await
+            .map_err(|e| RpcError::new(&*e))?
+            .into_iter()
+            .map(|(seq, entry)| EntrySeq { seq, entry })
+            .collect();
+        Ok(EntriesSinceResponse { entries })
     }
 }

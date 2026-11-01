@@ -288,6 +288,53 @@ pub struct GetAllowedWritersResponse {
     pub writers: Option<BTreeSet<AuthorId>>,
 }
 
+/// Namespace fingerprint query (Aster §E). Rust-only introspection surface
+/// for now; a C ABI and binding parity pass is planned.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FingerprintRequest {
+    pub doc_id: NamespaceId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FingerprintResponse {
+    /// XOR aggregate over the namespace's current record rows.
+    pub fingerprint: [u8; 32],
+}
+
+/// Namespace insertion sequence query (Aster §E). Rust-only introspection
+/// surface for now; a C ABI and binding parity pass is planned.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SequenceRequest {
+    pub doc_id: NamespaceId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SequenceResponse {
+    /// Sequence of the last state-changing put into this namespace.
+    pub sequence: u64,
+}
+
+/// Replay of the touch history since a sequence (Aster §E). Rust-only
+/// introspection surface for now; a C ABI and binding parity pass is planned.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntriesSinceRequest {
+    pub doc_id: NamespaceId,
+    pub seq: u64,
+}
+
+/// One row of [`EntriesSinceResponse`]: a touched key and its latest entry.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntrySeq {
+    /// The sequence at which this key was last touched.
+    pub seq: u64,
+    pub entry: SignedEntry,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntriesSinceResponse {
+    pub entries: Vec<EntrySeq>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GetSyncPeersRequest {
     pub doc_id: NamespaceId,
@@ -433,6 +480,12 @@ pub enum DocsProtocol {
     SetAllowedWriters(SetAllowedWritersRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<GetAllowedWritersResponse>>)]
     GetAllowedWriters(GetAllowedWritersRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<FingerprintResponse>>)]
+    Fingerprint(FingerprintRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<SequenceResponse>>)]
+    Sequence(SequenceRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<EntriesSinceResponse>>)]
+    EntriesSince(EntriesSinceRequest),
 }
 
 /// Options to configure what is included in a [`iroh::EndpointAddr`].
