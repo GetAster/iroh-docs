@@ -64,6 +64,12 @@ impl Docs {
     pub fn api(&self) -> &DocsApi {
         &self.api
     }
+
+    /// Returns the sync handle, for direct store operations such as
+    /// enumerating the content the live actors currently reference.
+    pub fn sync(&self) -> &crate::actor::SyncHandle {
+        &self.engine.sync
+    }
 }
 
 impl std::ops::Deref for Docs {
