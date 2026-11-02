@@ -24,7 +24,7 @@ Historical and current tag schemes in this repository:
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
 | Tag | `aster-iroh-docs-v0.101.1018` |
-| Pinned commit | `d9055d350e20bb187f1fae744c8e5ed57c8798e3` |
+| Pinned commit | `4205355d31a6bccc87d1db0d4cd23208fc10f6d5` |
 | Crate version | 0.101.1018 (workspace spec `iroh-docs = "0.101.1018"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
@@ -178,7 +178,7 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.101.0` | `aster-iroh-docs-v0.101.1018` | `d9055d350e20bb187f1fae744c8e5ed57c8798e3` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1018` | `4205355d31a6bccc87d1db0d4cd23208fc10f6d5` | `upgrade/iroh-docs-v0.101` |
 
 - **2026-11-01, 0.101.1018** (`ffda84e`, tag `aster-iroh-docs-v0.101.1018`): the
   portal-sync batch — rows 52 (§E namespace fingerprint/sequence/replay, from
@@ -209,7 +209,10 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   start_sync dials could resolve as one completed round and deadlock the
   initial wait; the final count raced the repair round's queued inserts):
   the second initial round is awaited explicitly and the count is a bounded
-  convergence wait. Suite: 178 passed, 4 ignored; clippy/fmt clean.
+  convergence wait. `4205355` exposes `Docs::sync` (the engine's `SyncHandle`)
+  for direct store enumeration, so a GC-off Aster node's manual sweep can seed
+  its `live` set from the docs engine's content hashes. Suite: 178 passed,
+  4 ignored; clippy/fmt clean.
 
 ### 0.101.1017 (2026-11-01)
 
