@@ -28,6 +28,7 @@ use tokio::sync::{self, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 // use super::gossip::{GossipActor, ToGossipActor};
+use super::announce::{AnnounceKind, Announcer};
 use super::state::{is_tiebreak_loss, NamespaceStates, Origin, SyncReason};
 use crate::{
     actor::{OpenOpts, SyncHandle, TagHold},
@@ -243,8 +244,14 @@ struct DownloadCandidate {
 
 // Currently peers might double-sync in both directions.
 pub struct LiveActor {
-    /// Inbox for `ToLiveActor` messages.
+    /// Control inbox: API calls (subscribe, start_sync, leave, shutdown,
+    /// downloads, connection handling) and incoming sync requests. Polled
+    /// ahead of everything else, so API calls are served even while gossip
+    /// data floods the other inbox.
     inbox: mpsc::Receiver<ToLiveActor>,
+    /// Data inbox: gossip-driven events (neighbors, content-ready, inline
+    /// values, sync reports) and lag reactions.
+    data_inbox: mpsc::Receiver<ToLiveActor>,
     sync: SyncHandle,
     endpoint: Endpoint,
     bao_store: Store,
@@ -260,10 +267,15 @@ pub struct LiveActor {
     replica_events_tx: async_channel::Sender<crate::Event>,
     replica_events_rx: async_channel::Receiver<crate::Event>,
 
-    /// Send messages to self.
+    /// Control channel to self, cloned into tasks that must reach the actor
+    /// promptly (accept tasks sending sync requests).
     /// Note: Must not be used in methods called from `Self::run` directly to prevent deadlocks.
     /// Only clone into newly spawned tasks.
     sync_actor_tx: mpsc::Sender<ToLiveActor>,
+    /// Data channel to self, for lag reactions scheduled from the loop.
+    data_actor_tx: mpsc::Sender<ToLiveActor>,
+    /// Broadcasts gossip messages off this loop.
+    announcer: Announcer,
     gossip: GossipState,
 
     /// Running sync futures (from connect).
@@ -330,7 +342,9 @@ impl LiveActor {
         bao_store: Store,
         downloader: Downloader,
         inbox: mpsc::Receiver<ToLiveActor>,
+        data_inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
+        data_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
         max_inline_value_size: usize,
         tag_hold: Option<TagHold>,
@@ -347,13 +361,15 @@ impl LiveActor {
         let gossip_state = GossipState::new(
             gossip,
             sync.clone(),
-            sync_actor_tx.clone(),
+            data_actor_tx.clone(),
             max_inline_value_size > 0,
         );
+        let announcer = Announcer::spawn(metrics.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
         Ok(Self {
             inbox,
+            data_inbox,
             sync,
             replica_events_rx,
             replica_events_tx,
@@ -365,6 +381,8 @@ impl LiveActor {
             max_inline_value_size,
             tag_hold,
             sync_actor_tx,
+            data_actor_tx,
+            announcer,
             running_sync_connect: Default::default(),
             running_sync_connect_ids: Default::default(),
             running_sync_accept: Default::default(),
@@ -417,9 +435,11 @@ impl LiveActor {
             self.metrics.doc_live_tick_main.inc();
             tokio::select! {
                 biased;
+                // Control first: API calls stay served even while the data
+                // inbox is flooded by gossip events.
                 msg = self.inbox.recv() => {
                     let msg = msg.context("to_actor closed")?;
-                    trace!(?i, %msg, "tick: to_actor");
+                    trace!(?i, %msg, "tick: to_actor control");
                     self.metrics.doc_live_tick_actor.inc();
                     match msg {
                         ToLiveActor::Shutdown { reply } => {
@@ -429,6 +449,12 @@ impl LiveActor {
                             self.on_actor_message(msg).await.context("on_actor_message")?;
                         }
                     }
+                }
+                msg = self.data_inbox.recv() => {
+                    let msg = msg.context("to_actor data closed")?;
+                    trace!(?i, %msg, "tick: to_actor data");
+                    self.metrics.doc_live_tick_actor.inc();
+                    self.on_actor_message(msg).await.context("on_actor_message")?;
                 }
                 event = self.replica_events_rx.recv() => {
                     trace!(?i, "tick: replica_event");
@@ -758,8 +784,16 @@ impl LiveActor {
             .into_iter()
             .collect();
         self.gossip.quit(&namespace);
-        if let Err(err) = self.gossip.join(namespace, peers).await {
-            warn!(?err, namespace = %namespace.fmt_short(), "failed to re-subscribe after gossip lag");
+        self.announcer.unregister(&namespace);
+        match self.gossip.join(namespace, peers).await {
+            Ok(senders) => {
+                if let Some((entries, values)) = senders {
+                    self.announcer.register(namespace, entries, values);
+                }
+            }
+            Err(err) => {
+                warn!(?err, namespace = %namespace.fmt_short(), "failed to re-subscribe after gossip lag");
+            }
         }
     }
 
@@ -887,6 +921,7 @@ impl LiveActor {
                 .await?;
             self.sync.close(namespace).await?;
             self.gossip.quit(&namespace);
+            self.announcer.unregister(&namespace);
         }
         self.neighbors.remove(&namespace);
         self.deferred_resyncs.remove(&namespace);
@@ -913,7 +948,13 @@ impl LiveActor {
         }
 
         // tell gossip to join
-        self.gossip.join(namespace, peer_ids.clone()).await?;
+        match self.gossip.join(namespace, peer_ids.clone()).await? {
+            Some((entries, values)) => {
+                self.announcer.register(namespace, entries, values);
+            }
+            // Already joined: extend the existing topic's peers instead.
+            None => self.announcer.join_peers(&namespace, peer_ids.clone()).await,
+        }
 
         if !peer_ids.is_empty() {
             // trigger initial sync with initial peers
@@ -1157,6 +1198,23 @@ impl LiveActor {
         self.flush_pending_downloads().await;
     }
 
+    /// Queues a broadcast on the announcer without awaiting gossip; a full
+    /// queue drops the message and schedules a lag reaction for the
+    /// namespace, so peers that missed it are repaired by a re-sync.
+    fn announce(&self, namespace: NamespaceId, kind: AnnounceKind, message: Bytes) {
+        if !self.announcer.try_announce(namespace, kind, message) {
+            self.schedule_lag(namespace);
+        }
+    }
+
+    /// Schedules the gossip-lag reaction for a namespace, best-effort: a
+    /// full data inbox drops the reaction, and a later event re-triggers it.
+    fn schedule_lag(&self, namespace: NamespaceId) {
+        let _ = self
+            .data_actor_tx
+            .try_send(ToLiveActor::GossipLagged { namespace });
+    }
+
     async fn broadcast_neighbors(&mut self, namespace: NamespaceId, op: &Op) {
         if !self.state.is_syncing(&namespace) {
             return;
@@ -1169,10 +1227,7 @@ impl LiveActor {
                 return;
             }
         };
-        // TODO: We should debounce and merge these neighbor announcements likely.
-        self.gossip
-            .broadcast_neighbors(&namespace, msg.into())
-            .await;
+        self.announce(namespace, AnnounceKind::Neighbors, msg.into());
     }
 
     async fn emit_content_ready(&mut self, namespace: NamespaceId, hash: Hash) {
@@ -1383,7 +1438,7 @@ impl LiveActor {
                         entry: entry.clone(),
                     };
                     let message: Bytes = postcard::to_stdvec(&op)?.into();
-                    self.gossip.broadcast(&namespace, message).await;
+                    self.announce(namespace, AnnounceKind::Entries, message);
                     if self.max_inline_value_size > 0
                         && entry.content_len() <= self.max_inline_value_size as u64
                     {
@@ -1399,7 +1454,7 @@ impl LiveActor {
                                 // still rode the namespace topic and the
                                 // peers download the value as usual.
                                 if message.len() <= self.gossip.max_message_size() {
-                                    self.gossip.broadcast_values(&namespace, message).await;
+                                    self.announce(namespace, AnnounceKind::Values, message);
                                 }
                             }
                             Err(err) => debug!(?err, "failed to read value for inline gossip"),
@@ -2353,6 +2408,7 @@ mod takeover_tests {
         let downloader = blobs.downloader(&endpoint);
         let sync = SyncHandle::spawn(crate::store::Store::memory(), None, "test".to_string());
         let (tx, rx) = mpsc::channel(8);
+        let (data_tx, data_rx) = mpsc::channel(8);
         let actor = LiveActor::new(
             sync,
             endpoint.clone(),
@@ -2360,7 +2416,9 @@ mod takeover_tests {
             (*blobs).clone(),
             downloader,
             rx,
+            data_rx,
             tx,
+            data_tx,
             Default::default(),
             0,
             None,

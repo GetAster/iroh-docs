@@ -1,7 +1,6 @@
 use std::collections::{hash_map, HashMap};
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use iroh::EndpointId;
 use iroh_blobs::Hash;
 use iroh_gossip::{
@@ -44,11 +43,6 @@ fn values_topic(namespace: NamespaceId) -> TopicId {
 
 #[derive(Debug)]
 struct ActiveState {
-    sender: GossipSender,
-    /// Sender for the derived inline-values topic; `None` when the engine
-    /// runs with inline values disabled, in which case the topic is neither
-    /// subscribed nor broadcast to.
-    values_sender: Option<GossipSender>,
     abort_handle: AbortHandle,
 }
 
@@ -81,13 +75,20 @@ impl GossipState {
         }
     }
 
-    pub async fn join(&mut self, namespace: NamespaceId, bootstrap: Vec<EndpointId>) -> Result<()> {
+    /// Joins a namespace's topics, spawning the receive loop for it.
+    ///
+    /// Returns the new senders when the namespace was joined fresh, for the
+    /// caller to register with the announcer; `None` when the namespace was
+    /// already joined (its peers were then just extended).
+    pub async fn join(
+        &mut self,
+        namespace: NamespaceId,
+        bootstrap: Vec<EndpointId>,
+    ) -> Result<Option<(GossipSender, Option<GossipSender>)>> {
         match self.active.entry(namespace) {
-            hash_map::Entry::Occupied(mut entry) => {
-                if !bootstrap.is_empty() {
-                    entry.get_mut().sender.join_peers(bootstrap).await?;
-                }
-            }
+            // The namespace is already joined: the caller extends its peers
+            // through the announcer, which holds the sender.
+            hash_map::Entry::Occupied(_) => Ok(None),
             hash_map::Entry::Vacant(entry) => {
                 let sub = self
                     .gossip
@@ -121,14 +122,10 @@ impl GossipState {
 
                     (namespace, res)
                 });
-                entry.insert(ActiveState {
-                    sender,
-                    values_sender,
-                    abort_handle,
-                });
+                entry.insert(ActiveState { abort_handle });
+                Ok(Some((sender, values_sender)))
             }
         }
-        Ok(())
     }
 
     pub fn quit(&mut self, topic: &NamespaceId) {
@@ -142,28 +139,6 @@ impl GossipState {
             state.abort_handle.abort();
         }
         self.progress().await
-    }
-
-    pub async fn broadcast(&mut self, namespace: &NamespaceId, message: Bytes) {
-        if let Some(state) = self.active.get_mut(namespace) {
-            state.sender.broadcast(message).await.ok();
-        }
-    }
-
-    /// Broadcast on the namespace's derived inline-values topic. No-op when
-    /// inline values are disabled or the namespace is not joined.
-    pub async fn broadcast_values(&mut self, namespace: &NamespaceId, message: Bytes) {
-        if let Some(state) = self.active.get_mut(namespace) {
-            if let Some(sender) = &state.values_sender {
-                sender.broadcast(message).await.ok();
-            }
-        }
-    }
-
-    pub async fn broadcast_neighbors(&mut self, namespace: &NamespaceId, message: Bytes) {
-        if let Some(state) = self.active.get_mut(namespace) {
-            state.sender.broadcast_neighbors(message).await.ok();
-        }
     }
 
     pub fn max_message_size(&self) -> usize {

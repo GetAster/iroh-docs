@@ -37,6 +37,8 @@ pub struct Metrics {
     pub doc_gossip_tick_pending_join: Counter,
     /// Number of times a gossip subscription dropped events and re-synced
     pub doc_gossip_lagged: Counter,
+    /// Number of broadcasts dropped because the announcer queue was full
+    pub announce_queue_full_drops: Counter,
 
     /// Number of times the live actor loop ticked
     pub doc_live_tick_main: Counter,

@@ -46,12 +46,17 @@ use crate::{
     Author, AuthorId, Clock, ContentStatus, ContentStatusCallback, Entry, NamespaceId,
 };
 
+mod announce;
 mod gossip;
 mod live;
 mod state;
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
 const ACTOR_CHANNEL_CAP: usize = 64;
+/// Cap of the live actor's data channel: gossip events queue here without
+/// blocking their senders' receive loops, and the actor drains them every
+/// tick. Bounded, so a wedged actor cannot accumulate unbounded memory.
+const DATA_CHANNEL_CAP: usize = 256;
 /// Capacity for the channels for [`Engine::subscribe`].
 /// The sync engine coordinates actors that manage open documents, set-reconciliation syncs with
 /// peers and a gossip swarm for each syncing document.
@@ -167,6 +172,10 @@ impl Engine {
         max_inline_value_size: usize,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
+        // Gossip data events ride their own bounded channel, polled after
+        // the control inbox, so a flood of neighbor/content events cannot
+        // starve API calls (which used to sit behind the same 64-cap inbox).
+        let (live_data_tx, to_live_data_recv) = mpsc::channel(DATA_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
 
         let content_status_cb: ContentStatusCallback = {
@@ -240,7 +249,9 @@ impl Engine {
             bao_store.clone(),
             downloader,
             to_live_actor_recv,
+            to_live_data_recv,
             live_actor_tx.clone(),
+            live_data_tx,
             sync.metrics().clone(),
             max_inline_value_size,
             tag_hold.clone(),
