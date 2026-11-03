@@ -953,7 +953,11 @@ impl LiveActor {
                 self.announcer.register(namespace, entries, values);
             }
             // Already joined: extend the existing topic's peers instead.
-            None => self.announcer.join_peers(&namespace, peer_ids.clone()).await,
+            None => {
+                self.announcer
+                    .join_peers(&namespace, peer_ids.clone())
+                    .await
+            }
         }
 
         if !peer_ids.is_empty() {

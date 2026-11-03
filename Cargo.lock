@@ -819,7 +819,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1932,7 +1932,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.101.1002"
-source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=7f8bbbca2da58bd92ff9920b0df9e8290b62c865#7f8bbbca2da58bd92ff9920b0df9e8290b62c865"
+source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=602bbb719ece3c2314faf732639a29a582fdf9ed#602bbb719ece3c2314faf732639a29a582fdf9ed"
 dependencies = [
  "blake3",
  "bytes",
