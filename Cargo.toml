@@ -108,5 +108,5 @@ iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "825b
 noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "6eb304c01ab606a5ccb568d0b2132ad6219b38ef" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "d2e14fb3597be41c98f8a32167199278dd5e6974" }
 iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "b28211ec000f013d7ad49cc9dd2fb93518c1ec8f" }
