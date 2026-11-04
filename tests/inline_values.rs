@@ -8,6 +8,7 @@
 //! therefore only have arrived inlined in a docs message.
 
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use iroh::{endpoint::presets, EndpointId};
 use iroh_blobs::{api::blobs::BlobStatus, Hash};
 use iroh_docs::{
@@ -163,6 +164,316 @@ async fn sync_exchange_inlines_only_below_threshold() -> Result<()> {
         blobs1.status(hash_over).await?,
         BlobStatus::Complete { .. }
     ));
+
+    author.shutdown().await?;
+    reader.shutdown().await?;
+    Ok(())
+}
+
+// ---- carried-bytes tests -------------------------------------------------
+//
+// The set API already holds the value it imports, so it carries the bytes on
+// the local-insert event and the live actor announces them without reading
+// the blob store. These tests insert below the set API on purpose: the
+// author's blob store never holds the value, so a `get_bytes` read cannot
+// produce it and any completed content on the reader proves the announce
+// came from the carried bytes.
+
+/// Waits until `events` reports the gossip insert of `hash`, returning the
+/// content status reported with it.
+async fn wait_for_remote_insert(
+    events: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin),
+    hash: Hash,
+) -> Result<Option<iroh_docs::ContentStatus>> {
+    loop {
+        match n0_future::time::timeout(Duration::from_secs(30), events.try_next()).await {
+            Ok(Ok(Some(LiveEvent::InsertRemote {
+                entry,
+                content_status,
+                ..
+            }))) if entry.content_hash() == hash => return Ok(Some(content_status)),
+            Ok(Ok(Some(_))) => {}
+            other => bail!("entry for {hash} never arrived: {other:?}"),
+        }
+    }
+}
+
+/// Waits for the insert and content-ready events of `hash` and returns its
+/// bytes from the reader's blob store.
+async fn wait_for_inline_content(
+    events: &mut (impl Stream<Item = Result<LiveEvent>> + Unpin),
+    blobs: &iroh_blobs::api::Store,
+    hash: Hash,
+) -> Result<Vec<u8>> {
+    let mut saw_insert = false;
+    let mut saw_ready = false;
+    while !(saw_insert && saw_ready) {
+        match n0_future::time::timeout(Duration::from_secs(30), events.try_next()).await {
+            Ok(Ok(Some(LiveEvent::InsertRemote { entry, .. }))) if entry.content_hash() == hash => {
+                saw_insert = true;
+            }
+            Ok(Ok(Some(LiveEvent::ContentReady { hash: ready }))) if ready == hash => {
+                saw_ready = true;
+            }
+            Ok(Ok(Some(_))) => {}
+            other => bail!("content for {hash} never became ready: {other:?}"),
+        }
+    }
+    Ok(blobs.get_bytes(hash).await?.to_vec())
+}
+
+/// A local insert carrying its bytes announces `Put` + `PutValue` even though
+/// the author's blob store never held the value: the value rides the event,
+/// not a `get_bytes` read of the store.
+#[tokio::test]
+#[traced_test]
+async fn carried_bytes_announce_without_a_store_read() -> Result<()> {
+    // The author refuses blobs, so the reader's content can only have come
+    // from the inline value.
+    let author = node(false).await?;
+    let reader = node(true).await?;
+    let doc0 = author.client().docs().create().await?;
+    let author_id = author.client().docs().author_create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = reader.client().docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+    wait_sync_finished(&mut events1).await?;
+
+    let value: Vec<u8> = vec![0x77; 512];
+    let hash = Hash::new(&value);
+    // Insert below the set API: the bytes never enter the author's blob
+    // store, they are carried on the local-insert event.
+    author
+        .client()
+        .sync()
+        .insert_local(
+            doc0.id(),
+            author_id,
+            b"carried".to_vec().into(),
+            hash,
+            value.len() as u64,
+            Some(Bytes::from(value.clone())),
+        )
+        .await?;
+
+    let got = wait_for_inline_content(&mut events1, reader.client().blobs(), hash).await?;
+    assert_eq!(got, value);
+    // The announce cannot have come from a store read.
+    assert!(
+        matches!(
+            author.client().blobs().status(hash).await?,
+            BlobStatus::NotFound
+        ),
+        "the author's blob store must never hold the carried value"
+    );
+
+    author.shutdown().await?;
+    reader.shutdown().await?;
+    Ok(())
+}
+
+/// A hash-only insert carries no bytes, so the live actor still announces the
+/// value through the blob-store read path.
+#[tokio::test]
+#[traced_test]
+async fn hash_only_insert_announces_via_the_store_read() -> Result<()> {
+    let author = node(false).await?;
+    let reader = node(true).await?;
+    let doc0 = author.client().docs().create().await?;
+    let author_id = author.client().docs().author_create().await?;
+
+    // The author holds the value; the entry is inserted by hash only.
+    let value: Vec<u8> = vec![0x88; 512];
+    let hash = Hash::new(&value);
+    let _tag = author
+        .client()
+        .blobs()
+        .add_bytes(value.clone())
+        .temp_tag()
+        .await?;
+
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = reader.client().docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+    wait_sync_finished(&mut events1).await?;
+
+    doc0.set_hash(author_id, b"hash-only".to_vec(), hash, value.len() as u64)
+        .await?;
+
+    let got = wait_for_inline_content(&mut events1, reader.client().blobs(), hash).await?;
+    assert_eq!(got, value);
+
+    author.shutdown().await?;
+    reader.shutdown().await?;
+    Ok(())
+}
+
+/// The set API carries the bytes it already holds on the local-insert event,
+/// and only up to the configured inline threshold: a larger payload never
+/// rides the event.
+#[tokio::test]
+#[traced_test]
+async fn set_bytes_carries_the_value_on_the_local_insert_event() -> Result<()> {
+    let author = node(false).await?;
+    let doc0 = author.client().docs().create().await?;
+    let author_id = author.client().docs().author_create().await?;
+    doc0.share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    // A raw replica-event subscription, alongside the live actor's own.
+    let (tx, rx) = async_channel::unbounded();
+    author.client().sync().subscribe(doc0.id(), tx).await?;
+
+    let small: Vec<u8> = vec![0x33; 512];
+    let hash_small = doc0
+        .set_bytes(author_id, b"small".to_vec(), small.clone())
+        .await?;
+    let event = n0_future::time::timeout(Duration::from_secs(30), rx.recv()).await??;
+    match event {
+        iroh_docs::Event::LocalInsert {
+            entry,
+            value: Some(value),
+            ..
+        } if entry.content_hash() == hash_small => {
+            assert_eq!(value.as_ref(), small.as_slice());
+        }
+        other => bail!("expected a carried value for {hash_small}: {other:?}"),
+    }
+
+    // Over the threshold the bytes are not carried: the live actor reads the
+    // store instead, so a large payload never sits in the event.
+    let large: Vec<u8> = vec![0x44; MAX_INLINE + 1];
+    let hash_large = doc0
+        .set_bytes(author_id, b"large".to_vec(), large.clone())
+        .await?;
+    loop {
+        let event = n0_future::time::timeout(Duration::from_secs(30), rx.recv()).await??;
+        match event {
+            iroh_docs::Event::LocalInsert { entry, value, .. }
+                if entry.content_hash() == hash_large =>
+            {
+                assert!(value.is_none(), "over-threshold value must not be carried");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    author.shutdown().await?;
+    Ok(())
+}
+
+/// A carried value above the author's inline threshold is not announced,
+/// exactly as before: the entry still gossips, the value does not.
+#[tokio::test]
+#[traced_test]
+async fn carried_value_over_the_size_cap_is_not_announced() -> Result<()> {
+    let author = node(false).await?;
+    // The reader accepts larger values, so a wrongly announced value would
+    // complete its content and fail the assertion below.
+    let reader = Node::memory(iroh::Endpoint::bind(presets::Minimal).await?)
+        .max_inline_value_size(4096)
+        .spawn()
+        .await?;
+    let doc0 = author.client().docs().create().await?;
+    let author_id = author.client().docs().author_create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = reader.client().docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+    wait_sync_finished(&mut events1).await?;
+
+    // The author's threshold is the 1024-byte default; 2048 is over it.
+    let value: Vec<u8> = vec![0x99; MAX_INLINE * 2];
+    let hash = Hash::new(&value);
+    author
+        .client()
+        .sync()
+        .insert_local(
+            doc0.id(),
+            author_id,
+            b"over-size".to_vec().into(),
+            hash,
+            value.len() as u64,
+            Some(Bytes::from(value)),
+        )
+        .await?;
+
+    let status = wait_for_remote_insert(&mut events1, hash).await?;
+    assert_ne!(status, Some(iroh_docs::ContentStatus::Complete));
+    // Give a wrongly announced value time to arrive, then check it never
+    // completed: the author refuses blobs, so only an inline value could.
+    n0_future::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !matches!(
+            reader.client().blobs().status(hash).await?,
+            BlobStatus::Complete { .. }
+        ),
+        "a value over the inline threshold must not be announced"
+    );
+
+    author.shutdown().await?;
+    reader.shutdown().await?;
+    Ok(())
+}
+
+/// A carried value that fits the inline threshold but pushes the encoded
+/// `PutValue` over the gossip message cap is not announced.
+#[tokio::test]
+#[traced_test]
+async fn carried_value_over_the_gossip_message_cap_is_not_announced() -> Result<()> {
+    let author = Node::memory(iroh::Endpoint::bind(presets::Minimal).await?)
+        .without_blobs_protocol()
+        .max_inline_value_size(4096)
+        .spawn()
+        .await?;
+    // The reader accepts 4096-byte values, so a wrongly announced value
+    // would complete its content and fail the assertion below.
+    let reader = Node::memory(iroh::Endpoint::bind(presets::Minimal).await?)
+        .max_inline_value_size(4096)
+        .spawn()
+        .await?;
+    let doc0 = author.client().docs().create().await?;
+    let author_id = author.client().docs().author_create().await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+    let doc1 = reader.client().docs().import(ticket).await?;
+    let mut events1 = doc1.subscribe().await?;
+    wait_sync_finished(&mut events1).await?;
+
+    // Passes the inline threshold (4096) but its encoded `PutValue` is over
+    // the gossip message cap (4096 bytes including the envelope).
+    let value: Vec<u8> = vec![0xAA; 4096];
+    let hash = Hash::new(&value);
+    author
+        .client()
+        .sync()
+        .insert_local(
+            doc0.id(),
+            author_id,
+            b"over-message".to_vec().into(),
+            hash,
+            value.len() as u64,
+            Some(Bytes::from(value)),
+        )
+        .await?;
+
+    let status = wait_for_remote_insert(&mut events1, hash).await?;
+    assert_ne!(status, Some(iroh_docs::ContentStatus::Complete));
+    n0_future::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !matches!(
+            reader.client().blobs().status(hash).await?,
+            BlobStatus::Complete { .. }
+        ),
+        "a value over the gossip message cap must not be announced"
+    );
 
     author.shutdown().await?;
     reader.shutdown().await?;

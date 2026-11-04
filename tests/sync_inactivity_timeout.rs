@@ -254,6 +254,7 @@ async fn init_frame(capability: iroh_docs::Capability) -> Result<Vec<u8>> {
             Bytes::from_static(b"other"),
             iroh_blobs::Hash::new(b"other"),
             5,
+            None,
         )
         .await?;
     let message = handle

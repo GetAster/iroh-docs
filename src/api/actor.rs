@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use bytes::Bytes;
 use iroh_blobs::api::TempTag;
 use irpc::{channel::mpsc, LocalSender, WithChannels};
 use n0_future::{task, StreamExt};
@@ -578,13 +579,21 @@ impl RpcActor {
             value,
         } = req;
         let len = value.len();
+        let inline_value = self.inline_value(&value);
         let tag = blobs_store
             .add_bytes(value)
             .temp_tag()
             .await
             .map_err(|e| RpcError::new(&e))?;
         self.sync
-            .insert_local(doc_id, author_id, key.clone(), tag.hash(), len as u64)
+            .insert_local(
+                doc_id,
+                author_id,
+                key.clone(),
+                tag.hash(),
+                len as u64,
+                inline_value,
+            )
             .await
             .map_err(|e| RpcError::new(&*e))?;
         let entry = self
@@ -628,6 +637,7 @@ impl RpcActor {
             value,
         } = req;
         let len = value.len();
+        let inline_value = self.inline_value(&value);
         let tag = blobs_store
             .add_bytes(value)
             .temp_tag()
@@ -635,7 +645,14 @@ impl RpcActor {
             .map_err(|e| RpcError::new(&e))?;
         blobs_store.sync_db().await.map_err(|e| RpcError::new(&e))?;
         self.sync
-            .insert_local(doc_id, author_id, key.clone(), tag.hash(), len as u64)
+            .insert_local(
+                doc_id,
+                author_id,
+                key.clone(),
+                tag.hash(),
+                len as u64,
+                inline_value,
+            )
             .await
             .map_err(|e| RpcError::new(&*e))?;
         // The document record must be durable when this call returns, not
@@ -703,10 +720,21 @@ impl RpcActor {
             size,
         } = req;
         self.sync
-            .insert_local(doc_id, author_id, key.clone(), hash, size)
+            .insert_local(doc_id, author_id, key.clone(), hash, size, None)
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(SetHashResponse {})
+    }
+
+    /// The content bytes to carry on the local-insert event, when this
+    /// engine's inline-value feature is on and the value fits its threshold.
+    ///
+    /// Gating here keeps a large payload out of the event and out of the
+    /// live actor: above the threshold the live actor resolves the value
+    /// with a blob-store read, exactly as before.
+    fn inline_value(&self, value: &Bytes) -> Option<Bytes> {
+        let max = self.engine.max_inline_value_size();
+        (max > 0 && value.len() <= max).then(|| value.clone())
     }
 
     pub(super) async fn doc_get_many(
