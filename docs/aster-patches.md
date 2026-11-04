@@ -15,7 +15,7 @@ This repository is Aster's fork of [n0-computer/iroh-docs](https://github.com/n0
 Historical and current tag schemes in this repository:
 
 - `aster-iroh-docs-v<version>`, for example `aster-iroh-docs-v0.99.0`, `aster-iroh-docs-v0.100.0`, `aster-iroh-docs-v0.101.7`.
-- `aster-iroh-docs-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-docs-v0.100.0-p1` (added the content-ready patch, row 10), `-v0.100.0-p2`, `-v0.101.0-p1`, `-v0.101.5-p1`, `-v0.101.5-p2`, `-v0.101.7-p1`, `-v0.101.10-p1` and `-v0.101.10-p2` (patch-block re-pins with no source change).
+- `aster-iroh-docs-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-docs-v0.100.0-p1` (added the content-ready patch, row 10), `-v0.100.0-p2`, `-v0.101.0-p1`, `-v0.101.5-p1`, `-v0.101.5-p2`, `-v0.101.7-p1`, `-v0.101.10-p1` and `-v0.101.10-p2` (patch-block re-pins with no source change). `aster-iroh-docs-v0.101.1019-p1` (2026-11-04) was created in error: it marks a code change, which the rule reserves for a version bump. It is superseded by 0.101.1020 and left in place (tags are immutable).
 
 ## Current release
 
@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1019` |
-| Pinned commit | `e400fb00227457a1255f3b4cee1e3dfddd41685a` |
-| Crate version | 0.101.1019 (workspace spec `iroh-docs = "0.101.1019"`) |
+| Tag | `aster-iroh-docs-v0.101.1020` |
+| Pinned commit | `d54c33cd002a9f19ca41e1aadde977d4c869d5c8` |
+| Crate version | 0.101.1020 (workspace spec `iroh-docs = "0.101.1020"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins ir
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "e400fb00227457a1255f3b4cee1e3dfddd41685a" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "d54c33cd002a9f19ca41e1aadde977d4c869d5c8" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -78,6 +78,9 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 53 | `fix/durable-set-record-flush` (tip `7766359`, based on `4acfc56`) | `set_bytes_durable` committed the blob metadata before acknowledging but left the document record in the actor's open write transaction, visible only on the 500 ms flush timer, so a hard kill in that window lost the record while its blob metadata was durable. The publish path now flushes the store after the local insert, so the acknowledgement covers both; the crash witness reopens the node after the kill and demands the record itself (`get_exact`), not just the blob. Files: `src/api/actor.rs`, `tests/durable_set_crash.rs`. | portal-sync (aster-request.md round-3 flush ask): the publish barrier must cover the document record, not only the blob metadata — otherwise a crash after the ack can still lose the published manifest entry. | `7766359`; released in 0.101.1018 | carried | **Aster's own; no upstream equivalent.** Low conflict risk (one flush call after the insert in `doc_set_durable`). Test: the extended `tests/durable_set_crash.rs` witness kills the child on the ack, reopens the node on the same directory and demands the record; it fails without the flush. `cargo test --all-features`: 166 passed, 4 ignored; clippy `--all-features --all-targets -D warnings` and fmt clean. |
 | 54 | `feat/inline-values` (tip `374d8ed`, based on `7766359`) | Inline values: entries at or below a size threshold (default 1024 bytes, `Builder::max_inline_value_size`, 0 disables) carry their value inside set-reconciliation and gossip messages instead of triggering one value-blob download round trip per entry. Ranger messages carry `Option<Bytes>` per entry; the sync actor attaches locally complete values to outgoing messages in one batch read (`get_bytes_many_if_complete`) and imports incoming ones after verifying hash and length, holding temp tags until the next protect enumeration (row 51's notify). Gossip `Op::Put` carries an optional value, sent when the author has the content and it fits the threshold, falling back to the bare entry when the inlined message exceeds the 4096-byte gossip cap. The wire shape changed (struct variant plus the optional ranger payload), so the inline format is negotiated: the endpoint advertises a second ALPN (`/iroh-sync/2`), the dialer tries Inline first and falls back to the legacy format, and a mixed-version pair degrades to the old wire instead of decoding garbage. Incoming gossip values are validated (size and hash) before import, and the live actor imports only values it still wants. An imported value marks the entry `Complete` before the insert event is emitted, so the normal pending-download path (row 10) turns into a zero-network `ContentReady`. Files: `src/ranger.rs`, `src/sync.rs`, `src/actor.rs`, `src/engine.rs`, `src/engine/live.rs`, `src/engine/gossip.rs`, `src/protocol.rs`, `tests/inline_values.rs`, `tests/util.rs`, `tests/sync.rs`. | portal-sync (aster-request.md §F): one blob per manifest entry (fork-verified: no inlining, one queued download per entry), an RTT on every edit's value-blob fetch, ~2M round-trip-bound downloads on a 1M-file join. The per-directory batching alternative is recorded as the rejected §6 fallback. | `374d8ed`; released in 0.101.1018 | carried | **Aster's own; no upstream equivalent.** Low conflict risk (one field on the ranger tuples and its callbacks, one gossip variant, spawn plumbing next to rows 47/48's arguments). Tests: `tests/inline_values.rs::gossip_inlines_small_value` and `sync_exchange_inlines_only_below_threshold` — the author node refuses the blobs ALPN, so content that ends up complete on the receiver can only have arrived inlined; a value one byte over the threshold stays incomplete. `cargo test --all-features`: 168 passed, 4 ignored; clippy `--all-features --all-targets -D warnings` and fmt clean. |
 | 57 | `fix/i-stall-hardening` | Moves the live actor's gossip broadcasts off its serial loop onto an announcer task with a bounded queue (cap 1024, `try_send`; a full queue drops the broadcast, counts `announce_queue_full_drops` and schedules a `GossipLagged` re-subscribe + resync — deliberate, counted loss), and splits control messages out of the `ToLiveActor` inbox into their own channel (cap 64), polled ahead of data (cap 256) in a biased `select!`. Broadcast sites: `broadcast_neighbors` and `emit_content_ready`. Files: `src/engine.rs`, `src/engine/announce.rs`, `src/engine/gossip.rs`, `src/engine/live.rs`, `src/metrics.rs`. | §I bench (`_internal/docs/aster-rpc/261103_i-bench-deadlock.md`): the hub awaited the gossip broadcast inside its serial loop, so a gossip actor wedged at the QUIC uni-stream credit wall (gossip rows 55/56) took docs down with it — the full 64-cap inbox then refused `StartSync` and every later API call. The announcer moves backpressure off the hub loop (the hub never awaits gossip); the control split guarantees control messages are not stuck behind a data flood. | `75a9d72` (same commit on topic and upgrade) | carried | Released in 0.101.1019, which is otherwise a gossip re-pin wave (gossip `2c2cc98`, then `d2e14fb3`, `7f8bbbca`, `602bbb71`; rows 55, 56, 58 there). The tag names the last re-pin `e400fb0`, not the version-bump `0be65ed`. |
+| 59 | none recorded | Answers whole-namespace `get_fingerprint` scans from the maintained `namespace_fingerprint` aggregate: `StoreInstance::get_fingerprint` short-circuits on `range.is_all()` to the O(1) aggregate the fork already maintains at write time, instead of scanning every record row per session. A `debug_assertions` fast-path-equals-scan assert; the test-only `entry_remove` XORs the removed row out; the equality-test helper folds the test-only `all()` iterator directly (independent scan); a two-store init/process round trip proves the sync-facing path. Files: `src/store/fs.rs`, `src/ranger.rs`. | Every set-reconciliation session opens with a whole-namespace `RangeFingerprint`; both sides scanned O(N) on the docs actor thread, every session, even when the namespaces already agree (aster-request.md \u00a7G; scope `261104_docs-fingerprint-scope.md`). Timings: 2k records 435 \u00b5s \u2192 86 ns, 100k 22.47 ms \u2192 91 ns. | `b021ab5`; released in 0.101.1020 | carried | Aster's own; no upstream equivalent. Recursion scans (`src/ranger.rs:587`) are unchanged: a genuinely differing namespace still pays O(range) per split, which is the work needed to find the difference. A false mismatch only recurses (slow, correct). |
+| 60 | none recorded (upstream cherry-picks) | Clamps remote sync ranges to the session namespace (upstream `c3c0ccd`, #117) and hardens the API around untrusted range bounds (upstream `8cfeacb`, #119). #117 closes a cross-namespace content leak: `get_range` \u2014 and `get_fingerprint`, which delegates to it \u2014 built its redb bounds from remote-supplied range endpoints with no namespace clamp, and the inline-values wire attached locally complete blobs filtered only by size, so a peer holding one ticket could read other namespaces' small values. Files: `src/store/fs.rs`, `src/sync.rs`, `src/ranger.rs`, `src/api.rs`, `src/actor.rs`. | Fork hardening for the same leak surface (aster-request.md \u00a7G correction: land with or before A as its own line). | `addc19e` (upstream `c3c0ccd`), `a2f8a56` (upstream `8cfeacb`); released in 0.101.1020 | carried | Cherry-picked with `-x` provenance. #119 needed one hand-resolved hunk in `remove_prefix_filtered`: upstream's `RecordsBounds::author_prefix(self.namespace, \u2026)` taken, the fork's aggregate XOR-out kept. #117's upstream notes document an adjacent unfixed issue: a <64-byte remote `RecordIdentifier` panics the docs actor thread (availability-only; candidate Aster follow-up). |
+| 61 | none recorded | Carries the caller's \u22641024 B bytes from `doc_set` through `insert_local` into `Event::LocalInsert { value: Option<Bytes> }`, so the live actor's `LocalInsert` arm announces `PutValue` from the carried bytes instead of awaiting a blob-store `get_bytes` read on its loop. Gated by the engine's `max_inline_value_size` and the gossip message cap; hash-only sets and imports pass `None` and keep the read path verbatim. Receiver hash validation is unchanged \u2014 it remains the integrity gate. Files: `src/sync.rs`, `src/api/actor.rs`, `src/engine.rs`, `src/engine/live.rs`, `tests/inline_values.rs`. | The live actor's per-write blob read was 86\u201390% of the `LocalInsert` arm (fork-side A/B: p50 7.2\u20137.8 \u00b5s \u2192 0.75\u20130.83 \u00b5s, ~9\u201310\u00d7); portal-scale live inserts are all \u22641024 B (aster-request.md \u00a7H; scope `261104_docs-live-inline-scope.md`). Freshness path unchanged (entry + value in the same gossip wave). | `bf992b8`; released in 0.101.1020 | carried | Aster's own. Wire, config and facade unchanged. Tests prove the carry: the author's blob store never holds the bytes (`BlobStatus::NotFound`) and the reader still completes content from the announce alone. `cargo test --all-features`: 185 passed, 4 ignored; clippy and fmt clean. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -175,7 +178,30 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1019 (2026-11-03), current
+### 0.101.1020 (2026-11-04), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1020` | `d54c33cd002a9f19ca41e1aadde977d4c869d5c8` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-04, 0.101.1020** (`d54c33c`, tag `aster-iroh-docs-v0.101.1020`): the
+  \u00a7G + \u00a7H wave on top of 0.101.1019. Row 59 (`b021ab5`): whole-namespace
+  `get_fingerprint` answers from the maintained aggregate, O(1) per session.
+  Row 60 (`addc19e`, `a2f8a56`): upstream cherry-picks #117 (cross-namespace
+  content-leak clamp) and #119 (untrusted range bounds). Row 61 (`bf992b8`):
+  carried inline values to the live announce (drops the live-actor blob read).
+  The version bump itself (`d54c33c`, option E, `n = 20`) follows a first
+  publication attempt at the unchanged 0.101.1019, which the registry's
+  BOM-drift guard refused (`publish-native-stack.py`: registry versions are
+  immutable). The `aster-iroh-docs-v0.101.1019-p1` tag created on that attempt
+  marks the same code at the unchanged version; it is superseded and left in
+  place. Validation at the pinned commit: fork_compat suite for this fork
+  (`cargo test --locked --all-features`), 185 passed, 4 ignored; clippy
+  `--all-features --all-targets -D warnings` and fmt clean. Aster consumer
+  trial: pin bump in `aster-rpc-internal` main (recorded with the release;
+  `aster_transport_core` suite and fork_compat green at the pinned commit).
+
+### 0.101.1019 (2026-11-03)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
