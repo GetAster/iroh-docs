@@ -198,7 +198,13 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   pinned commit: fork_compat green (its suite, `cargo test --locked
   --all-features`), a local `cargo test --all-features` 187 passed, 4 ignored
   (185 + the two new tests); clippy `--all-features --all-targets -D warnings`
-  and fmt clean.
+  and fmt clean. Aster consumer trial: pin bump in `aster-rpc-internal` main
+  as `12affb30`, released as Aster v0.3.1860 (`3214d607`). The wave's first
+  promote (v0.3.1859) failed `publish-native-stack.py`'s BOM-drift gate — the
+  publisher table still listed 0.101.1020 — fixed before re-release, and the
+  v0.3.1860 promote published 0.101.1021 with the full Aster artifact set.
+  Candidate runs 591/593 green (core suites included); fork_compat green at
+  the pinned commit.
 
 ### 0.101.1020 (2026-11-04)
 
