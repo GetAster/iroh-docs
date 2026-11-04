@@ -356,6 +356,12 @@ impl Store {
     }
 
     /// Load the replica info from the store.
+    ///
+    /// This is the single chokepoint every open path goes through (the docs
+    /// actor's `open` callback and [`Store::open_replica`]), so it also
+    /// rebuilds the namespace fingerprint once per open — see
+    /// [`StoreInstance::rebuild_namespace_fingerprint`]. A rebuild failure
+    /// fails the open: serving a possibly-stale aggregate would be worse.
     pub fn load_replica_info(
         &mut self,
         namespace_id: &NamespaceId,
@@ -371,6 +377,10 @@ impl Store {
             Err(err) => return Err(OpenError::Other(err.into())),
         };
         self.open_replicas.insert(info.capability.id());
+        StoreInstance::new(*namespace_id, self)
+            .rebuild_namespace_fingerprint()
+            .map(|_| ())
+            .map_err(OpenError::Other)?;
         Ok(info)
     }
 
@@ -874,6 +884,33 @@ impl StoreInstance<'_> {
             if let Some(fp) = tables.namespace_fingerprint.get(namespace)? {
                 return Ok(Fingerprint(*fp.value()));
             }
+            let mut fp = Fingerprint::empty();
+            let bounds = RecordsBounds::namespace(self.namespace);
+            let records = tables.records.range(bounds.as_ref())?;
+            for row in records {
+                let (compound_key, value) = row?;
+                let (ns, author, key) = compound_key.value();
+                let (timestamp, _sig_ns, _sig_author, _len, hash) = value.value();
+                fp ^= crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
+            }
+            let bytes = fp.0;
+            tables.namespace_fingerprint.insert(namespace, &bytes)?;
+            Ok(fp)
+        })
+    }
+
+    /// Rebuild the namespace fingerprint from the records table, overwriting
+    /// the stored aggregate.
+    ///
+    /// Run once per replica open (see [`Store::load_replica_info`]): the
+    /// sync protocol answers whole-set fingerprints from the aggregate
+    /// maintained on writes, and a release build has no scan comparison, so
+    /// an unconditional rebuild on open bounds any silent divergence between
+    /// the aggregate and the rows to one process lifetime. One O(N) scan per
+    /// open replaces the per-session scans the fast path removed.
+    pub fn rebuild_namespace_fingerprint(&mut self) -> Result<Fingerprint> {
+        let namespace = self.namespace.as_bytes();
+        self.store.as_mut().modify(|tables| {
             let mut fp = Fingerprint::empty();
             let bounds = RecordsBounds::namespace(self.namespace);
             let records = tables.records.range(bounds.as_ref())?;
@@ -2020,6 +2057,73 @@ mod tests {
         assert_eq!(
             wrapper.namespace_fingerprint()?,
             scan_namespace_fingerprint(&mut wrapper)?
+        );
+        Ok(())
+    }
+
+    /// A silently corrupted aggregate (a release build never compares it
+    /// against a scan) is rebuilt from the records table once per replica
+    /// open, bounding divergence to one process lifetime.
+    #[test]
+    fn load_replica_info_rebuilds_the_namespace_fingerprint() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let path = dbfile.path().to_path_buf();
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+
+        let author = {
+            let mut store = Store::persistent(&path)?;
+            store.new_author(&mut rand::rng())?
+        };
+
+        // Write rows and remember what the aggregate must be.
+        let expected = {
+            let mut store = Store::persistent(&path)?;
+            store.import_author(author.clone())?;
+            let _replica = store.new_replica(namespace.clone())?;
+            store.close_replica(id);
+            let mut wrapper = StoreInstance::new(id, &mut store);
+            for i in 0..5u64 {
+                wrapper.put(fixed_entry(
+                    &namespace,
+                    &author,
+                    &format!("k{i}"),
+                    b"v",
+                    i + 1,
+                ))?;
+            }
+            scan_namespace_fingerprint(&mut wrapper)?
+        };
+
+        // Corrupt the stored aggregate row without touching the records and
+        // without opening a replica (so nothing rebuilds): the corrupted
+        // value is what the O(1) read would serve.
+        let mut store = Store::persistent(&path)?;
+        store.modify(|tables| {
+            tables
+                .namespace_fingerprint
+                .insert(id.as_bytes(), &[0u8; 32])?;
+            Ok(())
+        })?;
+        assert_eq!(
+            StoreInstance::new(id, &mut store).namespace_fingerprint()?,
+            Fingerprint([0u8; 32]),
+            "the corruption is in place before the reopen"
+        );
+
+        // Opening the replica rebuilds the aggregate from the rows and the
+        // rebuild persists: the next store open reads the healed value with
+        // no rebuild of its own.
+        let mut replica = store.open_replica(&id)?;
+        assert_eq!(replica.namespace_fingerprint()?, expected);
+        drop(replica);
+        store.close_replica(id);
+        drop(store);
+        let mut store = Store::persistent(&path)?;
+        assert_eq!(
+            StoreInstance::new(id, &mut store).namespace_fingerprint()?,
+            expected,
+            "the rebuilt aggregate is durable"
         );
         Ok(())
     }
