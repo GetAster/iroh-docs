@@ -198,8 +198,9 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   place. Validation at the pinned commit: fork_compat suite for this fork
   (`cargo test --locked --all-features`), 185 passed, 4 ignored; clippy
   `--all-features --all-targets -D warnings` and fmt clean. Aster consumer
-  trial: pin bump in `aster-rpc-internal` main (recorded with the release;
-  `aster_transport_core` suite and fork_compat green at the pinned commit).
+  trial: pin bump in `aster-rpc-internal` main (released as Aster
+  v0.3.1856; `aster_transport_core` suite and fork_compat green at the
+  pinned commit).
 
 ### 0.101.1019 (2026-11-03)
 
