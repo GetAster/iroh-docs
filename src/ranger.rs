@@ -1515,6 +1515,96 @@ mod tests {
         }
     }
 
+    /// Two stores holding the same rows: the responder answers the
+    /// initiator's whole-namespace fingerprint with `None`, so the session
+    /// ends after one message. This is the protocol-level contract the
+    /// store's O(1) whole-namespace path has to satisfy.
+    #[tokio::test]
+    async fn whole_namespace_fingerprint_two_store_round_trip() -> anyhow::Result<()> {
+        use crate::store::fs::{Store, StoreInstance};
+        use crate::sync::{Entry, Record, RecordIdentifier, SignedEntry};
+        use crate::NamespaceSecret;
+
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let ns = namespace.id();
+
+        let file_a = tempfile::NamedTempFile::new()?;
+        let file_b = tempfile::NamedTempFile::new()?;
+        let mut store_a = Store::persistent(file_a.path())?;
+        let mut store_b = Store::persistent(file_b.path())?;
+        let author = store_a.new_author(&mut rand::rng())?;
+        store_b.import_author(author.clone())?;
+        for store in [&mut store_a, &mut store_b] {
+            store.new_replica(namespace.clone())?;
+            store.close_replica(ns);
+        }
+
+        // Build the signed entries once so both replicas hold byte-identical
+        // rows (timestamps included).
+        let entries: Vec<SignedEntry> = ["k1", "k2", "k3"]
+            .into_iter()
+            .map(|key| {
+                let id = RecordIdentifier::new(ns, author.id(), key);
+                let record = Record::current_from_data(format!("value-{key}"));
+                SignedEntry::from_entry(Entry::new(id, record), &namespace, &author)
+            })
+            .collect();
+        for store in [&mut store_a, &mut store_b] {
+            let mut wrapper = StoreInstance::new(ns, store);
+            for entry in &entries {
+                wrapper.put(entry.clone())?;
+            }
+        }
+
+        // Equal content: the responder's whole-namespace fingerprint matches
+        // the initiator's, so nothing is sent back.
+        let reply = {
+            let mut wrapper_a = StoreInstance::new(ns, &mut store_a);
+            let message = wrapper_a.initial_message()?;
+            let mut wrapper_b = StoreInstance::new(ns, &mut store_b);
+            wrapper_b
+                .process_message(
+                    &Default::default(),
+                    message,
+                    |_, _, _| true,
+                    async |_, _, _, _| (),
+                    async |_| ContentStatus::Complete,
+                )
+                .await?
+        };
+        assert!(
+            reply.is_none(),
+            "equal replicas must terminate after the initial fingerprint message"
+        );
+
+        // A differing row must still be reconciled: the fingerprint is not
+        // answered from a constant.
+        {
+            let mut wrapper_b = StoreInstance::new(ns, &mut store_b);
+            let id = RecordIdentifier::new(ns, author.id(), "k4");
+            let record = Record::current_from_data(b"value-k4");
+            let entry = SignedEntry::from_entry(Entry::new(id, record), &namespace, &author);
+            wrapper_b.put(entry)?;
+        }
+        let mut wrapper_a = StoreInstance::new(ns, &mut store_a);
+        let message = wrapper_a.initial_message()?;
+        let mut wrapper_b = StoreInstance::new(ns, &mut store_b);
+        let reply = wrapper_b
+            .process_message(
+                &Default::default(),
+                message,
+                |_, _, _| true,
+                async |_, _, _, _| (),
+                async |_| ContentStatus::Complete,
+            )
+            .await?;
+        assert!(
+            reply.is_some(),
+            "a differing replica must be reconciled, not reported as equal"
+        );
+        Ok(())
+    }
+
     #[test]
     fn store_get_range() {
         let mut store = SimpleStore::<&'static str, i32>::default();

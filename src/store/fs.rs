@@ -1042,7 +1042,27 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     }
 
     fn get_fingerprint(&mut self, range: &Range<RecordIdentifier>) -> Result<Fingerprint> {
-        // TODO: optimize
+        // The whole-set range is the aggregate maintained on every write, so
+        // answer it without a scan. Every sync session opens with this range,
+        // which makes the agreeing-replica case O(1) per side instead of one
+        // row read, one hash and one XOR per record. Split ranges still scan:
+        // that is the work needed to locate a difference.
+        if range.is_all() {
+            let fingerprint = self.namespace_fingerprint()?;
+            #[cfg(debug_assertions)]
+            {
+                let mut scanned = Fingerprint::empty();
+                for el in self.get_range(range.clone())? {
+                    scanned ^= el?.as_fingerprint();
+                }
+                debug_assert_eq!(
+                    fingerprint, scanned,
+                    "maintained namespace fingerprint diverged from a record scan"
+                );
+            }
+            return Ok(fingerprint);
+        }
+
         let elements = self.get_range(range.clone())?;
 
         let mut fp = Fingerprint::empty();
@@ -1208,6 +1228,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     #[cfg(test)]
     fn entry_remove(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
+        let namespace = id.namespace().to_bytes();
         self.store.as_mut().modify(|tables| {
             let entry = {
                 let (namespace, author, key) = id.as_byte_tuple();
@@ -1217,6 +1238,22 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 let value = tables.records.remove(id)?;
                 value.map(|value| into_entry(id, value.value()))
             };
+            // Keep the maintained aggregate equal to a scan of the records
+            // table: XOR the removed row out. A missing row means the
+            // aggregate has not been built yet; the first query builds it.
+            if let Some(entry) = entry.as_ref() {
+                let stored = tables
+                    .namespace_fingerprint
+                    .get(&namespace)?
+                    .map(|fp| *fp.value());
+                if let Some(mut bytes) = stored {
+                    let removed = entry.as_fingerprint();
+                    for (acc, sub) in bytes.iter_mut().zip(removed.0) {
+                        *acc ^= sub;
+                    }
+                    tables.namespace_fingerprint.insert(&namespace, &bytes)?;
+                }
+            }
             Ok(entry)
         })
     }
@@ -1816,12 +1853,16 @@ mod tests {
         Ok(())
     }
 
-    /// The full-namespace fingerprint computed the independent way: the
-    /// ranger's range scan over the identity range, exactly what the sync
-    /// protocol's initial message carries.
+    /// The full-namespace fingerprint computed independently of the
+    /// maintained aggregate: decode and hash every record row directly.
+    /// Going through the store's all-range `get_fingerprint` here would
+    /// compare the maintained value to itself.
     fn scan_namespace_fingerprint(wrapper: &mut StoreInstance) -> Result<Fingerprint> {
-        let first = wrapper.get_first()?;
-        wrapper.get_fingerprint(&Range::new(first.clone(), first))
+        let mut fp = Fingerprint::empty();
+        for entry in wrapper.all()? {
+            fp ^= entry?.as_fingerprint();
+        }
+        Ok(fp)
     }
 
     /// A signed entry at `key` with fixed data and timestamp, so replicas
