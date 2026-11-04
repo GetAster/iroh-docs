@@ -195,9 +195,10 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   open, bounding silent aggregate drift to one process lifetime. Row 64
   (`833cd6f`): debug-asserts that carried inline value bytes name the entry's
   hash and length, and documents the subscriber contract. Validation at the
-  pinned commit: `cargo test --all-features` 187 passed, 4 ignored (185 + the
-  two new tests); clippy `--all-features --all-targets -D warnings` and fmt
-  clean.
+  pinned commit: fork_compat green (its suite, `cargo test --locked
+  --all-features`), a local `cargo test --all-features` 187 passed, 4 ignored
+  (185 + the two new tests); clippy `--all-features --all-targets -D warnings`
+  and fmt clean.
 
 ### 0.101.1020 (2026-11-04)
 
