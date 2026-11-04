@@ -125,7 +125,9 @@ pub enum Event {
         /// Carried so the live actor can announce the inline gossip value
         /// without reading the blob store; `None` for hash-only inserts and
         /// for content above the threshold, which the live actor resolves
-        /// with a store read.
+        /// with a store read. Every replica-event subscriber — not only the
+        /// live actor — sees this event with the carried value; the value is
+        /// not part of the signed entry.
         #[debug(skip)]
         value: Option<Bytes>,
     },
@@ -554,6 +556,16 @@ where
     ) -> Result<usize, InsertError> {
         if len == 0 || hash == Hash::EMPTY {
             return Err(InsertError::EntryIsEmpty);
+        }
+        // The carried bytes must name this entry: the live actor announces
+        // them as the hash's content, so a mismatch would announce a value
+        // every receiver rejects while the blob store holds different bytes
+        // under the same hash. The production callers derive `hash` from the
+        // same bytes (`doc_set`'s `add_bytes` tag hash), so this is an
+        // internal-consistency check, not a caller contract.
+        if let Some(bytes) = &value {
+            debug_assert_eq!(bytes.len() as u64, len);
+            debug_assert_eq!(Hash::new(bytes), hash);
         }
         self.info.ensure_open()?;
         let id = RecordIdentifier::new(self.id(), author.id(), key);
