@@ -362,6 +362,9 @@ impl Store {
     /// rebuilds the namespace fingerprint once per open — see
     /// [`StoreInstance::rebuild_namespace_fingerprint`]. A rebuild failure
     /// fails the open: serving a possibly-stale aggregate would be worse.
+    /// The rebuild runs before the replica is registered as open, so a
+    /// failed rebuild leaves the namespace fully closed (removable,
+    /// retirable) instead of half-open until restart.
     pub fn load_replica_info(
         &mut self,
         namespace_id: &NamespaceId,
@@ -376,11 +379,14 @@ impl Store {
             Ok(None) => return Err(OpenError::NotFound),
             Err(err) => return Err(OpenError::Other(err.into())),
         };
-        self.open_replicas.insert(info.capability.id());
+        // Rebuild before registering the replica as open: a failed rebuild
+        // must leave the namespace fully closed, or remove_replica and
+        // retire_write_authority would refuse it until restart.
         StoreInstance::new(*namespace_id, self)
             .rebuild_namespace_fingerprint()
             .map(|_| ())
             .map_err(OpenError::Other)?;
+        self.open_replicas.insert(info.capability.id());
         Ok(info)
     }
 
