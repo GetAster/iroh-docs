@@ -1351,8 +1351,32 @@ const AUTHOR_BYTES: std::ops::Range<usize> = 32..64;
 const KEY_BYTES: std::ops::RangeFrom<usize> = 64..;
 
 /// The identifier of a record.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Deserialize` is manual to enforce the identifier's length invariant at
+/// the wire: a `RecordIdentifier` below 64 bytes (namespace + author) would
+/// panic the slicing accessors (`as_byte_tuple`, `to_byte_tuple`, `key`)
+/// the moment the bytes reach a store range operation. Set-reconciliation
+/// range endpoints are supplied by the remote peer, so rejecting the frame
+/// at decode turns it into a session error instead of a docs-actor panic.
+#[derive(Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordIdentifier(Bytes);
+
+impl<'de> Deserialize<'de> for RecordIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Bytes::deserialize(deserializer)?;
+        if bytes.len() < KEY_BYTES.start {
+            return Err(serde::de::Error::custom(format!(
+                "record identifier too short: {} bytes, need at least {}",
+                bytes.len(),
+                KEY_BYTES.start
+            )));
+        }
+        Ok(Self(bytes))
+    }
+}
 
 impl Default for RecordIdentifier {
     fn default() -> Self {
@@ -3588,6 +3612,45 @@ mod tests {
 
         let decoded: SignedEntry = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, signed);
+    }
+
+    /// A `RecordIdentifier` below 64 bytes must be rejected at decode, not
+    /// panicked on later: the slicing accessors index fixed ranges, and
+    /// set-reconciliation range endpoints are supplied by the remote peer.
+    #[test]
+    fn test_record_identifier_rejects_short_wire_bytes() {
+        // The identifier's wire format is a postcard byte slice (namespace ‖
+        // author ‖ key). Two bytes, as a crafted peer would send.
+        let short: Vec<u8> = b"ab".to_vec();
+        let bytes = postcard::to_stdvec(&short).unwrap();
+        // postcard discards custom serde error messages (`SerdeDeCustom` is
+        // a unit variant), so the variant is the assertion: a complete
+        // 2-byte payload decodes `Bytes` fine, leaving the length rejection
+        // as the only possible custom error.
+        let err = postcard::from_bytes::<RecordIdentifier>(&bytes).unwrap_err();
+        assert!(
+            matches!(err, postcard::Error::SerdeDeCustom),
+            "expected the length rejection, got: {err:?}"
+        );
+
+        // The exact message position that used to panic: a `Range` with
+        // short endpoints, as it arrives inside a `RangeFingerprint`. A
+        // struct and a tuple share postcard's sequence encoding, so a pair
+        // of byte slices is the wire shape of `Range<RecordIdentifier>`.
+        let bytes = postcard::to_stdvec(&(&b"ab"[..], &b"cd"[..])).unwrap();
+        let err = postcard::from_bytes::<ranger::Range<RecordIdentifier>>(&bytes).unwrap_err();
+        assert!(
+            matches!(err, postcard::Error::SerdeDeCustom),
+            "expected the length rejection, got: {err:?}"
+        );
+
+        // Valid identifiers still round-trip.
+        let author = Author::from_bytes(&[0xa1; 32]);
+        let namespace = NamespaceSecret::from_bytes(&[0xb2; 32]);
+        let id = RecordIdentifier::new(namespace.id(), author.id(), b"key");
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        let decoded: RecordIdentifier = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, id);
     }
 
     /// Snapshot of the `Author` postcard format.
