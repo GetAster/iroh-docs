@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1020-p1` (current pin; the published 0.101.1020 crate carries tag `aster-iroh-docs-v0.101.1020`, same source) |
-| Pinned commit | `10103440993eb4722a37ba9b56ec4cc83abf1094` |
-| Crate version | 0.101.1020 (workspace spec `iroh-docs = "0.101.1020"`) |
+| Tag | `aster-iroh-docs-v0.101.1021` |
+| Pinned commit | `7fff16b9abb27d5fe1ba6f61d16ddc496e31a817` |
+| Crate version | 0.101.1021 (workspace spec `iroh-docs = "0.101.1021"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins ir
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "10103440993eb4722a37ba9b56ec4cc83abf1094" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "7fff16b9abb27d5fe1ba6f61d16ddc496e31a817" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -81,6 +81,9 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 59 | none recorded | Answers whole-namespace `get_fingerprint` scans from the maintained `namespace_fingerprint` aggregate: `StoreInstance::get_fingerprint` short-circuits on `range.is_all()` to the O(1) aggregate the fork already maintains at write time, instead of scanning every record row per session. A `debug_assertions` fast-path-equals-scan assert; the test-only `entry_remove` XORs the removed row out; the equality-test helper folds the test-only `all()` iterator directly (independent scan); a two-store init/process round trip proves the sync-facing path. Files: `src/store/fs.rs`, `src/ranger.rs`. | Every set-reconciliation session opens with a whole-namespace `RangeFingerprint`; both sides scanned O(N) on the docs actor thread, every session, even when the namespaces already agree (aster-request.md \u00a7G; scope `261104_docs-fingerprint-scope.md`). Timings: 2k records 435 \u00b5s \u2192 86 ns, 100k 22.47 ms \u2192 91 ns. | `b021ab5`; released in 0.101.1020 | carried | Aster's own; no upstream equivalent. Recursion scans (`src/ranger.rs:587`) are unchanged: a genuinely differing namespace still pays O(range) per split, which is the work needed to find the difference. A false mismatch only recurses (slow, correct). |
 | 60 | none recorded (upstream cherry-picks) | Clamps remote sync ranges to the session namespace (upstream `c3c0ccd`, #117) and hardens the API around untrusted range bounds (upstream `8cfeacb`, #119). #117 closes a cross-namespace content leak: `get_range` \u2014 and `get_fingerprint`, which delegates to it \u2014 built its redb bounds from remote-supplied range endpoints with no namespace clamp, and the inline-values wire attached locally complete blobs filtered only by size, so a peer holding one ticket could read other namespaces' small values. Files: `src/store/fs.rs`, `src/sync.rs`, `src/ranger.rs`, `src/api.rs`, `src/actor.rs`. | Fork hardening for the same leak surface (aster-request.md \u00a7G correction: land with or before A as its own line). | `c2824d0` (upstream `c3c0ccd`), `8619a26` (upstream `8cfeacb`); released in 0.101.1020 | carried | Cherry-picked with `-x` provenance. #119 needed one hand-resolved hunk in `remove_prefix_filtered`: upstream's `RecordsBounds::author_prefix(self.namespace, \u2026)` taken, the fork's aggregate XOR-out kept. #117's upstream notes document an adjacent unfixed issue: a <64-byte remote `RecordIdentifier` panics the docs actor thread (availability-only; candidate Aster follow-up). |
 | 61 | none recorded | Carries the caller's \u22641024 B bytes from `doc_set` through `insert_local` into `Event::LocalInsert { value: Option<Bytes> }`, so the live actor's `LocalInsert` arm announces `PutValue` from the carried bytes instead of awaiting a blob-store `get_bytes` read on its loop. Gated by the engine's `max_inline_value_size` and the gossip message cap; hash-only sets and imports pass `None` and keep the read path verbatim. Receiver hash validation is unchanged \u2014 it remains the integrity gate. Files: `src/sync.rs`, `src/api/actor.rs`, `src/engine.rs`, `src/engine/live.rs`, `tests/inline_values.rs`. | The live actor's per-write blob read was 86\u201390% of the `LocalInsert` arm (fork-side A/B: p50 7.2\u20137.8 \u00b5s \u2192 0.75\u20130.83 \u00b5s, ~9\u201310\u00d7); portal-scale live inserts are all \u22641024 B (aster-request.md \u00a7H; scope `261104_docs-live-inline-scope.md`). Freshness path unchanged (entry + value in the same gossip wave). | `3dc3350`; released in 0.101.1020 | carried | Aster's own. Wire, config and facade unchanged. Tests prove the carry: the author's blob store never holds the bytes (`BlobStatus::NotFound`) and the reader still completes content from the announce alone. `cargo test --all-features`: 185 passed, 4 ignored; clippy and fmt clean. |
+| 62 | none recorded | A manual `Deserialize` on `RecordIdentifier` rejects identifiers below 64 bytes (namespace + author) at decode. The derived impl carried no length invariant, so a crafted <64-byte identifier decoded into the slicing accessors (`to_byte_tuple`/`as_byte_tuple`/`key`), which panic on `get_range`'s `Less`/`Greater` arms inside the docs actor — which runs without `catch_unwind`, so one frame killed the actor. The decode error terminates the session instead. Files: `src/sync.rs`. | #117's upstream notes documented this as an adjacent unfixed upstream issue (availability-only); reproduced 2026-11-04 (a crafted `RangeFingerprint` with two postcard-shaped short identifiers through the responder's `process_message` panicked at `to_byte_tuple`). §G's A short-circuits only `is_all()`, so it did not close the class. | `12655cd`; released in 0.101.1021 | carried | Aster's own. Covers both wire formats (Inline and Legacy deserialize the same identifier type). No wire change: valid identifiers round-trip byte-identically, and postcard discards custom serde messages, so the test asserts the `SerdeDeCustom` variant for a complete-but-short payload. |
+| 63 | none recorded | Rebuilds the namespace fingerprint from the records table once per replica open: `StoreInstance::rebuild_namespace_fingerprint` scans and overwrites the stored aggregate, wired through `Store::load_replica_info` — the single chokepoint both the docs actor's open callback and `open_replica` go through. A rebuild failure fails the open. Files: `src/store/fs.rs`. | Review ask on 0.101.1020: the aggregate is now authoritative for convergence, and a release build has no scan comparison, so silent divergence would be served indefinitely. One O(N) scan per open replaces the per-session scans the fast path removed and bounds any divergence to one process lifetime. | `4902348`; released in 0.101.1021 | carried | Aster's own. Idempotent (same value rebuilt); a write transaction per open is the cost. Test: corrupt the stored row, assert the O(1) read serves the corruption, then `open_replica` heals it and the healed value survives the next store open. |
+| 64 | none recorded | `insert_with_value` debug-asserts that carried inline value bytes hash to the entry hash and match `len`, and `Event::LocalInsert` documents that every replica-event subscriber — not only the live actor — sees the carried value. Files: `src/sync.rs`. | Review minor on 0.101.1020: the live actor announces the carried bytes as that hash's content, so a mismatch would announce a value every receiver rejects while the blob store holds different bytes under the same hash. Production callers derive the hash from the same bytes, so this is an internal-consistency check. | `833cd6f`; released in 0.101.1021 | carried | Aster's own. Debug-build check only; exercised by the existing `tests/inline_values.rs` suite. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -178,11 +181,29 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1020 (2026-11-04), current
+### 0.101.1021 (2026-11-04), current
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.101.0` | `aster-iroh-docs-v0.101.1020`, `-p1` (current pin) | `10103440993eb4722a37ba9b56ec4cc83abf1094` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1021` | `7fff16b9abb27d5fe1ba6f61d16ddc496e31a817` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-04, 0.101.1021** (`7fff16b`, tag `aster-iroh-docs-v0.101.1021`, option E,
+  `n = 21`): closes the review follow-ups on the 0.101.1020 wave. Row 62
+  (`12655cd`): <64-byte record identifiers rejected at decode instead of
+  panicking the docs actor on a crafted range endpoint. Row 63 (`4902348`):
+  the namespace fingerprint is rebuilt from the records table once per replica
+  open, bounding silent aggregate drift to one process lifetime. Row 64
+  (`833cd6f`): debug-asserts that carried inline value bytes name the entry's
+  hash and length, and documents the subscriber contract. Validation at the
+  pinned commit: `cargo test --all-features` 187 passed, 4 ignored (185 + the
+  two new tests); clippy `--all-features --all-targets -D warnings` and fmt
+  clean.
+
+### 0.101.1020 (2026-11-04)
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1020`, `-p1` | `10103440993eb4722a37ba9b56ec4cc83abf1094` | `upgrade/iroh-docs-v0.101` |
 
 - **2026-11-04, 0.101.1020** (`1010344`, tags `aster-iroh-docs-v0.101.1020` and `-p1`): the
   \u00a7G + \u00a7H wave on top of 0.101.1019. Row 59 (`b021ab5`): whole-namespace
