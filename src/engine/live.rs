@@ -1429,7 +1429,11 @@ impl LiveActor {
 
     async fn on_replica_event(&mut self, event: crate::Event) -> Result<()> {
         match event {
-            crate::Event::LocalInsert { namespace, entry } => {
+            crate::Event::LocalInsert {
+                namespace,
+                entry,
+                value,
+            } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
                 // A new entry was inserted locally. The entry always rides the
                 // namespace topic in the version-0 shape, so peers that
@@ -1446,22 +1450,34 @@ impl LiveActor {
                     if self.max_inline_value_size > 0
                         && entry.content_len() <= self.max_inline_value_size as u64
                     {
-                        match self.bao_store.blobs().get_bytes(entry.content_hash()).await {
-                            Ok(bytes) => {
-                                let op = Op::PutValue {
-                                    hash: entry.content_hash(),
-                                    value: bytes,
-                                };
-                                let message: Bytes = postcard::to_stdvec(&op)?.into();
-                                // Gossip messages have a size cap; if the
-                                // value pushed the message over it, the entry
-                                // still rode the namespace topic and the
-                                // peers download the value as usual.
-                                if message.len() <= self.gossip.max_message_size() {
-                                    self.announce(namespace, AnnounceKind::Values, message);
+                        // The set API already held these bytes and carried
+                        // them on the event; only hash-only inserts (and
+                        // imports) need the blob-store read.
+                        let value = match value {
+                            Some(value) => Some(value),
+                            None => {
+                                match self.bao_store.blobs().get_bytes(entry.content_hash()).await {
+                                    Ok(bytes) => Some(bytes),
+                                    Err(err) => {
+                                        debug!(?err, "failed to read value for inline gossip");
+                                        None
+                                    }
                                 }
                             }
-                            Err(err) => debug!(?err, "failed to read value for inline gossip"),
+                        };
+                        if let Some(value) = value {
+                            let op = Op::PutValue {
+                                hash: entry.content_hash(),
+                                value,
+                            };
+                            let message: Bytes = postcard::to_stdvec(&op)?.into();
+                            // Gossip messages have a size cap; if the value
+                            // pushed the message over it, the entry still rode
+                            // the namespace topic and the peers download the
+                            // value as usual.
+                            if message.len() <= self.gossip.max_message_size() {
+                                self.announce(namespace, AnnounceKind::Values, message);
+                            }
                         }
                     }
                 }

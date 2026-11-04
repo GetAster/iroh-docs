@@ -74,6 +74,11 @@ pub struct Engine {
     #[debug("ContentStatusCallback")]
     content_status_cb: ContentStatusCallback,
     blob_store: iroh_blobs::api::Store,
+    /// Entries at or below this many bytes of content have their value
+    /// carried into [`crate::Event::LocalInsert`] by the set API, so the live
+    /// actor does not re-read the blob store to announce it. 0 disables the
+    /// feature, matching the live actor's inline-value threshold.
+    max_inline_value_size: usize,
     _gc_protect_task: AbortOnDropHandle<()>,
     /// Woken after each GC protect enumeration. The publish paths hold the
     /// temp tag of an imported blob until an enumeration has observed the
@@ -284,6 +289,7 @@ impl Engine {
             content_status_cb,
             default_author,
             blob_store: bao_store,
+            max_inline_value_size,
             _gc_protect_task: gc_protect_task,
             protect_notify,
             tag_hold,
@@ -293,6 +299,15 @@ impl Engine {
     /// Get the blob store.
     pub fn blob_store(&self) -> &Store {
         &self.blob_store
+    }
+
+    /// The inline-value threshold this engine runs with.
+    ///
+    /// The set API uses it to decide whether the entry's bytes, which it
+    /// already holds, ride the local-insert event to the live actor instead
+    /// of that actor re-reading the blob store.
+    pub fn max_inline_value_size(&self) -> usize {
+        self.max_inline_value_size
     }
 
     /// The notifier woken after each GC protect enumeration, or `None` when

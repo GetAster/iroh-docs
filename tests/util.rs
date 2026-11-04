@@ -58,11 +58,16 @@ impl Deref for Node {
 pub struct Client {
     blobs: iroh_blobs::api::Store,
     docs: iroh_docs::api::DocsApi,
+    sync: iroh_docs::actor::SyncHandle,
 }
 
 impl Client {
-    fn new(blobs: iroh_blobs::api::Store, docs: iroh_docs::api::DocsApi) -> Self {
-        Self { blobs, docs }
+    fn new(
+        blobs: iroh_blobs::api::Store,
+        docs: iroh_docs::api::DocsApi,
+        sync: iroh_docs::actor::SyncHandle,
+    ) -> Self {
+        Self { blobs, docs, sync }
     }
 
     pub fn blobs(&self) -> &iroh_blobs::api::Store {
@@ -71,6 +76,12 @@ impl Client {
 
     pub fn docs(&self) -> &iroh_docs::api::DocsApi {
         &self.docs
+    }
+
+    /// The raw sync handle, for inserting entries below the public set API
+    /// (e.g. carrying content bytes the blob store does not hold).
+    pub fn sync(&self) -> &iroh_docs::actor::SyncHandle {
+        &self.sync
     }
 }
 
@@ -138,7 +149,7 @@ impl Builder {
         // Build the router
         let router = router.spawn();
 
-        let client = Client::new(blobs.clone(), docs.api().clone());
+        let client = Client::new(blobs.clone(), docs.api().clone(), docs.sync().clone());
         Ok(Node {
             router,
             client,

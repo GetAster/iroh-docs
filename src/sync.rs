@@ -119,6 +119,15 @@ pub enum Event {
         namespace: NamespaceId,
         /// Inserted entry.
         entry: SignedEntry,
+        /// The entry's content bytes, when the caller held them and they are
+        /// at most the configured inline-value threshold.
+        ///
+        /// Carried so the live actor can announce the inline gossip value
+        /// without reading the blob store; `None` for hash-only inserts and
+        /// for content above the threshold, which the live actor resolves
+        /// with a store read.
+        #[debug(skip)]
+        value: Option<Bytes>,
     },
     /// A remote entry has been added.
     RemoteInsert {
@@ -525,6 +534,24 @@ where
         hash: Hash,
         len: u64,
     ) -> Result<usize, InsertError> {
+        self.insert_with_value(key, author, hash, len, None).await
+    }
+
+    /// Like [`Self::insert`], but also carries the content bytes the caller
+    /// already holds into the resulting [`Event::LocalInsert`].
+    ///
+    /// The caller must only pass bytes at or below the configured
+    /// inline-value threshold, so a large payload never rides the event; the
+    /// live actor still applies its own threshold and gossip-message-size
+    /// checks before announcing the value.
+    pub async fn insert_with_value(
+        &mut self,
+        key: impl AsRef<[u8]>,
+        author: &Author,
+        hash: Hash,
+        len: u64,
+        value: Option<Bytes>,
+    ) -> Result<usize, InsertError> {
         if len == 0 || hash == Hash::EMPTY {
             return Err(InsertError::EntryIsEmpty);
         }
@@ -534,7 +561,8 @@ where
         let entry = Entry::new(id, record);
         let secret = self.secret_key()?;
         let signed_entry = entry.sign(secret, author);
-        self.insert_entry(signed_entry, InsertOrigin::Local).await
+        self.insert_entry_with_value(signed_entry, InsertOrigin::Local, value)
+            .await
     }
 
     /// Delete entries that match the given `author` and key `prefix`.
@@ -552,7 +580,8 @@ where
         let id = RecordIdentifier::new(self.id(), author.id(), prefix);
         let entry = Entry::new(id, Record::empty(self.info.local_timestamp()?));
         let signed_entry = entry.sign(self.secret_key()?, author);
-        self.insert_entry(signed_entry, InsertOrigin::Local).await
+        self.insert_entry_with_value(signed_entry, InsertOrigin::Local, None)
+            .await
     }
 
     /// Insert an entry into this replica which was received from a remote peer.
@@ -574,16 +603,30 @@ where
             from: received_from,
             remote_content_status: content_status,
         };
-        self.insert_entry(entry, origin).await
+        self.insert_entry_with_value(entry, origin, None).await
     }
 
-    /// Insert a signed entry into the database.
+    /// Insert a signed local entry into the database.
     ///
     /// Returns the number of entries removed as a consequence of this insertion.
+    #[cfg(test)]
     async fn insert_entry(
         &mut self,
         entry: SignedEntry,
         origin: InsertOrigin,
+    ) -> Result<usize, InsertError> {
+        self.insert_entry_with_value(entry, origin, None).await
+    }
+
+    /// Insert a signed entry into the database, carrying the content bytes
+    /// when the caller already holds them.
+    ///
+    /// Returns the number of entries removed as a consequence of this insertion.
+    async fn insert_entry_with_value(
+        &mut self,
+        entry: SignedEntry,
+        origin: InsertOrigin,
+        value: Option<Bytes>,
     ) -> Result<usize, InsertError> {
         let namespace = self.id();
 
@@ -609,7 +652,11 @@ where
         };
 
         let insert_event = match origin {
-            InsertOrigin::Local => Event::LocalInsert { namespace, entry },
+            InsertOrigin::Local => Event::LocalInsert {
+                namespace,
+                entry,
+                value,
+            },
             InsertOrigin::Sync {
                 from,
                 remote_content_status,
@@ -2912,7 +2959,14 @@ mod tests {
         handle.import_namespace(capability).await?;
         handle.open(namespace.id(), Default::default()).await?;
         let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
+            .insert_local(
+                id,
+                author,
+                b"foo".to_vec().into(),
+                Hash::new(b"bar"),
+                3,
+                None,
+            )
             .await;
         assert!(res.is_err());
 
@@ -2920,19 +2974,40 @@ mod tests {
         let capability = Capability::Write(namespace.clone());
         handle.import_namespace(capability).await?;
         let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
+            .insert_local(
+                id,
+                author,
+                b"foo".to_vec().into(),
+                Hash::new(b"bar"),
+                3,
+                None,
+            )
             .await;
         assert!(res.is_ok());
 
         // close and reopen - must still succeed
         handle.close(namespace.id()).await?;
         let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
+            .insert_local(
+                id,
+                author,
+                b"foo".to_vec().into(),
+                Hash::new(b"bar"),
+                3,
+                None,
+            )
             .await;
         assert!(res.is_err());
         handle.open(namespace.id(), Default::default()).await?;
         let res = handle
-            .insert_local(id, author, b"foo".to_vec().into(), Hash::new(b"bar"), 3)
+            .insert_local(
+                id,
+                author,
+                b"foo".to_vec().into(),
+                Hash::new(b"bar"),
+                3,
+                None,
+            )
             .await;
         assert!(res.is_ok());
         Ok(())

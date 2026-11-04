@@ -149,6 +149,10 @@ enum ReplicaAction {
         key: Bytes,
         hash: Hash,
         len: u64,
+        /// The content bytes, when the set API held them and they are within
+        /// the inline-value threshold; see [`Event::LocalInsert`].
+        #[debug(skip)]
+        value: Option<Bytes>,
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
     },
@@ -482,6 +486,7 @@ impl SyncHandle {
         key: Bytes,
         hash: Hash,
         len: u64,
+        value: Option<Bytes>,
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::InsertLocal {
@@ -489,6 +494,7 @@ impl SyncHandle {
             key,
             hash,
             len,
+            value,
             reply,
         };
         self.send_replica(namespace, action).await?;
@@ -1246,12 +1252,15 @@ impl Actor {
                 key,
                 hash,
                 len,
+                value,
                 reply,
             } => {
                 send_reply_with_async(reply, self, async move |this| {
                     let author = get_author(&mut this.store, &author)?;
                     let mut replica = this.states.replica(namespace, &mut this.store)?;
-                    replica.insert(&key, &author, hash, len).await?;
+                    replica
+                        .insert_with_value(&key, &author, hash, len, value)
+                        .await?;
                     this.metrics.new_entries_local.inc();
                     this.metrics.new_entries_local_size.inc_by(len);
                     Ok(())
