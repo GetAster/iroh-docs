@@ -567,13 +567,22 @@ impl Store {
             return Err(anyhow!("replica is not closed"));
         }
         self.modify(|tables| {
+            let ns = namespace.as_bytes();
+            // The key table's range is (ns, key, author); no contiguous
+            // range covers a whole namespace, so remove per record row,
+            // before the records go.
+            let bounds = RecordsBounds::namespace(*namespace);
+            for row in tables.records.range(bounds.as_ref())? {
+                let (compound_key, _value) = row?;
+                let (_, author, key) = compound_key.value();
+                tables.records_by_seq_key.remove((ns, key, author))?;
+            }
             let bounds = RecordsBounds::namespace(*namespace);
             tables.records.retain_in(bounds.as_ref(), |_k, _v| false)?;
             let bounds = ByKeyBounds::namespace(*namespace);
             let _ = tables
                 .records_by_key
                 .retain_in(bounds.as_ref(), |_k, _v| false);
-            let ns = namespace.as_bytes();
             tables.namespaces.remove(ns)?;
             tables.namespace_peers.remove_all(ns)?;
             tables.download_policy.remove(ns)?;
@@ -583,14 +592,6 @@ impl Store {
             let _ = tables
                 .records_by_seq
                 .retain_in((ns, 0u64)..=(ns, u64::MAX), |_k, _v| false);
-            // The key table's range is (ns, key, author); no contiguous
-            // range covers a whole namespace, so remove per row.
-            let bounds = RecordsBounds::namespace(*namespace);
-            for row in tables.records.range(bounds.as_ref())? {
-                let (compound_key, _value) = row?;
-                let (_, author, key) = compound_key.value();
-                tables.records_by_seq_key.remove((ns, key, author))?;
-            }
             Ok(())
         })
     }
@@ -988,14 +989,29 @@ impl StoreInstance<'_> {
     /// sequence. A key touched several times appears once, with its latest
     /// touch and latest record, so a consumer tracking the last seen
     /// sequence converges on the current state. Tombstones replay as empty
-    /// records; a key whose put was superseded by a later remove is
-    /// naturally absent from the records table and is skipped.
+    /// records; a key whose record was removed (superseded by a prefix
+    /// delete) is skipped.
     ///
     /// `limit` bounds the returned page: at most `limit` pairs, or the
     /// whole tail when `limit` is 0. A paging consumer passes the last
-    /// received touch as the next `seq`.
+    /// received touch as the next `seq`. A page reads O(`limit`) index
+    /// rows: the touch index keeps one row per key, so the walk stops
+    /// once the page is full. Rows written by 0.101.1018, before the key
+    /// index existed, are not compacted: such a key is reported once per
+    /// page, at its earliest touch in that page, and may reappear on a
+    /// later page at a later touch.
     pub fn entries_since(&mut self, seq: u64, limit: usize) -> Result<Vec<(u64, SignedEntry)>> {
-        use std::collections::BTreeMap;
+        Ok(self.entries_since_scanned(seq, limit)?.0)
+    }
+
+    /// [`Self::entries_since`], also returning how many touch-index rows
+    /// the page read.
+    fn entries_since_scanned(
+        &mut self,
+        seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<(u64, SignedEntry)>, usize)> {
+        use std::collections::HashSet;
         self.ensure_sequence_index()?;
         // Through the open transaction: no commit for a read.
         let tables = self.store.as_mut().tables()?;
@@ -1003,23 +1019,34 @@ impl StoreInstance<'_> {
         let start = (ns, seq.saturating_add(1));
         let end = (ns, u64::MAX);
         let index = tables.records_by_seq.range(start..=end)?;
-        let mut latest: BTreeMap<(Vec<u8>, Vec<u8>), (u64, SignedEntry)> = BTreeMap::new();
+        let mut out = Vec::new();
+        let mut seen: HashSet<(Vec<u8>, Vec<u8>)> = HashSet::new();
+        let mut scanned = 0usize;
         for row in index {
+            if limit > 0 && out.len() >= limit {
+                break;
+            }
+            scanned += 1;
             let (compound_key, target) = row?;
             let (_, touch) = compound_key.value();
             let (author, key) = target.value();
+            // A row the key index has moved past is a superseded touch
+            // left by a pre-compaction store: the key's latest row is
+            // later in the walk.
+            if let Some(latest) = tables.records_by_seq_key.get((ns, key, author))? {
+                if latest.value() != touch {
+                    continue;
+                }
+            }
+            if !seen.insert((author.to_vec(), key.to_vec())) {
+                continue;
+            }
             let id = (ns, author, key);
             if let Some(record) = tables.records.get(id)? {
-                let entry = into_entry(id, record.value());
-                latest.insert((author.to_vec(), key.to_vec()), (touch, entry));
+                out.push((touch, into_entry(id, record.value())));
             }
         }
-        let mut out: Vec<_> = latest.into_values().collect();
-        out.sort_by_key(|(touch, _)| *touch);
-        if limit > 0 {
-            out.truncate(limit);
-        }
-        Ok(out)
+        Ok((out, scanned))
     }
 }
 
@@ -1279,7 +1306,17 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 tables.records_by_key.remove(id)?;
                 let id = (namespace, author, key);
                 let value = tables.records.remove(id)?;
-                value.map(|value| into_entry(id, value.value()))
+                let entry = value.map(|value| into_entry(id, value.value()));
+                if entry.is_some() {
+                    remove_touch(
+                        &mut tables.records_by_seq,
+                        &mut tables.records_by_seq_key,
+                        namespace,
+                        author,
+                        key,
+                    )?;
+                }
+                entry
             };
             // Keep the maintained aggregate equal to a scan of the records
             // table: XOR the removed row out. A missing row means the
@@ -1361,6 +1398,13 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 let (ns, author, key) = compound_key.value();
                 let (timestamp, _sig_ns, _sig_author, _len, hash) = value.value();
                 removed_fp ^= crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
+                remove_touch(
+                    &mut tables.records_by_seq,
+                    &mut tables.records_by_seq_key,
+                    ns,
+                    author,
+                    key,
+                )?;
                 count += 1;
             }
             if count > 0 {
@@ -1378,6 +1422,26 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             Ok(count)
         })
     }
+}
+
+/// Drop a removed record's touch rows, so the sequence index holds rows
+/// only for live records and a page never walks dead ones.
+fn remove_touch(
+    records_by_seq: &mut redb::Table<
+        '_,
+        tables::RecordsBySeqKey<'static>,
+        tables::RecordsBySeqValue<'static>,
+    >,
+    records_by_seq_key: &mut redb::Table<'_, tables::RecordsByKeyId<'static>, u64>,
+    ns: &[u8; 32],
+    author: &[u8; 32],
+    key: &[u8],
+) -> Result<()> {
+    if let Some(touch) = records_by_seq_key.remove((ns, key, author))? {
+        let touch = touch.value();
+        records_by_seq.remove((ns, touch))?;
+    }
+    Ok(())
 }
 
 fn chain_none<'a, I: Iterator<Item = T> + 'a, T>(
@@ -2529,11 +2593,157 @@ mod tests {
             assert_eq!(wrapper.namespace_sequence()?, 1);
         }
         store.remove_replica(&id)?;
+        assert_eq!(
+            store.tables()?.records_by_seq_key.iter()?.count(),
+            0,
+            "the key index goes with the replica"
+        );
         let _replica = store.new_replica(namespace.clone())?;
         store.close_replica(id);
         let mut wrapper = StoreInstance::new(id, &mut store);
         assert_eq!(wrapper.namespace_sequence()?, 0);
         assert!(wrapper.entries_since(0, 0)?.is_empty());
+        Ok(())
+    }
+
+    /// Write `records` keys, re-touch some of them, then page from a cursor
+    /// `tail` records behind: the page reads exactly `limit` index rows,
+    /// however long the tail.
+    fn assert_page_reads_limit_rows(records: usize, tail: usize, limit: usize) -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+
+        wrapper.put(fixed_entry(&namespace, &author, "k/0000000", b"v", 1))?;
+        assert_eq!(wrapper.namespace_sequence()?, 1);
+        for i in 1..records {
+            let key = format!("k/{i:07}");
+            wrapper.put(fixed_entry(&namespace, &author, &key, b"v", i as u64 + 1))?;
+        }
+        // Re-touch a spread of keys inside the tail: compaction must keep
+        // their superseded rows out of the walk.
+        let first_tail = records - tail;
+        for i in (first_tail..records).step_by(97) {
+            let key = format!("k/{i:07}");
+            let ts = (records + i) as u64 + 1;
+            wrapper.put(fixed_entry(&namespace, &author, &key, b"w", ts))?;
+        }
+        let cursor = first_tail as u64;
+        let (page, scanned) = wrapper.entries_since_scanned(cursor, limit)?;
+        assert_eq!(page.len(), limit);
+        assert_eq!(scanned, limit, "a page reads O(limit) index rows");
+        assert!(page.windows(2).all(|w| w[0].0 < w[1].0), "ordered by touch");
+        assert!(page[0].0 > cursor);
+        Ok(())
+    }
+
+    #[test]
+    fn entries_since_page_reads_limit_rows() -> Result<()> {
+        assert_page_reads_limit_rows(20_000, 18_000, 256)
+    }
+
+    /// The acceptance size from the portal 1M-file cell. Slow in debug:
+    /// `cargo test --release -- --ignored entries_since_page_reads_limit_rows_1m`.
+    #[test]
+    #[ignore]
+    fn entries_since_page_reads_limit_rows_1m() -> Result<()> {
+        assert_page_reads_limit_rows(1_000_000, 900_000, 256)
+    }
+
+    /// A prefix delete removes the deleted keys' touch rows with their
+    /// records, so neither index keeps rows for dead records.
+    #[test]
+    fn prefix_delete_drops_touch_rows() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+
+        wrapper.put(fixed_entry(&namespace, &author, "dir/x", b"x", 1))?;
+        assert_eq!(wrapper.namespace_sequence()?, 1);
+        wrapper.put(fixed_entry(&namespace, &author, "dir/y", b"y", 2))?;
+        wrapper.put(fixed_entry(&namespace, &author, "other", b"o", 3))?;
+        // A later put of the prefix supersedes both children.
+        wrapper.put(fixed_entry(&namespace, &author, "dir", b"d", 4))?;
+
+        let (by_seq, by_seq_key) = {
+            let tables = wrapper.store.as_mut().tables()?;
+            let ns_id = namespace.id();
+            let ns = ns_id.as_bytes();
+            let by_seq = tables
+                .records_by_seq
+                .range((ns, 0u64)..=(ns, u64::MAX))?
+                .count();
+            let by_seq_key = tables.records_by_seq_key.iter()?.count();
+            (by_seq, by_seq_key)
+        };
+        assert_eq!(by_seq, 2, "only live records keep touch rows");
+        assert_eq!(by_seq_key, 2);
+        let (replay, scanned) = wrapper.entries_since_scanned(0, 0)?;
+        let keys: Vec<_> = replay.iter().map(|(_, e)| e.key().to_vec()).collect();
+        assert_eq!(keys, vec![b"other".to_vec(), b"dir".to_vec()]);
+        assert_eq!(scanned, 2);
+        Ok(())
+    }
+
+    /// Rows from a 0.101.1018 store (no key index, duplicate touches) still
+    /// replay every live key: once per page, possibly again on a later page.
+    #[test]
+    fn entries_since_tolerates_uncompacted_rows() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+
+        wrapper.put(fixed_entry(&namespace, &author, "a", b"v0", 1))?;
+        wrapper.put(fixed_entry(&namespace, &author, "b", b"v0", 2))?;
+        assert_eq!(wrapper.namespace_sequence()?, 2);
+        wrapper.put(fixed_entry(&namespace, &author, "a", b"v1", 3))?;
+        let a_touch = wrapper.namespace_sequence()?;
+        // Recreate the 0.101.1018 shape for "a": its superseded touch row
+        // is back and the key index has no row for it.
+        let ns_id = namespace.id();
+        let ns = *ns_id.as_bytes();
+        let author_bytes = author.id().to_bytes();
+        wrapper.store.as_mut().modify(|tables| {
+            tables
+                .records_by_seq_key
+                .remove((&ns, b"a".as_slice(), &author_bytes))?;
+            tables
+                .records_by_seq
+                .insert((&ns, 0u64), (&author_bytes, b"a".as_slice()))?;
+            Ok(())
+        })?;
+
+        // Whole tail: each key once.
+        let replay = wrapper.entries_since(0, 0)?;
+        let keys: Vec<_> = replay.iter().map(|(_, e)| e.key().to_vec()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&b"a".to_vec()) && keys.contains(&b"b".to_vec()));
+        // Paged from before the stray row: "a" first at its stray touch,
+        // again at its live touch on a later page, with the latest record.
+        let mut cursor = 0u64;
+        let mut seen = Vec::new();
+        loop {
+            let page = wrapper.entries_since(cursor, 1)?;
+            let Some((touch, entry)) = page.into_iter().next() else {
+                break;
+            };
+            seen.push((touch, entry.key().to_vec(), entry.content_len()));
+            cursor = touch;
+        }
+        assert!(seen.contains(&(a_touch, b"a".to_vec(), 2)));
+        assert!(seen.iter().any(|(_, k, _)| k == b"b"));
         Ok(())
     }
 }
