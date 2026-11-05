@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1022` |
-| Pinned commit | `5536fe8bdcc3bde580cb529e052a27b311ee6f80` |
-| Crate version | 0.101.1022 (workspace spec `iroh-docs = "0.101.1022"`) |
+| Tag | `aster-iroh-docs-v0.101.1023` |
+| Pinned commit | `c8fb2f074c2462bf34b1d1f6af519830a14b33c9` |
+| Crate version | 0.101.1023 (workspace spec `iroh-docs = "0.101.1023"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins ir
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "7fff16b9abb27d5fe1ba6f61d16ddc496e31a817" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "c8fb2f074c2462bf34b1d1f6af519830a14b33c9" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -85,6 +85,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 63 | none recorded | Rebuilds the namespace fingerprint from the records table once per replica open: `StoreInstance::rebuild_namespace_fingerprint` scans and overwrites the stored aggregate, wired through `Store::load_replica_info` — the single chokepoint both the docs actor's open callback and `open_replica` go through. A rebuild failure fails the open. Files: `src/store/fs.rs`. | Review ask on 0.101.1020: the aggregate is now authoritative for convergence, and a release build has no scan comparison, so silent divergence would be served indefinitely. One O(N) scan per open replaces the per-session scans the fast path removed and bounds any divergence to one process lifetime. | `4902348`; released in 0.101.1021 | carried | Aster's own. Idempotent (same value rebuilt); a write transaction per open is the cost. Test: corrupt the stored row, assert the O(1) read serves the corruption, then `open_replica` heals it and the healed value survives the next store open. Peer-review note: the open-time scan runs on the docs actor thread (~one blake3 per record); measured once on a 1M-record namespace - p50 322 ms over five opens (276-350 ms), release build on the dev Mac. |
 | 64 | none recorded | `insert_with_value` debug-asserts that carried inline value bytes hash to the entry hash and match `len`, and `Event::LocalInsert` documents that every replica-event subscriber — not only the live actor — sees the carried value. Files: `src/sync.rs`. | Review minor on 0.101.1020: the live actor announces the carried bytes as that hash's content, so a mismatch would announce a value every receiver rejects while the blob store holds different bytes under the same hash. Production callers derive the hash from the same bytes, so this is an internal-consistency check. | `833cd6f`; released in 0.101.1021 | carried | Aster's own. Debug-build check only; exercised by the existing `tests/inline_values.rs` suite. |
 | 65 | none recorded | Moves the fingerprint rebuild in `load_replica_info` ahead of registering the replica open: the id enters `open_replicas` only after `rebuild_namespace_fingerprint` succeeds, so a failed rebuild leaves the namespace fully closed (removable, retirable) instead of half-open until restart. Files: `src/store/fs.rs`. | Peer-review nit on 0.101.1021: the rebuild was the only fallible step after the tables read, and registering open first made its failure mode a half-open namespace - `remove_replica` and `retire_write_authority` refuse open namespaces. | `c6b0732`; released in 0.101.1022 | carried | Aster's own. No behavior change on the success path; the 0.101.1021 rebuild test is unchanged. Full local suite green (130 lib + 57 integration + doc), fmt and clippy `--all-features --all-targets -D warnings` clean. |
+| 66 | none recorded | `entries_since` stops walking the touch index once the page holds `limit` entries, so a page reads O(`limit`) rows instead of the whole tail; rows left by 0.101.1018 (no key index) are skipped when the key index points past them and deduped within a page, so such a key may reappear on a later page. Removing a record (`remove_prefix_filtered`, `entry_remove`) drops its touch rows, and `remove_replica` clears the key index before the records it reads (it iterated the already-cleared records table and leaked every key-index row). Files: `src/store/fs.rs`. | portal-sync V0b 1M-file cell (Aster 0.3.1861): the docs actor thread was bound at 80-99% of a core; each 256-key page from a receiver 900k behind read ~900k index rows and ~900k records, so catch-up was quadratic. Same code since 0.101.1018. | `d13a4ec`; released in 0.101.1023 | carried | Aster's own. Acceptance: a 256-entry page from a 900k tail of 1M records reads exactly 256 index rows (`entries_since_page_reads_limit_rows_1m`, ignored, release build, 41 s); new tests for prefix-delete cleanup, uncompacted rows and the replica-removal key index. Full local suite green (133 lib + 57 integration + doc), fmt and clippy `--all-features --all-targets -D warnings` clean. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -182,7 +183,24 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1022 (2026-11-04), current
+### 0.101.1023 (2026-11-05), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1023` | `c8fb2f074c2462bf34b1d1f6af519830a14b33c9` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-05, 0.101.1023** (`c8fb2f0`, tag `aster-iroh-docs-v0.101.1023`, option E,
+  `n = 23`): portal-sync's §J ask. Row 66 (`d13a4ec`): `entries_since` pages
+  in O(`limit`) index rows; removed records drop their touch rows;
+  `remove_replica` no longer leaks key-index rows. Validation at the pinned
+  commit: full local suite green (133 lib + 57 integration + doc), fmt and
+  clippy clean, 1M-record acceptance test green in release. Aster consumer
+  trial: pin bump in `aster-rpc-internal` main as `07ed85b6`, with
+  `get_exact_entry` and by-key queries (`6191e833`, `af121f65`); core,
+  facade and FFI suites (nextest), Python, and Go/.NET/Java/TS docs tests
+  green locally.
+
+### 0.101.1022 (2026-11-04)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
