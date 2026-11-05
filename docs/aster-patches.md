@@ -195,7 +195,9 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
   restart. Row 63 gained the measured open-scan cost note (1M records,
   p50 322 ms). Validation at the pinned commit: full local suite green
   (130 lib + 57 integration + doc), fmt and clippy `--all-features
-  --all-targets -D warnings` clean.
+  --all-targets -D warnings` clean. Aster consumer trial: pin bump in
+  `aster-rpc-internal` main as `7fc2132c`, released as Aster v0.3.1866
+  (`b0a93cab`). Candidate run 595 green (core suites included).
 
 ### 0.101.1021 (2026-11-04)
 
