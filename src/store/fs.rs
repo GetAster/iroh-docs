@@ -89,6 +89,31 @@ enum CurrentTransaction {
     Write(TransactionAndTables),
 }
 
+/// The largest [`Store::get_many`] result collected from an open write
+/// transaction; a larger one commits and streams from a snapshot.
+pub const COLLECTED_QUERY_LIMIT: usize = 4096;
+
+/// The entries of a [`Store::get_many`] query.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum QueryResults {
+    /// Collected from the open write transaction.
+    Collected(std::vec::IntoIter<SignedEntry>),
+    /// Streamed from a read snapshot.
+    Snapshot(QueryIterator<'static>),
+}
+
+impl Iterator for QueryResults {
+    type Item = Result<SignedEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            QueryResults::Collected(entries) => entries.next().map(Ok),
+            QueryResults::Snapshot(entries) => entries.next(),
+        }
+    }
+}
+
 #[cfg(feature = "fs-store")]
 fn open_database(path: &std::path::Path) -> Result<Database> {
     match Database::create(path) {
@@ -599,13 +624,49 @@ impl Store {
     }
 
     /// Get an iterator over entries of a replica.
+    ///
+    /// Reading never commits a write transaction on its own: with one open,
+    /// a result of up to [`COLLECTED_QUERY_LIMIT`] entries is collected from
+    /// its tables, which include the uncommitted writes. Only a larger result
+    /// commits, so that it can stream from a read snapshot.
     pub fn get_many(
         &mut self,
         namespace: NamespaceId,
         query: impl Into<Query>,
-    ) -> Result<QueryIterator> {
+    ) -> Result<QueryResults> {
+        let query = query.into();
+        if matches!(self.transaction, CurrentTransaction::Write(_)) {
+            let mut entries = QueryIterator::borrowed(self.tables()?, namespace, query.clone())?;
+            let mut collected = Vec::new();
+            loop {
+                match entries.next() {
+                    None => return Ok(QueryResults::Collected(collected.into_iter())),
+                    Some(entry) => collected.push(entry?),
+                }
+                if collected.len() > COLLECTED_QUERY_LIMIT {
+                    break;
+                }
+            }
+        }
         let tables = self.snapshot_owned()?;
-        QueryIterator::new(tables, namespace, query.into())
+        Ok(QueryResults::Snapshot(QueryIterator::new(
+            tables, namespace, query,
+        )?))
+    }
+
+    /// Get all entries of a replica matching `query`.
+    ///
+    /// Reads the open write transaction when there is one, and never commits it.
+    pub fn get_many_vec(
+        &mut self,
+        namespace: NamespaceId,
+        query: impl Into<Query>,
+    ) -> Result<Vec<SignedEntry>> {
+        let query = query.into();
+        if matches!(self.transaction, CurrentTransaction::Write(_)) {
+            return QueryIterator::borrowed(self.tables()?, namespace, query)?.collect();
+        }
+        QueryIterator::new(self.snapshot_owned()?, namespace, query)?.collect()
     }
 
     /// Get an entry by key and author.
@@ -626,6 +687,9 @@ impl Store {
     }
 
     /// Get all content hashes of all replicas in the store.
+    ///
+    /// Commits an open write transaction: the iterator streams the whole store
+    /// from a read snapshot. Its one caller is the blobs GC's protect pass.
     pub fn content_hashes(&mut self) -> Result<ContentHashesIterator> {
         let tables = self.snapshot_owned()?;
         ContentHashesIterator::all(&tables.records)
@@ -1943,6 +2007,64 @@ mod tests {
             // clamped away either.
             assert_eq!(returned, vec![ours.id()], "{label} range");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_many_does_not_commit() -> Result<()> {
+        use super::tables::RECORDS_TABLE;
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        store.flush()?;
+
+        let put = |store: &mut Store, range: std::ops::Range<usize>| -> Result<()> {
+            let mut wrapper = StoreInstance::new(namespace.id(), store);
+            for i in range {
+                let id = RecordIdentifier::new(namespace.id(), author.id(), format!("k-{i:05}"));
+                let entry = Entry::new(id, Record::current_from_data(format!("v-{i}")));
+                wrapper.entry_put(SignedEntry::from_entry(entry, &namespace, &author))?;
+            }
+            Ok(())
+        };
+        let committed = |store: &Store| -> Result<u64> {
+            let tx = store.db.begin_read()?;
+            Ok(redb::ReadableTableMetadata::len(
+                &tx.open_table(RECORDS_TABLE)?,
+            )?)
+        };
+
+        put(&mut store, 0..3)?;
+        assert!(matches!(store.transaction, CurrentTransaction::Write(_)));
+        let queries = [
+            Query::all().build(),
+            Query::author(author.id()).build(),
+            Query::key_exact("k-00001").build(),
+            Query::key_prefix("k-").build(),
+            Query::single_latest_per_key().build(),
+        ];
+        for query in queries {
+            let all = store
+                .get_many(namespace.id(), query.clone())?
+                .collect::<Result<Vec<_>>>()?;
+            let vec = store.get_many_vec(namespace.id(), query.clone())?;
+            assert_eq!(all, vec, "{query:?}");
+            assert!(!all.is_empty(), "{query:?} sees the uncommitted writes");
+        }
+        assert!(
+            matches!(store.transaction, CurrentTransaction::Write(_)),
+            "a query must not commit the open write transaction"
+        );
+        assert_eq!(committed(&store)?, 0, "nothing was committed by the reads");
+
+        // A result larger than the collected limit commits and streams.
+        put(&mut store, 3..COLLECTED_QUERY_LIMIT + 2)?;
+        let count = store.get_many(namespace.id(), Query::all())?.count();
+        assert_eq!(count, COLLECTED_QUERY_LIMIT + 2);
+        assert_eq!(committed(&store)?, (COLLECTED_QUERY_LIMIT + 2) as u64);
         Ok(())
     }
 

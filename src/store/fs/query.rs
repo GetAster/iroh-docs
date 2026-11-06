@@ -1,9 +1,11 @@
 use anyhow::Result;
 use iroh_blobs::Hash;
+use redb::{ReadOnlyTable, Table};
 
 use super::{
     bounds::{ByKeyBounds, RecordsBounds},
-    ranges::{RecordsByKeyRange, RecordsRange},
+    ranges::{RecordsByKeyRange, RecordsLookup, RecordsRange},
+    tables::{RecordsId, Tables},
     RecordsValue,
 };
 use crate::{
@@ -16,9 +18,12 @@ use crate::{
 };
 
 /// A query iterator for entry queries.
+///
+/// Reads either a read snapshot it owns, or the open write transaction's
+/// tables it borrows; the records table type `R` says which.
 #[derive(Debug)]
-pub struct QueryIterator {
-    range: QueryRange,
+pub struct QueryIterator<'a, R = ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>> {
+    range: QueryRange<'a, R>,
     query: Query,
     offset: u64,
     count: u64,
@@ -26,24 +31,37 @@ pub struct QueryIterator {
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-enum QueryRange {
+enum QueryRange<'a, R> {
     AuthorKey {
-        range: RecordsRange<'static>,
+        range: RecordsRange<'a>,
         key_filter: KeyFilter,
     },
     KeyAuthor {
-        range: RecordsByKeyRange,
+        range: RecordsByKeyRange<'a, R>,
         author_filter: AuthorFilter,
         selector: Option<LatestPerKeySelector>,
     },
 }
 
-impl QueryIterator {
-    pub fn new(tables: ReadOnlyTables, namespace: NamespaceId, query: Query) -> Result<Self> {
-        let index_kind = IndexKind::from(&query);
-        let range = match index_kind {
+/// Which index a query reads, with its bounds and residual filters.
+#[allow(clippy::large_enum_variant)]
+enum Plan {
+    AuthorKey {
+        bounds: RecordsBounds,
+        key_filter: KeyFilter,
+    },
+    KeyAuthor {
+        bounds: ByKeyBounds,
+        author_filter: AuthorFilter,
+        selector: Option<LatestPerKeySelector>,
+    },
+}
+
+impl Plan {
+    fn new(namespace: NamespaceId, query: &Query) -> Self {
+        match IndexKind::from(query) {
             IndexKind::AuthorKey { range, key_filter } => {
-                let (bounds, filter) = match range {
+                let (bounds, key_filter) = match range {
                     // single author: both author and key are selected via the range. therefore
                     // set `filter` to `Any`.
                     AuthorFilter::Exact(author) => (
@@ -53,39 +71,86 @@ impl QueryIterator {
                     // no author set => full table scan with the provided key filter
                     AuthorFilter::Any => (RecordsBounds::namespace(namespace), key_filter),
                 };
-                let range = RecordsRange::with_bounds_static(&tables.records, bounds)?;
-                QueryRange::AuthorKey {
-                    range,
-                    key_filter: filter,
-                }
+                Plan::AuthorKey { bounds, key_filter }
             }
             IndexKind::KeyAuthor {
                 range,
                 author_filter,
                 latest_per_key,
-            } => {
-                let bounds = ByKeyBounds::new(namespace, &range);
-                let range =
-                    RecordsByKeyRange::with_bounds(tables.records_by_key, tables.records, bounds)?;
-                let selector = latest_per_key.then(LatestPerKeySelector::default);
-                QueryRange::KeyAuthor {
-                    author_filter,
-                    range,
-                    selector,
-                }
-            }
-        };
+            } => Plan::KeyAuthor {
+                bounds: ByKeyBounds::new(namespace, &range),
+                author_filter,
+                selector: latest_per_key.then(LatestPerKeySelector::default),
+            },
+        }
+    }
+}
 
-        Ok(Self {
+impl QueryIterator<'static> {
+    /// A query over an owned read snapshot.
+    pub fn new(tables: ReadOnlyTables, namespace: NamespaceId, query: Query) -> Result<Self> {
+        let range = match Plan::new(namespace, &query) {
+            Plan::AuthorKey { bounds, key_filter } => QueryRange::AuthorKey {
+                range: RecordsRange::with_bounds_static(&tables.records, bounds)?,
+                key_filter,
+            },
+            Plan::KeyAuthor {
+                bounds,
+                author_filter,
+                selector,
+            } => QueryRange::KeyAuthor {
+                range: RecordsByKeyRange::with_bounds_static(
+                    tables.records_by_key,
+                    tables.records,
+                    bounds,
+                )?,
+                author_filter,
+                selector,
+            },
+        };
+        Ok(Self::with_range(range, query))
+    }
+}
+
+impl<'a, 'tx> QueryIterator<'a, &'a Table<'tx, RecordsId<'static>, RecordsValue<'static>>> {
+    /// A query over the open write transaction's tables, which sees its
+    /// uncommitted writes.
+    pub fn borrowed(tables: &'a Tables<'tx>, namespace: NamespaceId, query: Query) -> Result<Self> {
+        let range = match Plan::new(namespace, &query) {
+            Plan::AuthorKey { bounds, key_filter } => QueryRange::AuthorKey {
+                range: RecordsRange::with_bounds(&tables.records, bounds)?,
+                key_filter,
+            },
+            Plan::KeyAuthor {
+                bounds,
+                author_filter,
+                selector,
+            } => QueryRange::KeyAuthor {
+                range: RecordsByKeyRange::with_bounds(
+                    &tables.records_by_key,
+                    &tables.records,
+                    bounds,
+                )?,
+                author_filter,
+                selector,
+            },
+        };
+        Ok(Self::with_range(range, query))
+    }
+}
+
+impl<'a, R> QueryIterator<'a, R> {
+    fn with_range(range: QueryRange<'a, R>, query: Query) -> Self {
+        Self {
             range,
             query,
             offset: 0,
             count: 0,
-        })
+        }
     }
 }
 
-impl Iterator for QueryIterator {
+impl<R: RecordsLookup> Iterator for QueryIterator<'_, R> {
     type Item = Result<SignedEntry>;
 
     fn next(&mut self) -> Option<Result<SignedEntry>> {

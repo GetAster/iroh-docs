@@ -1404,9 +1404,7 @@ impl Actor {
             ReplicaAction::GetManyVec { query, reply } => {
                 send_reply_with(reply, self, move |this| {
                     this.states.ensure_open(&namespace)?;
-                    this.store
-                        .get_many(namespace, query)?
-                        .collect::<Result<Vec<_>>>()
+                    this.store.get_many_vec(namespace, query)
                 })
             }
             ReplicaAction::DropReplica { reply } => send_reply_with(reply, self, |this| {

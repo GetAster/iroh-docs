@@ -1,6 +1,6 @@
 //! Ranges and helpers for working with [`redb`] tables
 
-use redb::{Key, Range, ReadOnlyTable, ReadableTable, Value};
+use redb::{Key, Range, ReadOnlyTable, ReadableTable, Table, Value};
 
 use super::{
     bounds::{ByKeyBounds, RecordsBounds},
@@ -121,17 +121,52 @@ impl Iterator for RecordsRange<'_> {
     }
 }
 
-#[derive(derive_more::Debug)]
-#[debug("RecordsByKeyRange")]
-pub struct RecordsByKeyRange {
-    records_table: ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>,
-    by_key_range: Range<'static, RecordsByKeyId<'static>, ()>,
+/// Point lookups into the records table, from a read snapshot or from the
+/// open write transaction.
+pub trait RecordsLookup {
+    /// The entry stored under `id`, if any.
+    fn lookup(&self, id: &RecordsId<'_>) -> anyhow::Result<Option<SignedEntry>>;
 }
 
-impl RecordsByKeyRange {
-    pub fn with_bounds(
+impl RecordsLookup for ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>> {
+    fn lookup(&self, id: &RecordsId<'_>) -> anyhow::Result<Option<SignedEntry>> {
+        Ok(self.get(id)?.map(|value| into_entry(*id, value.value())))
+    }
+}
+
+impl RecordsLookup for &Table<'_, RecordsId<'static>, RecordsValue<'static>> {
+    fn lookup(&self, id: &RecordsId<'_>) -> anyhow::Result<Option<SignedEntry>> {
+        Ok(self.get(id)?.map(|value| into_entry(*id, value.value())))
+    }
+}
+
+/// An iterator over a range of the by-key index, resolving each row in the
+/// records table `R`.
+#[derive(derive_more::Debug)]
+#[debug("RecordsByKeyRange")]
+pub struct RecordsByKeyRange<'a, R = ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>> {
+    records_table: R,
+    by_key_range: Range<'a, RecordsByKeyId<'static>, ()>,
+}
+
+impl RecordsByKeyRange<'static> {
+    pub fn with_bounds_static(
         records_by_key_table: ReadOnlyTable<RecordsByKeyId<'static>, ()>,
         records_table: ReadOnlyTable<RecordsId<'static>, RecordsValue<'static>>,
+        bounds: ByKeyBounds,
+    ) -> anyhow::Result<Self> {
+        let by_key_range = records_by_key_table.range(bounds.as_ref())?;
+        Ok(Self {
+            records_table,
+            by_key_range,
+        })
+    }
+}
+
+impl<'a, R: RecordsLookup> RecordsByKeyRange<'a, R> {
+    pub fn with_bounds(
+        records_by_key_table: &'a impl ReadableTable<RecordsByKeyId<'static>, ()>,
+        records_table: R,
         bounds: ByKeyBounds,
     ) -> anyhow::Result<Self> {
         let by_key_range = records_by_key_table.range(bounds.as_ref())?;
@@ -149,18 +184,13 @@ impl RecordsByKeyRange {
         direction: &SortDirection,
         filter: impl for<'x> Fn(RecordsByKeyId<'x>) -> bool,
     ) -> Option<anyhow::Result<SignedEntry>> {
-        let entry = self.by_key_range.next_try_filter_map(direction, |k, _v| {
+        self.by_key_range.next_try_filter_map(direction, |k, _v| {
             if !filter(k) {
                 return None;
             };
             let (namespace, key, author) = k;
             let records_id = (namespace, author, key);
-            let entry = self.records_table.get(&records_id).transpose()?;
-            let entry = entry
-                .map(|value| into_entry(records_id, value.value()))
-                .map_err(anyhow::Error::from);
-            Some(entry)
-        });
-        entry
+            self.records_table.lookup(&records_id).transpose()
+        })
     }
 }
