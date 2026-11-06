@@ -1197,7 +1197,9 @@ impl LiveActor {
 
         let result_for_event = match &result {
             Ok(details) => Ok(details.into()),
-            Err(err) => Err(err.to_string()),
+            // The whole cause chain: the top-level message alone ("Failed
+            // to close ...") does not say what failed.
+            Err(err) => Err(format!("{err:#}")),
         };
 
         // How long the exchange took, for the start time of a displaced success below.
