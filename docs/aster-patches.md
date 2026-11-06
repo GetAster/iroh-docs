@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1027` |
-| Pinned commit | `0f14e7ef455309a8f5f56c644243c221ba1b41ee` |
-| Crate version | 0.101.1027 (workspace spec `iroh-docs = "0.101.1027"`) |
+| Tag | `aster-iroh-docs-v0.101.1028` |
+| Pinned commit | `d03a9c3bb2dc328e18dbd6b475278d793e27644d` |
+| Crate version | 0.101.1028 (workspace spec `iroh-docs = "0.101.1028"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -90,6 +90,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 68 | none recorded | A failed content download is fetched again on its own: the namespace gets a retry (`MissingRetry`) at 1 s, doubling per failure to 60 s, that queues its missing hashes from their known providers and its gossip neighbours, and clears once nothing is missing or the namespace closes. Before, a failed download returned to `missing_hashes` and was redriven only when a later sync round finished, which a quiet swarm (updates by gossip) may never run, so the content stayed missing for good. Test: `failed_content_download_is_retried_without_a_new_sync` (fault hook `fail_next_downloads`; times out with the retry disabled). |
 | 69 | none recorded | A graceful close by the peer completes a sync's closing phase: `close_streams` (both sides) treats an application close with code 0 during finish / `stopped` / `read_to_end` as done. The side that finished first drops the connection while the other may still wait for the acknowledgement of its final frame, which the close overtakes and a lost acknowledgement never resends, so rounds whose exchange had succeeded failed with "Failed to close"; under 0.5% loss that failed Aster enrollment's policy syncs. Any other close code still fails. Tests: `net::close_tests` (the graceful case fails with the classification disabled). |
 | 70 | none recorded | `SyncFinished` carries a failed sync's whole cause chain (`{err:#}`), not just the top-level message, which read "Failed to close connection1" with nothing about what failed. |
+| 71 | none recorded | Split ranges in set reconciliation are answered from maintained bucket aggregates. A new table (`namespace-buckets-1`) partitions each namespace's records, in records-table order, into contiguous buckets of about 512 (`BUCKET_SIZE`), each keyed by its first record and holding a count and the XOR of its record fingerprints. Every write to the records table updates it in the same transaction, and it is rebuilt with the namespace fingerprint on open. `get_fingerprint`, `get_range_len` and the new `Store::get_nth_key` combine the buckets a range covers and read only the two it cuts through, O(N/B + B) instead of O(range). `process_message` computes the start index and pivots through them and collects a sub-range only when it is small enough to send. Messages are byte-identical to before. Per-session counters (rounds, ranges per round, range size bins, records hashed and read) are logged at debug as "set reconciliation summary". Before, a sync under live ingest walked and hashed every record of every split range at every level, about 10 times per record per sync; on portal-sync's 1M-file cell BLAKE3 was 14% of the receiver docs actor. Tests: `bucket_aggregates_track_random_ops_{memory,fs}`, `split_range_fingerprint_hashes_only_the_end_buckets`, `reconciliation_messages_match_the_walking_store`, `remove_replica_clears_bucket_rows`; debug builds cross-check every bucket answer against a scan. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -187,7 +188,20 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1027 (2026-11-06), current
+### 0.101.1028 (2026-11-06), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1028` | `d03a9c3bb2dc328e18dbd6b475278d793e27644d` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-06, 0.101.1028** (`d03a9c3`, tag `aster-iroh-docs-v0.101.1028`):
+  row 71 (`7fd0201`), split-range fingerprints, lengths and offsets come
+  from maintained bucket aggregates. Asked for by portal-sync after its 1M-file
+  cell on 0.101.1027. Validation: full local suite green (143 lib plus
+  integration and doc), fmt and clippy clean; reconciliation messages
+  byte-identical to the walking store; mutation-checked.
+
+### 0.101.1027 (2026-11-06)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
