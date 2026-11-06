@@ -2010,6 +2010,121 @@ mod tests {
         Ok(())
     }
 
+    /// Reads of the open write transaction return what a committed snapshot
+    /// of the same writes returns, for every query shape, under random puts
+    /// that overwrite, delete and prefix-remove entries.
+    #[test]
+    fn test_uncommitted_reads_match_committed_snapshot() -> Result<()> {
+        use rand::{RngExt, SeedableRng};
+
+        use crate::store::{SortBy, SortDirection};
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(7);
+        let open = || -> Result<(tempfile::NamedTempFile, Store)> {
+            let file = tempfile::NamedTempFile::new()?;
+            let store = Store::persistent(file.path())?;
+            Ok((file, store))
+        };
+        let (_fx, mut uncommitted) = open()?;
+        let (_fy, mut committed) = open()?;
+        let namespace = NamespaceSecret::new(&mut rng);
+        let authors: Vec<Author> = (0..3).map(|_| Author::new(&mut rng)).collect();
+        for store in [&mut uncommitted, &mut committed] {
+            store.new_replica(namespace.clone())?;
+            store.close_replica(namespace.id());
+            for author in &authors {
+                store.import_author(author.clone())?;
+            }
+            store.flush()?;
+        }
+        let keys: [&[u8]; 7] = [b"a", b"ab", b"abc", b"abd", b"b", b"ba", b"c"];
+        let mut timestamp = 1u64;
+        for round in 0..400 {
+            let author = &authors[rng.random_range(0..authors.len())];
+            let key = keys[rng.random_range(0..keys.len())];
+            timestamp += rng.random_range(0..3u64);
+            let record = if rng.random_bool(0.2) {
+                Record::empty(timestamp)
+            } else {
+                Record::from_data(format!("v{round}"), timestamp)
+            };
+            let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+            let entry = SignedEntry::from_entry(Entry::new(id, record), &namespace, author);
+            for store in [&mut uncommitted, &mut committed] {
+                StoreInstance::new(namespace.id(), store).put(entry.clone())?;
+            }
+            if round % 5 != 0 {
+                continue;
+            }
+            let pick_key = keys[rng.random_range(0..keys.len())];
+            let pick_author = authors[rng.random_range(0..authors.len())].id();
+            let direction = if rng.random_bool(0.5) {
+                SortDirection::Asc
+            } else {
+                SortDirection::Desc
+            };
+            let flat = match rng.random_range(0..4) {
+                0 => Query::all(),
+                1 => Query::author(pick_author),
+                2 => Query::key_exact(pick_key),
+                _ => Query::key_prefix(pick_key),
+            };
+            let flat = if rng.random_bool(0.5) {
+                flat.author(pick_author)
+            } else {
+                flat
+            };
+            let sort_by = if rng.random_bool(0.5) {
+                SortBy::AuthorKey
+            } else {
+                SortBy::KeyAuthor
+            };
+            let mut flat = flat.sort_by(sort_by, direction);
+            let mut latest = Query::single_latest_per_key().sort_direction(direction);
+            if rng.random_bool(0.5) {
+                latest = latest.key_prefix(pick_key);
+            }
+            if rng.random_bool(0.3) {
+                flat = flat.include_empty();
+                latest = latest.include_empty();
+            }
+            if rng.random_bool(0.3) {
+                let offset = rng.random_range(0..4);
+                flat = flat.offset(offset);
+                latest = latest.offset(offset);
+            }
+            if rng.random_bool(0.3) {
+                let limit = rng.random_range(0..4);
+                flat = flat.limit(limit);
+                latest = latest.limit(limit);
+            }
+            for query in [flat.build(), latest.build()] {
+                assert!(matches!(
+                    uncommitted.transaction,
+                    CurrentTransaction::Write(_)
+                ));
+                let seen = uncommitted
+                    .get_many(namespace.id(), query.clone())?
+                    .collect::<Result<Vec<_>>>()?;
+                let seen_vec = uncommitted.get_many_vec(namespace.id(), query.clone())?;
+                committed.flush()?;
+                let expected = committed
+                    .get_many(namespace.id(), query.clone())?
+                    .collect::<Result<Vec<_>>>()?;
+                assert_eq!(seen, expected, "round {round}: {query:?}");
+                assert_eq!(seen_vec, expected, "round {round}: {query:?}");
+            }
+            for author in &authors {
+                for key in keys {
+                    let a = uncommitted.get_exact(namespace.id(), author.id(), key, true)?;
+                    committed.flush()?;
+                    let b = committed.get_exact(namespace.id(), author.id(), key, true)?;
+                    assert_eq!(a, b, "round {round}: get_exact");
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_get_many_does_not_commit() -> Result<()> {
         use super::tables::RECORDS_TABLE;
