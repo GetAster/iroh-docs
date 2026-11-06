@@ -191,6 +191,8 @@ pub struct SyncOutcome {
     pub rejected: Vec<RejectedEntry>,
     /// Rejects beyond [`MAX_REJECTED_PER_EXCHANGE`] that were dropped from [`Self::rejected`].
     pub rejected_truncated: usize,
+    /// Counters for the set reconciliation work of this session.
+    pub(crate) stats: crate::ranger::SplitStats,
 }
 
 /// Upper bound on rejects retained per exchange: enough to schedule the
@@ -787,6 +789,8 @@ where
                 .insert(entry.author(), entry.timestamp());
         }
 
+        self.store.stats = std::mem::take(&mut state.stats);
+
         // let subscribers = std::rc::Rc::new(&mut self.subscribers);
         // l
         let cb = self.info.content_status_cb.clone();
@@ -890,6 +894,8 @@ where
                 },
             )
             .await?;
+
+        state.stats = std::mem::take(&mut self.store.stats);
 
         // update state with outgoing data.
         Self::extend_rejected(state, rejected.into_inner());

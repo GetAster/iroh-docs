@@ -65,6 +65,22 @@ pub type RecordsByKeyIdOwned = ([u8; 32], Bytes, [u8; 32]);
 pub const NAMESPACE_FINGERPRINT_TABLE: TableDefinition<&[u8; 32], &[u8; 32]> =
     TableDefinition::new("namespace-fingerprint-1");
 
+/// Table: Namespace range buckets
+/// Key:   `([u8; 32], [u8; 32], &[u8])`  # (NamespaceId, AuthorId, Key) of the bucket's first record
+/// Value: `(u64, [u8; 32])`              # (record count, XOR of the records' fingerprints)
+///
+/// Partitions each namespace's records, in records-table order, into
+/// contiguous buckets of roughly [`super::buckets::BUCKET_SIZE`] records:
+/// a record belongs to the bucket with the greatest key not above its id.
+/// The XOR uses [`crate::ranger::record_fingerprint`] bytes and carries no
+/// empty-set base. Maintained in the transaction that changes the records;
+/// a namespace with records but no bucket rows has not been built yet (a
+/// replica written before this table existed) and is built on open or on
+/// the first range query.
+pub const NAMESPACE_BUCKETS_TABLE: TableDefinition<RecordsId, BucketValue> =
+    TableDefinition::new("namespace-buckets-1");
+pub type BucketValue<'a> = (u64, &'a [u8; 32]);
+
 /// Table: Namespace insertion sequence
 /// Key:   `[u8; 32]`   # NamespaceId
 /// Value: `u64`        # sequence of the last state-changing put
@@ -175,6 +191,7 @@ pub struct Tables<'tx> {
     pub writer_allowlist: Table<'tx, &'static [u8; 32], &'static [u8]>,
     pub authors: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
     pub namespace_fingerprint: Table<'tx, &'static [u8; 32], &'static [u8; 32]>,
+    pub namespace_buckets: Table<'tx, RecordsId<'static>, BucketValue<'static>>,
     pub namespace_sequence: Table<'tx, &'static [u8; 32], u64>,
     pub records_by_seq: Table<'tx, RecordsBySeqKey<'static>, RecordsBySeqValue<'static>>,
     pub records_by_seq_key: Table<'tx, RecordsByKeyId<'static>, u64>,
@@ -191,6 +208,7 @@ impl<'tx> Tables<'tx> {
         let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
+        let namespace_buckets = tx.open_table(NAMESPACE_BUCKETS_TABLE)?;
         let namespace_sequence = tx.open_table(NAMESPACE_SEQUENCE_TABLE)?;
         let records_by_seq = tx.open_table(RECORDS_BY_SEQ_TABLE)?;
         let records_by_seq_key = tx.open_table(RECORDS_BY_SEQ_KEY_TABLE)?;
@@ -204,6 +222,7 @@ impl<'tx> Tables<'tx> {
             writer_allowlist,
             authors,
             namespace_fingerprint,
+            namespace_buckets,
             namespace_sequence,
             records_by_seq,
             records_by_seq_key,
@@ -223,6 +242,7 @@ pub struct ReadOnlyTables {
     pub writer_allowlist: ReadOnlyTable<&'static [u8; 32], &'static [u8]>,
     pub authors: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
     pub namespace_fingerprint: ReadOnlyTable<&'static [u8; 32], &'static [u8; 32]>,
+    pub namespace_buckets: ReadOnlyTable<RecordsId<'static>, BucketValue<'static>>,
     pub namespace_sequence: ReadOnlyTable<&'static [u8; 32], u64>,
     pub records_by_seq: ReadOnlyTable<RecordsBySeqKey<'static>, RecordsBySeqValue<'static>>,
     pub records_by_seq_key: ReadOnlyTable<RecordsByKeyId<'static>, u64>,
@@ -240,6 +260,7 @@ impl ReadOnlyTables {
         let writer_allowlist = tx.open_table(WRITER_ALLOWLIST_TABLE)?;
         let authors = tx.open_table(AUTHORS_TABLE)?;
         let namespace_fingerprint = tx.open_table(NAMESPACE_FINGERPRINT_TABLE)?;
+        let namespace_buckets = tx.open_table(NAMESPACE_BUCKETS_TABLE)?;
         let namespace_sequence = tx.open_table(NAMESPACE_SEQUENCE_TABLE)?;
         let records_by_seq = tx.open_table(RECORDS_BY_SEQ_TABLE)?;
         let records_by_seq_key = tx.open_table(RECORDS_BY_SEQ_KEY_TABLE)?;
@@ -253,6 +274,7 @@ impl ReadOnlyTables {
             writer_allowlist,
             authors,
             namespace_fingerprint,
+            namespace_buckets,
             namespace_sequence,
             records_by_seq,
             records_by_seq_key,

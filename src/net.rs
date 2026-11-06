@@ -211,6 +211,7 @@ pub async fn connect_and_sync_with_timeout(
                 recv = %res.num_recv,
                 "done, ok"
             );
+            res.stats.log_summary();
         }
         Err(err) => {
             debug!(?t_connect, ?t_process, ?err, "done, failed");
@@ -363,9 +364,11 @@ where
                 recv = %outcome.num_recv,
                 "done, ok"
             );
+            outcome.stats.log_summary();
         }
         Err(err) => {
             debug!(?t_connect, ?t_process, ?err, "done, failed");
+            outcome.stats.log_summary();
         }
     });
 

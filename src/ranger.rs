@@ -290,6 +290,53 @@ impl<E: RangeEntry> From<Message<E, (E, ContentStatus)>> for Message<E> {
     }
 }
 
+/// Counters for the split path of one sync session, summed over its rounds.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SplitStats {
+    /// Number of `process_message` calls.
+    pub(crate) rounds: u64,
+    /// Number of fingerprint ranges received in each round.
+    pub(crate) ranges_per_round: Vec<u32>,
+    /// Local sizes of the ranges that differed, binned by bit length:
+    /// bin `b` counts sizes in `[2^(b-1), 2^b)`, bin 0 counts empty ranges.
+    pub(crate) size_bins: Vec<u64>,
+    /// Records hashed by `get_fingerprint`.
+    pub(crate) records_hashed: u64,
+    /// Records read by the split path outside fingerprinting: counting,
+    /// offset lookups and collected sub-ranges.
+    pub(crate) records_read: u64,
+}
+
+impl SplitStats {
+    fn record_size(&mut self, len: usize) {
+        let bin = (usize::BITS - len.leading_zeros()) as usize;
+        if self.size_bins.len() <= bin {
+            self.size_bins.resize(bin + 1, 0);
+        }
+        self.size_bins[bin] += 1;
+    }
+
+    /// Emit the session summary.
+    pub(crate) fn log_summary(&self) {
+        let size_bins: Vec<(u32, u64)> = self
+            .size_bins
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(bin, count)| (bin as u32, *count))
+            .collect();
+        tracing::debug!(
+            rounds = self.rounds,
+            ranges = self.ranges_per_round.iter().map(|n| u64::from(*n)).sum::<u64>(),
+            ranges_per_round = ?self.ranges_per_round,
+            ?size_bins,
+            records_hashed = self.records_hashed,
+            records_read = self.records_read,
+            "set reconciliation summary"
+        );
+    }
+}
+
 pub trait Store<E: RangeEntry>: Sized {
     type Error: Debug + Send + Sync + Into<anyhow::Error> + 'static;
 
@@ -341,6 +388,26 @@ pub trait Store<E: RangeEntry>: Sized {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Returns the key of the entry at offset `n` of the range, in the order
+    /// [`Self::get_range`] yields them.
+    ///
+    /// Default impl walks the range.
+    fn get_nth_key(
+        &mut self,
+        range: Range<E::Key>,
+        n: usize,
+    ) -> Result<Option<E::Key>, Self::Error> {
+        match self.get_range(range)?.nth(n) {
+            Some(entry) => Ok(Some(entry?.key().clone())),
+            None => Ok(None),
+        }
+    }
+
+    /// The counters of the sync session this store serves, if it keeps any.
+    fn split_stats(&mut self) -> Option<&mut SplitStats> {
+        None
     }
 
     /// Returns all entries whose key starts with the given `prefix`.
@@ -482,6 +549,11 @@ pub trait Store<E: RangeEntry>: Sized {
             }
         }
 
+        if let Some(stats) = self.split_stats() {
+            stats.rounds += 1;
+            stats.ranges_per_round.push(fingerprints.len() as u32);
+        }
+
         // Process fingerprint messages
         for RangeFingerprint { range, fingerprint } in fingerprints {
             let local_fingerprint = self.get_fingerprint(&range)?;
@@ -492,6 +564,9 @@ pub trait Store<E: RangeEntry>: Sized {
 
             // Case2 Recursion Anchor
             let num_local_values = self.get_range_len(range.clone())?;
+            if let Some(stats) = self.split_stats() {
+                stats.record_size(num_local_values);
+            }
             if num_local_values <= 1 || fingerprint == Fingerprint::empty() {
                 let values = self
                     .get_range(range.clone())?
@@ -513,31 +588,73 @@ pub trait Store<E: RangeEntry>: Sized {
                 // such that [ml, ml+1) is nonempty
                 let mut ranges = Vec::with_capacity(config.split_factor);
 
-                // Select the first index, for which the key is larger or equal than the x of the range.
-                let mut start_index = 0;
-                for el in self.get_range(range.clone())? {
-                    let el = el?;
-                    if el.key() >= range.x() {
-                        break;
+                // The index of the first entry, in the order `get_range` yields them,
+                // whose key is at least `range.x()`. A regular range yields only keys
+                // from `x` on, so it is 0. Otherwise the iteration starts at the lowest
+                // key and the entries below the range's wrap point, `y` for a wrapping
+                // range and `x` for the whole set, come first.
+                let below = if range.is_all() {
+                    Some(range.x().clone())
+                } else if range.x() > range.y() {
+                    Some(range.y().clone())
+                } else {
+                    None
+                };
+                let start_index = match below {
+                    None => 0,
+                    Some(below) => {
+                        let first = self.get_first()?;
+                        if first < below {
+                            self.get_range_len(Range::new(first, below))?
+                        } else {
+                            0
+                        }
                     }
-                    start_index += 1;
-                }
+                };
 
                 // select a pivot value. pivots repeat every split_factor, so pivot(i) == pivot(i + self.split_factor * x)
                 // it is guaranteed that pivot(0) != x if local_values.len() >= 2
-                let mut pivot = |i: usize| {
-                    // ensure that pivots wrap around
-                    let i = i % config.split_factor;
+                let mut pivots = Vec::with_capacity(config.split_factor);
+                for i in 0..config.split_factor {
                     // choose an offset. this will be
                     // 1/2, 1 in case of split_factor == 2
                     // 1/3, 2/3, 1 in case of split_factor == 3
                     // etc.
                     let offset = (num_local_values * (i + 1)) / config.split_factor;
+                    // ensure that pivots wrap around
                     let offset = (start_index + offset) % num_local_values;
-                    self.get_range(range.clone())
-                        .map(|mut i| i.nth(offset))
-                        .and_then(|e| e.expect("missing entry"))
-                        .map(|e| e.key().clone())
+                    let key = self
+                        .get_nth_key(range.clone(), offset)?
+                        .expect("missing entry");
+                    #[cfg(debug_assertions)]
+                    {
+                        let walked = self
+                            .get_range(range.clone())?
+                            .nth(offset)
+                            .expect("missing entry")?;
+                        debug_assert!(
+                            walked.key() == &key,
+                            "offset lookup diverged from a range walk"
+                        );
+                    }
+                    pivots.push(key);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    let mut walked = 0;
+                    for el in self.get_range(range.clone())? {
+                        if el?.key() >= range.x() {
+                            break;
+                        }
+                        walked += 1;
+                    }
+                    debug_assert_eq!(
+                        start_index, walked,
+                        "start index diverged from a range walk"
+                    );
+                }
+                let pivot = |i: usize| -> Result<E::Key, Self::Error> {
+                    Ok(pivots[i % config.split_factor].clone())
                 };
                 if range.is_all() {
                     // the range is the whole set, so range.x and range.y should not matter
@@ -579,18 +696,22 @@ pub trait Store<E: RangeEntry>: Sized {
 
                 let mut non_empty = 0;
                 for range in ranges {
-                    let chunk: Vec<_> = self.get_range(range.clone())?.collect();
-                    if !chunk.is_empty() {
+                    let len = self.get_range_len(range.clone())?;
+                    if len > 0 {
                         non_empty += 1;
                     }
                     // Add either the fingerprint or the item set
-                    let fingerprint = self.get_fingerprint(&range)?;
-                    if chunk.len() > config.max_set_size {
+                    if len > config.max_set_size {
+                        let fingerprint = self.get_fingerprint(&range)?;
                         out.push(MessagePart::RangeFingerprint(RangeFingerprint {
                             range: range.clone(),
                             fingerprint,
                         }));
                     } else {
+                        let chunk: Vec<_> = self.get_range(range.clone())?.collect();
+                        if let Some(stats) = self.split_stats() {
+                            stats.records_read += chunk.len() as u64;
+                        }
                         // let content_status_cb = content_status_cb.clone();
                         let values = chunk.into_iter().filter_map(|entry| match entry {
                             Err(_err) => None,
@@ -694,6 +815,25 @@ impl<E: RangeEntry, S: Store<E>> Store<E> for &mut S {
         range: &Range<<E as RangeEntry>::Key>,
     ) -> Result<Fingerprint, Self::Error> {
         (**self).get_fingerprint(range)
+    }
+
+    fn get_range_len(
+        &mut self,
+        range: Range<<E as RangeEntry>::Key>,
+    ) -> Result<usize, Self::Error> {
+        (**self).get_range_len(range)
+    }
+
+    fn get_nth_key(
+        &mut self,
+        range: Range<<E as RangeEntry>::Key>,
+        n: usize,
+    ) -> Result<Option<<E as RangeEntry>::Key>, Self::Error> {
+        (**self).get_nth_key(range, n)
+    }
+
+    fn split_stats(&mut self) -> Option<&mut SplitStats> {
+        (**self).split_stats()
     }
 
     fn entry_put(&mut self, entry: E) -> Result<(), Self::Error> {

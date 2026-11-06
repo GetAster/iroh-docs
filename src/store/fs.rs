@@ -25,13 +25,14 @@ use super::{
 use crate::{
     actor::MAX_COMMIT_DELAY,
     keys::Author,
-    ranger::{Fingerprint, Range, RangeEntry},
+    ranger::{Fingerprint, Range, RangeEntry, SplitStats},
     sync::{Entry, EntrySignature, Record, RecordIdentifier, Replica, SignedEntry},
     AuthorHeads, AuthorId, Capability, CapabilityKind, NamespaceId, NamespaceSecret, PeerIdBytes,
     ReplicaInfo,
 };
 
 mod bounds;
+pub(crate) mod buckets;
 #[cfg(all(feature = "fs-store", feature = "redb-v2-migration"))]
 mod migrate_redb_v2_tuples;
 mod migrations;
@@ -579,6 +580,7 @@ impl Store {
             }
             let bounds = RecordsBounds::namespace(*namespace);
             tables.records.retain_in(bounds.as_ref(), |_k, _v| false)?;
+            buckets::clear(&mut tables.namespace_buckets, namespace)?;
             let bounds = ByKeyBounds::namespace(*namespace);
             let _ = tables
                 .records_by_key
@@ -847,11 +849,17 @@ fn get_exact(
 pub struct StoreInstance<'a> {
     namespace: NamespaceId,
     pub(crate) store: &'a mut Store,
+    /// Counters for the sync session this instance serves.
+    pub(crate) stats: SplitStats,
 }
 
 impl<'a> StoreInstance<'a> {
     pub(crate) fn new(namespace: NamespaceId, store: &'a mut Store) -> Self {
-        StoreInstance { namespace, store }
+        StoreInstance {
+            namespace,
+            store,
+            stats: SplitStats::default(),
+        }
     }
 }
 
@@ -906,8 +914,8 @@ impl StoreInstance<'_> {
         })
     }
 
-    /// Rebuild the namespace fingerprint from the records table, overwriting
-    /// the stored aggregate.
+    /// Rebuild the namespace fingerprint and the range buckets from the
+    /// records table, overwriting the stored aggregates.
     ///
     /// Run once per replica open (see [`Store::load_replica_info`]): the
     /// sync protocol answers whole-set fingerprints from the aggregate
@@ -918,19 +926,65 @@ impl StoreInstance<'_> {
     pub fn rebuild_namespace_fingerprint(&mut self) -> Result<Fingerprint> {
         let namespace = self.namespace.as_bytes();
         self.store.as_mut().modify(|tables| {
+            // The bucket rows are rebuilt in the same scan, so the two
+            // aggregates cannot disagree about the rows they cover.
+            let total = buckets::rebuild(
+                &tables.records,
+                &mut tables.namespace_buckets,
+                &self.namespace,
+            )?;
             let mut fp = Fingerprint::empty();
-            let bounds = RecordsBounds::namespace(self.namespace);
-            let records = tables.records.range(bounds.as_ref())?;
-            for row in records {
-                let (compound_key, value) = row?;
-                let (ns, author, key) = compound_key.value();
-                let (timestamp, _sig_ns, _sig_author, _len, hash) = value.value();
-                fp ^= crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
-            }
+            fp ^= Fingerprint(total);
             let bytes = fp.0;
             tables.namespace_fingerprint.insert(namespace, &bytes)?;
             Ok(fp)
         })
+    }
+
+    /// Build the bucket rows if the namespace has records but no rows yet (a
+    /// replica written before the bucket table existed and not opened since).
+    fn ensure_buckets(&mut self) -> Result<()> {
+        let unbuilt = {
+            let tables = self.store.as_mut().tables()?;
+            buckets::is_unbuilt(&tables.records, &tables.namespace_buckets, &self.namespace)?
+        };
+        if unbuilt {
+            self.store.as_mut().modify(|tables| {
+                buckets::rebuild(
+                    &tables.records,
+                    &mut tables.namespace_buckets,
+                    &self.namespace,
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The record-table bounds `get_range` reads for `range`: one interval,
+    /// or two for a wrapping range (the second is read after the first).
+    fn range_bounds(
+        &self,
+        range: &Range<RecordIdentifier>,
+    ) -> (RecordsBounds, Option<RecordsBounds>) {
+        match range.x().cmp(range.y()) {
+            // identity range: all entries in the replica
+            Ordering::Equal => (RecordsBounds::namespace(self.namespace), None),
+            // regular range: x <= t < y
+            Ordering::Less => {
+                let start = Bound::Included(range.x().to_byte_tuple());
+                let end = Bound::Excluded(range.y().to_byte_tuple());
+                (RecordsBounds::untrusted(&self.namespace, start, end), None)
+            }
+            // split range: start <= t < y, then x <= t <= end
+            Ordering::Greater => {
+                let end = Bound::Excluded(range.y().to_byte_tuple());
+                let first = RecordsBounds::untrusted(&self.namespace, Bound::Unbounded, end);
+                let start = Bound::Included(range.x().to_byte_tuple());
+                let second = RecordsBounds::untrusted(&self.namespace, start, Bound::Unbounded);
+                (first, Some(second))
+            }
+        }
     }
 
     /// Build the insertion-sequence index if it does not exist yet: assign
@@ -1115,8 +1169,9 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
         // The whole-set range is the aggregate maintained on every write, so
         // answer it without a scan. Every sync session opens with this range,
         // which makes the agreeing-replica case O(1) per side instead of one
-        // row read, one hash and one XOR per record. Split ranges still scan:
-        // that is the work needed to locate a difference.
+        // row read, one hash and one XOR per record. Split ranges combine the
+        // bucket aggregates they cover and hash only the records of the
+        // buckets they cut through.
         if range.is_all() {
             let fingerprint = self.namespace_fingerprint()?;
             #[cfg(debug_assertions)]
@@ -1133,15 +1188,129 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             return Ok(fingerprint);
         }
 
-        let elements = self.get_range(range.clone())?;
-
+        self.ensure_buckets()?;
+        let (first, second) = self.range_bounds(range);
         let mut fp = Fingerprint::empty();
-        for el in elements {
-            let el = el?;
-            fp ^= el.as_fingerprint();
+        let mut hashed = 0;
+        {
+            let tables = self.store.as_mut().tables()?;
+            for bounds in std::iter::once(first).chain(second) {
+                let agg = buckets::aggregate(
+                    &tables.records,
+                    &tables.namespace_buckets,
+                    &self.namespace,
+                    &bounds,
+                    true,
+                )?;
+                fp ^= Fingerprint(agg.xor);
+                hashed += agg.scanned;
+            }
+        }
+        self.stats.records_hashed += hashed;
+
+        #[cfg(debug_assertions)]
+        {
+            let mut scanned = Fingerprint::empty();
+            for el in self.get_range(range.clone())? {
+                scanned ^= el?.as_fingerprint();
+            }
+            debug_assert_eq!(
+                fp, scanned,
+                "bucket fingerprint diverged from a record scan"
+            );
         }
 
         Ok(fp)
+    }
+
+    fn get_range_len(&mut self, range: Range<RecordIdentifier>) -> Result<usize> {
+        self.ensure_buckets()?;
+        let (first, second) = self.range_bounds(&range);
+        let mut count = 0;
+        let mut scanned = 0;
+        {
+            let tables = self.store.as_mut().tables()?;
+            for bounds in std::iter::once(first).chain(second) {
+                let agg = buckets::aggregate(
+                    &tables.records,
+                    &tables.namespace_buckets,
+                    &self.namespace,
+                    &bounds,
+                    false,
+                )?;
+                count += agg.count;
+                scanned += agg.scanned;
+            }
+        }
+        self.stats.records_read += scanned;
+
+        #[cfg(debug_assertions)]
+        {
+            let mut walked = 0;
+            for el in self.get_range(range)? {
+                el?;
+                walked += 1;
+            }
+            debug_assert_eq!(count, walked, "bucket count diverged from a record scan");
+        }
+
+        Ok(count as usize)
+    }
+
+    fn get_nth_key(
+        &mut self,
+        range: Range<RecordIdentifier>,
+        n: usize,
+    ) -> Result<Option<RecordIdentifier>> {
+        self.ensure_buckets()?;
+        let (first, second) = self.range_bounds(&range);
+        let mut offset = n as u64;
+        let mut scanned = 0;
+        let mut found = None;
+        {
+            let tables = self.store.as_mut().tables()?;
+            for bounds in std::iter::once(first).chain(second) {
+                match buckets::nth(
+                    &tables.records,
+                    &tables.namespace_buckets,
+                    &self.namespace,
+                    &bounds,
+                    offset,
+                )? {
+                    buckets::Nth::Found { id, scanned: read } => {
+                        scanned += read;
+                        found = Some(RecordIdentifier::new(id.0, id.1, id.2));
+                        break;
+                    }
+                    buckets::Nth::Short {
+                        total,
+                        scanned: read,
+                    } => {
+                        scanned += read;
+                        offset -= total;
+                    }
+                }
+            }
+        }
+        self.stats.records_read += scanned;
+
+        #[cfg(debug_assertions)]
+        {
+            let walked = match self.get_range(range)?.nth(n) {
+                Some(entry) => Some(entry?.id().clone()),
+                None => None,
+            };
+            debug_assert_eq!(
+                found, walked,
+                "bucket offset lookup diverged from a record scan"
+            );
+        }
+
+        Ok(found)
+    }
+
+    fn split_stats(&mut self) -> Option<&mut SplitStats> {
+        Some(&mut self.stats)
     }
 
     fn entry_put(&mut self, e: SignedEntry) -> Result<()> {
@@ -1183,6 +1352,31 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             };
             tables.records.insert(key, value)?;
 
+            // Maintain the range buckets.
+            let mut delta = crate::ranger::record_fingerprint(
+                id.namespace().as_ref(),
+                id.author().as_ref(),
+                id.key(),
+                e.timestamp(),
+                hash.as_bytes(),
+            );
+            if let Some((old_timestamp, old_hash)) = superseded {
+                delta ^= crate::ranger::record_fingerprint(
+                    id.namespace().as_ref(),
+                    id.author().as_ref(),
+                    id.key(),
+                    old_timestamp,
+                    &old_hash,
+                );
+            }
+            buckets::insert(
+                &tables.records,
+                &mut tables.namespace_buckets,
+                key,
+                delta.0,
+                superseded.is_none(),
+            )?;
+
             // insert into by key index table
             let key = (
                 &id.namespace().to_bytes(),
@@ -1207,22 +1401,6 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 .get(id.namespace().as_bytes())?
                 .map(|fp| *fp.value());
             if let Some(mut bytes) = stored {
-                let mut delta = crate::ranger::record_fingerprint(
-                    id.namespace().as_ref(),
-                    id.author().as_ref(),
-                    id.key(),
-                    e.timestamp(),
-                    hash.as_bytes(),
-                );
-                if let Some((old_timestamp, old_hash)) = superseded {
-                    delta ^= crate::ranger::record_fingerprint(
-                        id.namespace().as_ref(),
-                        id.author().as_ref(),
-                        id.key(),
-                        old_timestamp,
-                        &old_hash,
-                    );
-                }
                 for (acc, add) in bytes.iter_mut().zip(delta.0) {
                     *acc ^= add;
                 }
@@ -1260,40 +1438,13 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     }
 
     fn get_range(&mut self, range: Range<RecordIdentifier>) -> Result<Self::RangeIterator<'_>> {
+        let (first, second) = self.range_bounds(&range);
         let tables = self.store.as_mut().tables()?;
-        let iter = match range.x().cmp(range.y()) {
-            // identity range: iter1 = all, iter2 = none
-            Ordering::Equal => {
-                // iterator for all entries in replica
-                let bounds = RecordsBounds::namespace(self.namespace);
-                let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
-                chain_none(iter)
-            }
-            // regular range: iter1 = x <= t < y, iter2 = none
-            Ordering::Less => {
-                // iterator for entries from range.x to range.y
-                let start = Bound::Included(range.x().to_byte_tuple());
-                let end = Bound::Excluded(range.y().to_byte_tuple());
-                let bounds = RecordsBounds::untrusted(&self.namespace, start, end);
-                let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
-                chain_none(iter)
-            }
-            // split range: iter1 = start <= t < y, iter2 = x <= t <= end
-            Ordering::Greater => {
-                // iterator for entries from start to range.y
-                let end = Bound::Excluded(range.y().to_byte_tuple());
-                let bounds = RecordsBounds::untrusted(&self.namespace, Bound::Unbounded, end);
-                let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
-
-                // iterator for entries from range.x to end
-                let start = Bound::Included(range.x().to_byte_tuple());
-                let bounds = RecordsBounds::untrusted(&self.namespace, start, Bound::Unbounded);
-                let iter2 = RecordsRange::with_bounds(&tables.records, bounds)?;
-
-                iter.chain(Some(iter2).into_iter().flatten())
-            }
-        };
-        Ok(iter)
+        let iter = RecordsRange::with_bounds(&tables.records, first)?;
+        let iter2 = second
+            .map(|bounds| RecordsRange::with_bounds(&tables.records, bounds))
+            .transpose()?;
+        Ok(iter.chain(iter2.into_iter().flatten()))
     }
 
     #[cfg(test)]
@@ -1307,13 +1458,19 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                 let id = (namespace, author, key);
                 let value = tables.records.remove(id)?;
                 let entry = value.map(|value| into_entry(id, value.value()));
-                if entry.is_some() {
+                if let Some(entry) = entry.as_ref() {
                     remove_touch(
                         &mut tables.records_by_seq,
                         &mut tables.records_by_seq_key,
                         namespace,
                         author,
                         key,
+                    )?;
+                    buckets::remove(
+                        &tables.records,
+                        &mut tables.namespace_buckets,
+                        id,
+                        entry.as_fingerprint().0,
                     )?;
                 }
                 entry
@@ -1393,11 +1550,19 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
             // must cancel exactly the rows that were XORed in, base
             // untouched.
             let mut removed_fp = Fingerprint([0u8; 32]);
+            let mut touched = Vec::new();
             for removed in iter {
                 let (compound_key, value) = removed?;
                 let (ns, author, key) = compound_key.value();
                 let (timestamp, _sig_ns, _sig_author, _len, hash) = value.value();
-                removed_fp ^= crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
+                let fp = crate::ranger::record_fingerprint(ns, author, key, timestamp, hash);
+                removed_fp ^= fp;
+                buckets::remove_counted(
+                    &mut tables.namespace_buckets,
+                    (ns, author, key),
+                    fp.0,
+                    &mut touched,
+                )?;
                 remove_touch(
                     &mut tables.records_by_seq,
                     &mut tables.records_by_seq_key,
@@ -1406,6 +1571,9 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
                     key,
                 )?;
                 count += 1;
+            }
+            for start in touched {
+                buckets::settle(&tables.records, &mut tables.namespace_buckets, &start)?;
             }
             if count > 0 {
                 let stored = tables
@@ -1444,6 +1612,7 @@ fn remove_touch(
     Ok(())
 }
 
+#[cfg(test)]
 fn chain_none<'a, I: Iterator<Item = T> + 'a, T>(
     iter: I,
 ) -> Chain<I, Flatten<std::option::IntoIter<I>>> {
@@ -2747,6 +2916,561 @@ mod tests {
         }
         assert!(seen.contains(&(a_touch, b"a".to_vec(), 2)));
         assert!(seen.iter().any(|(_, k, _)| k == b"b"));
+        Ok(())
+    }
+
+    // ---- range buckets ----
+
+    /// Every invariant of the bucket table, checked against a scan.
+    fn check_buckets(wrapper: &mut StoreInstance) -> Result<()> {
+        let records: Vec<(RecordIdentifier, [u8; 32])> = wrapper
+            .all()?
+            .map(|entry| entry.map(|entry| (entry.id().clone(), entry.as_fingerprint().0)))
+            .collect::<Result<_>>()?;
+        let namespace = wrapper.namespace;
+        let rows = {
+            let tables = wrapper.store.as_mut().tables()?;
+            buckets::all(&tables.namespace_buckets, &namespace)?
+        };
+        let mut at = 0usize;
+        for row in &rows {
+            assert!(row.count > 0, "empty bucket");
+            assert!(
+                row.count <= 2 * buckets::bucket_size(),
+                "bucket of {} exceeds twice the bucket size",
+                row.count
+            );
+            let end = at + row.count as usize;
+            assert!(end <= records.len(), "bucket runs past the records");
+            assert_eq!(
+                row.start,
+                records[at].0.to_byte_tuple(),
+                "bucket is not keyed by its first record"
+            );
+            let mut xor = [0u8; 32];
+            for (_, fp) in &records[at..end] {
+                for (a, b) in xor.iter_mut().zip(fp) {
+                    *a ^= b;
+                }
+            }
+            assert_eq!(row.xor, xor, "bucket xor diverged from its records");
+            at = end;
+        }
+        assert_eq!(at, records.len(), "buckets do not cover every record");
+        Ok(())
+    }
+
+    /// A random id: an existing record, a neighbour of one, or one in another
+    /// namespace.
+    fn random_id(
+        rng: &mut rand::rngs::StdRng,
+        wrapper: &StoreInstance,
+        known: &[RecordIdentifier],
+        authors: &[Author],
+    ) -> RecordIdentifier {
+        use rand::RngExt;
+        let namespace = wrapper.namespace;
+        match rng.random_range(0..10usize) {
+            0..=3 if !known.is_empty() => known[rng.random_range(0..known.len())].clone(),
+            4 => RecordIdentifier::new(NamespaceId::from(&[0u8; 32]), authors[0].id(), b"a"),
+            5 => RecordIdentifier::new(NamespaceId::from(&[0xffu8; 32]), authors[0].id(), b"a"),
+            6 => RecordIdentifier::new(namespace, AuthorId::from(&[0u8; 32]), b""),
+            7 => RecordIdentifier::new(namespace, AuthorId::from(&[0xffu8; 32]), b"zzz"),
+            _ => {
+                let author = authors[rng.random_range(0..authors.len())].id();
+                let key = format!(
+                    "{}/{:02}",
+                    ["a", "b", "c", "d", "e", "f"][rng.random_range(0..6usize)],
+                    rng.random_range(0..40usize)
+                );
+                RecordIdentifier::new(namespace, author, key)
+            }
+        }
+    }
+
+    /// The fingerprint, length and offset lookup of random ranges, wrapping
+    /// and whole-set ones included, equal a walk of `get_range`.
+    fn check_ranges(
+        rng: &mut rand::rngs::StdRng,
+        wrapper: &mut StoreInstance,
+        authors: &[Author],
+        rounds: usize,
+    ) -> Result<()> {
+        use rand::RngExt;
+        let known: Vec<RecordIdentifier> = wrapper
+            .all()?
+            .map(|entry| entry.map(|entry| entry.id().clone()))
+            .collect::<Result<_>>()?;
+        for _ in 0..rounds {
+            let x = random_id(rng, wrapper, &known, authors);
+            let y = if rng.random_range(0..6usize) == 0 {
+                x.clone()
+            } else {
+                random_id(rng, wrapper, &known, authors)
+            };
+            let range = Range::new(x, y);
+            // The definition of a range, independent of the store: a regular
+            // range is [x, y); a wrapping one is [start, y) then [x, end).
+            let stored: Vec<SignedEntry> = wrapper.all()?.collect::<Result<_>>()?;
+            let within = |from: Option<&RecordIdentifier>, to: Option<&RecordIdentifier>| {
+                stored
+                    .iter()
+                    .filter(|entry| {
+                        from.is_none_or(|from| entry.id() >= from)
+                            && to.is_none_or(|to| entry.id() < to)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let walked = match range.x().cmp(range.y()) {
+                std::cmp::Ordering::Equal => stored.clone(),
+                std::cmp::Ordering::Less => within(Some(range.x()), Some(range.y())),
+                std::cmp::Ordering::Greater => {
+                    let mut walked = within(None, Some(range.y()));
+                    walked.extend(within(Some(range.x()), None));
+                    walked
+                }
+            };
+            assert_eq!(
+                wrapper
+                    .get_range(range.clone())?
+                    .collect::<Result<Vec<_>>>()?,
+                walked,
+                "{range:?}"
+            );
+            let mut fp = Fingerprint::empty();
+            for entry in &walked {
+                fp ^= entry.as_fingerprint();
+            }
+            assert_eq!(wrapper.get_fingerprint(&range)?, fp, "{range:?}");
+            assert_eq!(wrapper.get_range_len(range.clone())?, walked.len());
+            let mut offsets: Vec<usize> = (0..4)
+                .map(|_| rng.random_range(0..walked.len() + 2))
+                .collect();
+            offsets.extend([0, walked.len().saturating_sub(1), walked.len()]);
+            for offset in offsets {
+                assert_eq!(
+                    wrapper.get_nth_key(range.clone(), offset)?,
+                    walked.get(offset).map(|entry| entry.id().clone()),
+                    "offset {offset} of {range:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn bucket_aggregates_track_random_ops(mut store: Store, size: u64) -> Result<()> {
+        use rand::{RngExt, SeedableRng};
+
+        let _small = buckets::BucketSizeGuard::new(size);
+        {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+            let authors: Vec<Author> = (0..3)
+                .map(|_| store.new_author(&mut rng))
+                .collect::<Result<_>>()?;
+            let namespace = NamespaceSecret::new(&mut rng);
+            let id = namespace.id();
+            let _replica = store.new_replica(namespace.clone())?;
+            store.close_replica(id);
+            let mut wrapper = StoreInstance::new(id, &mut store);
+
+            let mut peak = 0usize;
+            for op in 0..500u64 {
+                let author = &authors[rng.random_range(0..authors.len())];
+                let prefix = ["a", "b", "c", "d", "e", "f"][rng.random_range(0..6usize)];
+                match rng.random_range(0..10usize) {
+                    // A burst of new records under one prefix.
+                    0..=5 => {
+                        for _ in 0..rng.random_range(1..6usize) {
+                            let key = format!("{prefix}/{:02}", rng.random_range(0..40usize));
+                            let data = vec![op as u8; 1 + (op % 5) as usize];
+                            wrapper.put(fixed_entry(&namespace, author, &key, &data, op + 1))?;
+                        }
+                    }
+                    // A tombstone at the prefix removes everything under it.
+                    6 => {
+                        wrapper.put(fixed_entry(&namespace, author, prefix, &[], op + 1))?;
+                    }
+                    // A direct removal of one record.
+                    7 | 8 => {
+                        let known: Vec<RecordIdentifier> = wrapper
+                            .all()?
+                            .map(|entry| entry.map(|entry| entry.id().clone()))
+                            .collect::<Result<_>>()?;
+                        if !known.is_empty() {
+                            let victim = &known[rng.random_range(0..known.len())];
+                            wrapper.entry_remove(victim)?;
+                        }
+                    }
+                    // A direct overwrite of an existing key.
+                    _ => {
+                        let key = format!("{prefix}/{:02}", rng.random_range(0..40usize));
+                        let data = vec![op as u8; 9];
+                        wrapper.entry_put(fixed_entry(&namespace, author, &key, &data, op + 1))?;
+                    }
+                }
+                check_buckets(&mut wrapper)?;
+                peak = peak.max(wrapper.len()?);
+                if op % 3 == 0 {
+                    check_ranges(&mut rng, &mut wrapper, &authors, 4)?;
+                }
+            }
+            assert!(peak > 40, "the run never grew past a few buckets");
+
+            // The rebuild on open produces buckets that satisfy the same
+            // invariants over the same records and the same totals.
+            let incremental = {
+                let tables = wrapper.store.as_mut().tables()?;
+                buckets::all(&tables.namespace_buckets, &id)?
+            };
+            let fingerprint = wrapper.namespace_fingerprint()?;
+            drop(wrapper);
+            store.load_replica_info(&id)?;
+            store.close_replica(id);
+            let mut wrapper = StoreInstance::new(id, &mut store);
+            check_buckets(&mut wrapper)?;
+            let rebuilt = {
+                let tables = wrapper.store.as_mut().tables()?;
+                buckets::all(&tables.namespace_buckets, &id)?
+            };
+            let totals = |rows: &[buckets::Bucket]| {
+                rows.iter()
+                    .fold((0u64, [0u8; 32]), |(count, mut xor), row| {
+                        for (a, b) in xor.iter_mut().zip(&row.xor) {
+                            *a ^= b;
+                        }
+                        (count + row.count, xor)
+                    })
+            };
+            assert_eq!(totals(&incremental), totals(&rebuilt));
+            assert_eq!(wrapper.namespace_fingerprint()?, fingerprint);
+            check_ranges(&mut rng, &mut wrapper, &authors, 30)?;
+
+            // A namespace whose bucket rows are missing (a database from
+            // before the table existed) is built on its first range query,
+            // and writes in the meantime leave it alone.
+            wrapper.store.as_mut().modify(|tables| {
+                buckets::clear(&mut tables.namespace_buckets, &id)?;
+                Ok(())
+            })?;
+            wrapper.put(fixed_entry(&namespace, &authors[0], "a/new", b"x", 9_999))?;
+            check_ranges(&mut rng, &mut wrapper, &authors, 10)?;
+            check_buckets(&mut wrapper)?;
+            wrapper.put(fixed_entry(&namespace, &authors[1], "b/new", b"y", 10_000))?;
+            check_buckets(&mut wrapper)?;
+
+            // Draining the namespace one record at a time empties and
+            // merges buckets down to none.
+            loop {
+                let known: Vec<RecordIdentifier> = wrapper
+                    .all()?
+                    .map(|entry| entry.map(|entry| entry.id().clone()))
+                    .collect::<Result<_>>()?;
+                if known.is_empty() {
+                    break;
+                }
+                wrapper.entry_remove(&known[rng.random_range(0..known.len())])?;
+                check_buckets(&mut wrapper)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Size 4 splits constantly; size 24 also merges small buckets (a
+    /// bucket merges below a quarter of the size).
+    #[test]
+    fn bucket_aggregates_track_random_ops_memory() -> Result<()> {
+        for size in [4, 24] {
+            bucket_aggregates_track_random_ops(Store::memory(), size)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bucket_aggregates_track_random_ops_fs() -> Result<()> {
+        for size in [4, 24] {
+            let dbfile = tempfile::NamedTempFile::new()?;
+            bucket_aggregates_track_random_ops(Store::persistent(dbfile.path())?, size)?;
+        }
+        Ok(())
+    }
+
+    /// Removing a namespace removes its bucket rows and leaves other
+    /// namespaces' alone.
+    #[test]
+    fn remove_replica_clears_bucket_rows() -> Result<()> {
+        let mut store = Store::memory();
+        let author = store.new_author(&mut rand::rng())?;
+        let (one, two) = (
+            NamespaceSecret::new(&mut rand::rng()),
+            NamespaceSecret::new(&mut rand::rng()),
+        );
+        for namespace in [&one, &two] {
+            let _replica = store.new_replica(namespace.clone())?;
+            store.close_replica(namespace.id());
+            let mut wrapper = StoreInstance::new(namespace.id(), &mut store);
+            for i in 0..20u64 {
+                wrapper.put(fixed_entry(
+                    namespace,
+                    &author,
+                    &format!("k{i}"),
+                    b"v",
+                    i + 1,
+                ))?;
+            }
+        }
+        store.remove_replica(&one.id())?;
+        let rows = |store: &mut Store, id: NamespaceId| -> Result<usize> {
+            let tables = store.tables()?;
+            Ok(buckets::all(&tables.namespace_buckets, &id)?.len())
+        };
+        assert_eq!(rows(&mut store, one.id())?, 0);
+        assert!(rows(&mut store, two.id())? > 0);
+        Ok(())
+    }
+
+    /// A range fingerprint over a large range hashes the records of the two
+    /// buckets it cuts through, not the range.
+    #[test]
+    fn split_range_fingerprint_hashes_only_the_end_buckets() -> Result<()> {
+        let mut store = Store::memory();
+        let authors: Vec<Author> = (0..4)
+            .map(|_| store.new_author(&mut rand::rng()))
+            .collect::<Result<_>>()?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        let _replica = store.new_replica(namespace.clone())?;
+        store.close_replica(id);
+        let mut wrapper = StoreInstance::new(id, &mut store);
+        let per_author = 2_500u64;
+        for author in &authors {
+            for i in 0..per_author {
+                wrapper.entry_put(fixed_entry(
+                    &namespace,
+                    author,
+                    &format!("k{i:05}"),
+                    b"v",
+                    i + 1,
+                ))?;
+            }
+        }
+        let size = buckets::BUCKET_SIZE;
+        let ids: Vec<RecordIdentifier> = wrapper
+            .all()?
+            .map(|entry| entry.map(|entry| entry.id().clone()))
+            .collect::<Result<_>>()?;
+        let range = Range::new(ids[1_000].clone(), ids[9_000].clone());
+        assert_eq!(wrapper.get_range_len(range.clone())?, 8_000);
+
+        // Buckets grown by inserts hold up to twice the size.
+        wrapper.stats = SplitStats::default();
+        let grown = wrapper.get_fingerprint(&range)?;
+        assert!(
+            wrapper.stats.records_hashed <= 4 * size,
+            "hashed {} records",
+            wrapper.stats.records_hashed
+        );
+
+        // Rebuilt buckets hold exactly the size, so the two partial ends
+        // hash fewer than twice that.
+        wrapper.rebuild_namespace_fingerprint()?;
+        wrapper.stats = SplitStats::default();
+        assert_eq!(wrapper.get_fingerprint(&range)?, grown);
+        assert!(
+            wrapper.stats.records_hashed <= 2 * size,
+            "hashed {} records",
+            wrapper.stats.records_hashed
+        );
+        assert_eq!(wrapper.stats.records_read, 0);
+
+        // A wrapping range covering most of the set hashes just as few.
+        wrapper.stats = SplitStats::default();
+        wrapper.get_fingerprint(&Range::new(ids[9_000].clone(), ids[1_000].clone()))?;
+        assert!(wrapper.stats.records_hashed <= 2 * size);
+
+        // Counting and the offset lookup read only partial buckets too.
+        wrapper.stats = SplitStats::default();
+        wrapper.get_range_len(range.clone())?;
+        wrapper.get_nth_key(range, 4_000)?;
+        assert!(
+            wrapper.stats.records_read <= 4 * size,
+            "read {} records",
+            wrapper.stats.records_read
+        );
+        Ok(())
+    }
+
+    /// The pre-bucket behaviour of the split path: every query walks the
+    /// range.
+    struct Walking<'a, 'b>(&'b mut StoreInstance<'a>);
+
+    impl<'a, 'b> crate::ranger::Store<SignedEntry> for Walking<'a, 'b> {
+        type Error = anyhow::Error;
+        type RangeIterator<'x>
+            = <StoreInstance<'a> as crate::ranger::Store<SignedEntry>>::RangeIterator<'x>
+        where
+            Self: 'x;
+        type ParentIterator<'x>
+            = <StoreInstance<'a> as crate::ranger::Store<SignedEntry>>::ParentIterator<'x>
+        where
+            Self: 'x;
+
+        fn get_first(&mut self) -> Result<RecordIdentifier> {
+            self.0.get_first()
+        }
+        fn get(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
+            self.0.get(id)
+        }
+        fn len(&mut self) -> Result<usize> {
+            self.0.len()
+        }
+        fn is_empty(&mut self) -> Result<bool> {
+            self.0.is_empty()
+        }
+        fn get_fingerprint(&mut self, range: &Range<RecordIdentifier>) -> Result<Fingerprint> {
+            if range.is_all() {
+                return self.0.get_fingerprint(range);
+            }
+            let mut fp = Fingerprint::empty();
+            for el in self.0.get_range(range.clone())? {
+                fp ^= el?.as_fingerprint();
+            }
+            Ok(fp)
+        }
+        fn entry_put(&mut self, entry: SignedEntry) -> Result<()> {
+            self.0.entry_put(entry)
+        }
+        fn get_range(&mut self, range: Range<RecordIdentifier>) -> Result<Self::RangeIterator<'_>> {
+            self.0.get_range(range)
+        }
+        fn prefixed_by(&mut self, id: &RecordIdentifier) -> Result<Self::RangeIterator<'_>> {
+            self.0.prefixed_by(id)
+        }
+        fn prefixes_of(&mut self, id: &RecordIdentifier) -> Result<Self::ParentIterator<'_>> {
+            self.0.prefixes_of(id)
+        }
+        fn all(&mut self) -> Result<Self::RangeIterator<'_>> {
+            self.0.all()
+        }
+        fn entry_remove(&mut self, id: &RecordIdentifier) -> Result<Option<SignedEntry>> {
+            self.0.entry_remove(id)
+        }
+        fn remove_prefix_filtered(
+            &mut self,
+            id: &RecordIdentifier,
+            predicate: impl Fn(&Record) -> bool,
+        ) -> Result<usize> {
+            self.0.remove_prefix_filtered(id, predicate)
+        }
+    }
+
+    /// Run a full reconciliation between two stores and return every message
+    /// in order.
+    async fn reconcile<S: crate::ranger::Store<SignedEntry>>(
+        alice: &mut S,
+        bob: &mut S,
+    ) -> Result<Vec<crate::ranger::Message<SignedEntry>>> {
+        use crate::{ranger::SyncConfig, ContentStatus};
+        let config = SyncConfig::default();
+        let mut log = Vec::new();
+        let mut message = Some(alice.initial_message().map_err(Into::into)?);
+        let mut to_bob = true;
+        while let Some(current) = message {
+            log.push(current.clone());
+            let target: &mut S = if to_bob { &mut *bob } else { &mut *alice };
+            message = target
+                .process_message(
+                    &config,
+                    current,
+                    |_, _, _| true,
+                    async |_, _, _, _| {},
+                    async |_| ContentStatus::Complete,
+                )
+                .await
+                .map_err(Into::into)?;
+            to_bob = !to_bob;
+            assert!(log.len() < 200, "reconciliation does not terminate");
+        }
+        Ok(log)
+    }
+
+    /// Two overlapping replicas reconcile through the same messages whether
+    /// the split path reads the buckets or walks the ranges, and end equal.
+    #[tokio::test]
+    async fn reconciliation_messages_match_the_walking_store() -> Result<()> {
+        let namespace = NamespaceSecret::from_bytes(&[3u8; 32]);
+        let authors: Vec<Author> = (1..=3u8).map(|i| Author::from_bytes(&[i; 32])).collect();
+        let id = namespace.id();
+
+        let populate = |store: &mut Store, mine: usize| -> Result<()> {
+            let _replica = store.new_replica(namespace.clone())?;
+            store.close_replica(id);
+            let mut wrapper = StoreInstance::new(id, store);
+            for (a, author) in authors.iter().enumerate() {
+                for i in 0..120u64 {
+                    // Both replicas share the multiples of three; each
+                    // also holds records the other lacks.
+                    if i % 3 == 0 || (i as usize + a + mine) % 5 == mine {
+                        let key = format!("k/{i:03}");
+                        wrapper.put(fixed_entry(&namespace, author, &key, &[i as u8], i + 1))?;
+                    }
+                }
+            }
+            // One tombstone prefix, on one side only.
+            if mine == 0 {
+                wrapper.put(fixed_entry(&namespace, &authors[1], "k/05", &[], 500))?;
+            }
+            Ok(())
+        };
+
+        let (mut fast_a, mut fast_b) = (Store::memory(), Store::memory());
+        let (mut walk_a, mut walk_b) = (Store::memory(), Store::memory());
+        for store in [&mut fast_a, &mut walk_a] {
+            populate(store, 0)?;
+        }
+        for store in [&mut fast_b, &mut walk_b] {
+            populate(store, 1)?;
+        }
+
+        let _small = buckets::BucketSizeGuard::new(4);
+        let fast = {
+            let (mut a, mut b) = (
+                StoreInstance::new(id, &mut fast_a),
+                StoreInstance::new(id, &mut fast_b),
+            );
+            let log = reconcile(&mut a, &mut b).await?;
+            // One round per message processed, and every differing range
+            // is binned.
+            let (a, b) = (a.stats, b.stats);
+            assert_eq!(a.rounds + b.rounds, log.len() as u64);
+            assert_eq!(a.ranges_per_round.len() as u64, a.rounds);
+            assert_eq!(b.ranges_per_round.len() as u64, b.rounds);
+            assert!(a.size_bins.iter().sum::<u64>() > 0 && b.records_read > 0);
+            a.log_summary();
+            log
+        };
+        let walking = {
+            let (mut a, mut b) = (
+                StoreInstance::new(id, &mut walk_a),
+                StoreInstance::new(id, &mut walk_b),
+            );
+            let (mut a, mut b) = (Walking(&mut a), Walking(&mut b));
+            reconcile(&mut a, &mut b).await?
+        };
+        assert!(fast.len() > 6, "the replicas barely differed");
+        assert_eq!(fast, walking);
+
+        // Both ended with the same records.
+        let ends = |store: &mut Store| -> Result<Vec<RecordIdentifier>> {
+            let mut wrapper = StoreInstance::new(id, store);
+            let ids = wrapper
+                .all()?
+                .map(|entry| entry.map(|entry| entry.id().clone()))
+                .collect::<Result<_>>();
+            ids
+        };
+        assert_eq!(ends(&mut fast_a)?, ends(&mut fast_b)?);
+        assert_eq!(ends(&mut fast_a)?, ends(&mut walk_a)?);
         Ok(())
     }
 }
