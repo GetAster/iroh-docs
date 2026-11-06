@@ -290,7 +290,8 @@ impl<E: RangeEntry> From<Message<E, (E, ContentStatus)>> for Message<E> {
     }
 }
 
-/// Counters for the split path of one sync session, summed over its rounds.
+/// Counters for one sync session, summed over its rounds: the split path,
+/// and the entries received from the remote.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SplitStats {
     /// Number of `process_message` calls.
@@ -305,6 +306,17 @@ pub(crate) struct SplitStats {
     /// Records read by the split path outside fingerprinting: counting,
     /// offset lookups and collected sub-ranges.
     pub(crate) records_read: u64,
+    /// Entries received from the remote.
+    pub(crate) entries_received: u64,
+    /// Received entries dropped unvalidated: an entry at their key or a
+    /// prefix of it is at least as new.
+    pub(crate) entries_stale: u64,
+    /// Received entries validated, signatures included.
+    pub(crate) entries_validated: u64,
+    /// Validated entries that failed validation.
+    pub(crate) entries_rejected: u64,
+    /// Received entries inserted.
+    pub(crate) entries_inserted: u64,
 }
 
 impl SplitStats {
@@ -332,6 +344,11 @@ impl SplitStats {
             ?size_bins,
             records_hashed = self.records_hashed,
             records_read = self.records_read,
+            entries_received = self.entries_received,
+            entries_stale = self.entries_stale,
+            entries_validated = self.entries_validated,
+            entries_rejected = self.entries_rejected,
+            entries_inserted = self.entries_inserted,
             "set reconciliation summary"
         );
     }
@@ -527,14 +544,23 @@ pub trait Store<E: RangeEntry>: Sized {
                 })
             };
 
-            // Store incoming values
+            // Store incoming values. An entry that would not be inserted is
+            // dropped before validation, which verifies two signatures.
             for (entry, content_status, content) in values {
-                if validate_cb(self, &entry, content_status) {
-                    // TODO: Get rid of the clone?
-                    let outcome = self.put(entry.clone())?;
-                    if let InsertOutcome::Inserted { .. } = outcome {
-                        on_insert_cb(self, entry, content_status, content).await;
-                    }
+                let would_insert = self.would_insert(&entry)?;
+                let valid = would_insert && validate_cb(self, &entry, content_status);
+                // TODO: Get rid of the clone?
+                let inserted =
+                    valid && matches!(self.put(entry.clone())?, InsertOutcome::Inserted { .. });
+                if let Some(stats) = self.split_stats() {
+                    stats.entries_received += 1;
+                    stats.entries_stale += u64::from(!would_insert);
+                    stats.entries_validated += u64::from(would_insert);
+                    stats.entries_rejected += u64::from(would_insert && !valid);
+                    stats.entries_inserted += u64::from(inserted);
+                }
+                if inserted {
+                    on_insert_cb(self, entry, content_status, content).await;
                 }
             }
 
@@ -740,6 +766,24 @@ pub trait Store<E: RangeEntry>: Sized {
         }
     }
 
+    /// Whether [`Self::put`] would insert `entry`: it compares strictly greater
+    /// than every stored entry at its key or at a prefix of its key.
+    ///
+    /// Answering from the store alone, this is cheaper than validating an
+    /// entry that would be dropped anyway.
+    fn would_insert(&mut self, entry: &E) -> Result<bool, Self::Error> {
+        // From the willow spec:
+        // "Remove all entries whose timestamp is strictly less than the timestamp of any other entry [..]
+        // whose path is a prefix of p." and then "remove all but those whose record has the greatest hash component".
+        // This is the contract of the `Ord` impl for `E::Value`.
+        for prefix_entry in self.prefixes_of(entry.key())? {
+            if entry.value() <= prefix_entry?.value() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Insert a key value pair.
     ///
     /// Entries are inserted if they compare strictly greater than all entries in the set of
@@ -754,17 +798,8 @@ pub trait Store<E: RangeEntry>: Sized {
     /// Returns `true` if the entry was inserted.
     /// Returns `false` if it was not inserted.
     fn put(&mut self, entry: E) -> Result<InsertOutcome, Self::Error> {
-        let prefix_entry = self.prefixes_of(entry.key())?;
-        // First we check if our entry is strictly greater than all parent elements.
-        // From the willow spec:
-        // "Remove all entries whose timestamp is strictly less than the timestamp of any other entry [..]
-        // whose path is a prefix of p." and then "remove all but those whose record has the greatest hash component".
-        // This is the contract of the `Ord` impl for `E::Value`.
-        for prefix_entry in prefix_entry {
-            let prefix_entry = prefix_entry?;
-            if entry.value() <= prefix_entry.value() {
-                return Ok(InsertOutcome::NotInserted);
-            }
+        if !self.would_insert(&entry)? {
+            return Ok(InsertOutcome::NotInserted);
         }
 
         // Now we remove all entries that have our key as a prefix and are older than our entry.

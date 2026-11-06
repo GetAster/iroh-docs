@@ -644,6 +644,17 @@ where
     ) -> Result<usize, InsertError> {
         let namespace = self.id();
 
+        // A remote entry that would not be inserted is dropped before its
+        // two signatures are verified.
+        if !matches!(origin, InsertOrigin::Local)
+            && !self
+                .store
+                .would_insert(&entry)
+                .map_err(InsertError::Store)?
+        {
+            return Err(InsertError::NewerEntryExists);
+        }
+
         let allowed_writers = self.store.allowed_writers().map_err(InsertError::Store)?;
         let store = &self.store;
         validate_entry(
@@ -1950,6 +1961,47 @@ mod tests {
         let store = store::Store::memory();
         test_timestamps(store).await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_remote_entry_dropped_before_verify() -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let mut store = store::Store::memory();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let other = NamespaceSecret::new(&mut rng);
+        let _replica = store.new_replica(namespace.clone())?;
+        let author = store.new_author(&mut rng)?;
+        store.close_replica(namespace.id());
+        let mut replica = store.open_replica(&namespace.id())?;
+
+        let key = b"k";
+        let entry = |timestamp, secret: &NamespaceSecret| {
+            let id = RecordIdentifier::new(namespace.id(), author.id(), key);
+            Entry::new(id, Record::from_data(b"v", timestamp)).sign(secret, &author)
+        };
+        replica
+            .insert_entry(entry(2, &namespace), InsertOrigin::Local)
+            .await?;
+
+        // Signed with the wrong namespace key: it fails verification when it
+        // would be inserted, and is dropped unverified when it would not be.
+        let res = replica
+            .insert_remote_entry(entry(3, &other), [0u8; 32], ContentStatus::Missing)
+            .await;
+        assert!(matches!(
+            res,
+            Err(InsertError::Validation(ValidationFailure::BadSignature))
+        ));
+        let res = replica
+            .insert_remote_entry(entry(1, &other), [0u8; 32], ContentStatus::Missing)
+            .await;
+        assert!(matches!(res, Err(InsertError::NewerEntryExists)));
+        let res = replica
+            .insert_remote_entry(entry(2, &namespace), [0u8; 32], ContentStatus::Missing)
+            .await;
+        assert!(matches!(res, Err(InsertError::NewerEntryExists)));
+        store.close_replica(namespace.id());
         Ok(())
     }
 
