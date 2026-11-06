@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1028` |
-| Pinned commit | `d03a9c3bb2dc328e18dbd6b475278d793e27644d` |
-| Crate version | 0.101.1028 (workspace spec `iroh-docs = "0.101.1028"`) |
+| Tag | `aster-iroh-docs-v0.101.1029` |
+| Pinned commit | `e3dd9dcb0ad89baaf3cda26fed1eb592308879de` |
+| Crate version | 0.101.1029 (workspace spec `iroh-docs = "0.101.1029"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins ir
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "0f14e7ef455309a8f5f56c644243c221ba1b41ee" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "e3dd9dcb0ad89baaf3cda26fed1eb592308879de" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -91,6 +91,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 69 | none recorded | A graceful close by the peer completes a sync's closing phase: `close_streams` (both sides) treats an application close with code 0 during finish / `stopped` / `read_to_end` as done. The side that finished first drops the connection while the other may still wait for the acknowledgement of its final frame, which the close overtakes and a lost acknowledgement never resends, so rounds whose exchange had succeeded failed with "Failed to close"; under 0.5% loss that failed Aster enrollment's policy syncs. Any other close code still fails. Tests: `net::close_tests` (the graceful case fails with the classification disabled). |
 | 70 | none recorded | `SyncFinished` carries a failed sync's whole cause chain (`{err:#}`), not just the top-level message, which read "Failed to close connection1" with nothing about what failed. |
 | 71 | none recorded | Split ranges in set reconciliation are answered from maintained bucket aggregates. A new table (`namespace-buckets-1`) partitions each namespace's records, in records-table order, into contiguous buckets of about 512 (`BUCKET_SIZE`), each keyed by its first record and holding a count and the XOR of its record fingerprints. Every write to the records table updates it in the same transaction, and it is rebuilt with the namespace fingerprint on open. `get_fingerprint`, `get_range_len` and the new `Store::get_nth_key` combine the buckets a range covers and read only the two it cuts through, O(N/B + B) instead of O(range). `process_message` computes the start index and pivots through them and collects a sub-range only when it is small enough to send. Messages are byte-identical to before. Per-session counters (rounds, ranges per round, range size bins, records hashed and read) are logged at debug as "set reconciliation summary". Before, a sync under live ingest walked and hashed every record of every split range at every level, about 10 times per record per sync; on portal-sync's 1M-file cell BLAKE3 was 14% of the receiver docs actor. Tests: `bucket_aggregates_track_random_ops_{memory,fs}`, `split_range_fingerprint_hashes_only_the_end_buckets`, `reconciliation_messages_match_the_walking_store`, `remove_replica_clears_bucket_rows`; debug builds cross-check every bucket answer against a scan. |
+| 72 | none recorded | Reads stop committing, and stale remote entries skip signature verification. `get_many` and `get_many_vec` read the open write transaction (`QueryIterator` runs over an owned snapshot or the write transaction's borrowed tables) instead of taking a snapshot, which committed it: every query was a redb commit plus `fdatasync`. `get_many` collects up to `COLLECTED_QUERY_LIMIT` (4096) entries this way; only a larger result commits, to stream. `content_hashes` (blobs GC protect) still commits. `ranger::Store::would_insert` runs the newer-than-existing check that `put` makes; set reconciliation and `insert_remote_entry` run it before validation, so a duplicate or stale entry is dropped without verifying its two signatures (a stale entry with a bad signature reports `NewerEntryExists`). The sync summary adds entries received, stale, validated, rejected and inserted. Asked for by portal-sync (§M) after its 1M-file cell on 0.101.1028. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -188,7 +189,20 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1028 (2026-11-06), current
+### 0.101.1029 (2026-11-06), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1029` | `e3dd9dcb0ad89baaf3cda26fed1eb592308879de` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-06, 0.101.1029** (`e3dd9dc`, tag `aster-iroh-docs-v0.101.1029`):
+  row 72 (`ad187fa`, `1ae8b65`), queries read the open write transaction
+  instead of committing it; remote entries that would not be inserted are
+  dropped before signature verification; per-sync entry counters. Asked for
+  by portal-sync (§M) after its 1M-file cell on 0.101.1028. Validation: full
+  local suite green (145 lib plus integration and doc), fmt and clippy clean.
+
+### 0.101.1028 (2026-11-06)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
