@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1023` |
-| Pinned commit | `c8fb2f074c2462bf34b1d1f6af519830a14b33c9` |
-| Crate version | 0.101.1023 (workspace spec `iroh-docs = "0.101.1023"`) |
+| Tag | `aster-iroh-docs-v0.101.1025` |
+| Pinned commit | `1a50fb17d8f36fa364f4c00a0b243bed09ae555e` |
+| Crate version | 0.101.1025 (workspace spec `iroh-docs = "0.101.1025"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins ir
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "c8fb2f074c2462bf34b1d1f6af519830a14b33c9" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "1a50fb17d8f36fa364f4c00a0b243bed09ae555e" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -86,6 +86,8 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 64 | none recorded | `insert_with_value` debug-asserts that carried inline value bytes hash to the entry hash and match `len`, and `Event::LocalInsert` documents that every replica-event subscriber — not only the live actor — sees the carried value. Files: `src/sync.rs`. | Review minor on 0.101.1020: the live actor announces the carried bytes as that hash's content, so a mismatch would announce a value every receiver rejects while the blob store holds different bytes under the same hash. Production callers derive the hash from the same bytes, so this is an internal-consistency check. | `833cd6f`; released in 0.101.1021 | carried | Aster's own. Debug-build check only; exercised by the existing `tests/inline_values.rs` suite. |
 | 65 | none recorded | Moves the fingerprint rebuild in `load_replica_info` ahead of registering the replica open: the id enters `open_replicas` only after `rebuild_namespace_fingerprint` succeeds, so a failed rebuild leaves the namespace fully closed (removable, retirable) instead of half-open until restart. Files: `src/store/fs.rs`. | Peer-review nit on 0.101.1021: the rebuild was the only fallible step after the tables read, and registering open first made its failure mode a half-open namespace - `remove_replica` and `retire_write_authority` refuse open namespaces. | `c6b0732`; released in 0.101.1022 | carried | Aster's own. No behavior change on the success path; the 0.101.1021 rebuild test is unchanged. Full local suite green (130 lib + 57 integration + doc), fmt and clippy `--all-features --all-targets -D warnings` clean. |
 | 66 | none recorded | `entries_since` stops walking the touch index once the page holds `limit` entries, so a page reads O(`limit`) rows instead of the whole tail; rows left by 0.101.1018 (no key index) are skipped when the key index points past them and deduped within a page, so such a key may reappear on a later page. Removing a record (`remove_prefix_filtered`, `entry_remove`) drops its touch rows, and `remove_replica` clears the key index before the records it reads (it iterated the already-cleared records table and leaked every key-index row). Files: `src/store/fs.rs`. | portal-sync V0b 1M-file cell (Aster 0.3.1861): the docs actor thread was bound at 80-99% of a core; each 256-key page from a receiver 900k behind read ~900k index rows and ~900k records, so catch-up was quadratic. Same code since 0.101.1018. | `d13a4ec`; released in 0.101.1023 | carried | Aster's own. Acceptance: a 256-entry page from a 900k tail of 1M records reads exactly 256 index rows (`entries_since_page_reads_limit_rows_1m`, ignored, release build, 41 s); new tests for prefix-delete cleanup, uncompacted rows and the replica-removal key index. Full local suite green (133 lib + 57 integration + doc), fmt and clippy `--all-features --all-targets -D warnings` clean. |
+| 67 | none recorded | The insert guard counts empty entries as parents: `parents()` (the `prefixes_of` lookup that `put` checks every insert against) read with `include_empty = false`, so a deletion marker, which is an empty entry, never outranked the older entry being inserted. A peer that had not yet seen a delete synced the removed entries back and they were inserted again, for prefix and exact-key deletes alike. Upstream since `f1c3cf9` (2024-05). Test: `test_stale_entry_after_delete_{memory,fs}` (fails without the fix on both cases). |
+| 68 | none recorded | A failed content download is fetched again on its own: the namespace gets a retry (`MissingRetry`) at 1 s, doubling per failure to 60 s, that queues its missing hashes from their known providers and its gossip neighbours, and clears once nothing is missing or the namespace closes. Before, a failed download returned to `missing_hashes` and was redriven only when a later sync round finished, which a quiet swarm (updates by gossip) may never run, so the content stayed missing for good. Test: `failed_content_download_is_retried_without_a_new_sync` (fault hook `fail_next_downloads`; times out with the retry disabled). |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -183,7 +185,25 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1023 (2026-11-05), current
+### 0.101.1025 (2026-11-06), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1025` | `1a50fb17d8f36fa364f4c00a0b243bed09ae555e` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-06, 0.101.1025** (`1a50fb1`, tag `aster-iroh-docs-v0.101.1025`,
+  option E, `n = 25`; 0.101.1024 at `2dca7a4` was pushed but never tagged
+  or consumed): two bugs found by Aster's loopback netem sweep. Row 67
+  (`0154dd4`): a deletion marker outranks older entries synced back to it;
+  a late joiner held a prefix-deleted key because the writer had taken it
+  back from a peer that synced before seeing the delete. Row 68 (`9c0a8a1`):
+  a failed content download is retried with backoff; a joining peer never
+  read a record whose content download failed once. Validation at the
+  pinned commit: full local suite green (136 lib + integration + doc), fmt
+  and clippy clean, both new tests fail with their fix disabled. Aster
+  consumer trial: pin bump in `aster-rpc-internal` main.
+
+### 0.101.1023 (2026-11-05)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
