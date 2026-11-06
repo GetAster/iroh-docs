@@ -55,6 +55,23 @@ const MAX_PENDING_VALUES: usize = 1024;
 /// race; an entry normally arrives within one sync exchange.
 const PENDING_VALUE_TTL: Duration = Duration::from_secs(60);
 
+/// First wait before a namespace's missing content is fetched again after a
+/// download failed; it doubles per failure up to [`MISSING_RETRY_MAX`].
+const MISSING_RETRY_FIRST: Duration = Duration::from_secs(1);
+const MISSING_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Backoff for re-fetching a namespace's missing content. Without it a failed
+/// download is retried only at the end of a later sync round, and a quiet
+/// swarm, whose updates arrive by gossip, may never run one.
+#[derive(Debug)]
+struct MissingRetry {
+    /// When to fetch again; `None` while no download has failed since the
+    /// last attempt.
+    due: Option<Instant>,
+    /// The wait the next failure schedules.
+    step: Duration,
+}
+
 /// A per-context rate limiter: `allow` returns true once per [`WARN_LIMITER_INTERVAL`].
 #[derive(Debug, Default)]
 pub(super) struct WarnLimiter {
@@ -327,6 +344,9 @@ pub struct LiveActor {
     /// rejected entries. The offerers are dialed when the re-sync fires even
     /// if they are no longer gossip neighbors.
     deferred_resyncs: HashMap<NamespaceId, (Instant, HashSet<PublicKey>)>,
+    /// Namespaces whose missing content is fetched again after a failed
+    /// download; see [`MissingRetry`].
+    missing_retries: HashMap<NamespaceId, MissingRetry>,
     /// When we last warned about validation rejects, per namespace.
     validation_warned: HashMap<NamespaceId, Instant>,
     /// When we last reacted to a gossip lag, per namespace.
@@ -401,6 +421,7 @@ impl LiveActor {
             sync_inactivity_timeout: DEFAULT_SYNC_INACTIVITY_TIMEOUT,
             neighbors: Default::default(),
             deferred_resyncs: Default::default(),
+            missing_retries: Default::default(),
             validation_warned: Default::default(),
             lagged_reacted: Default::default(),
         })
@@ -510,6 +531,10 @@ impl LiveActor {
                 _ = Self::deferred_resync_timer(&self.deferred_resyncs), if !self.deferred_resyncs.is_empty() => {
                     trace!(?i, "tick: deferred resync");
                     self.fire_deferred_resyncs();
+                }
+                _ = Self::missing_retry_timer(&self.missing_retries), if self.missing_retries.values().any(|r| r.due.is_some()) => {
+                    trace!(?i, "tick: missing content retry");
+                    self.fire_missing_retries().await;
                 }
             }
         }
@@ -674,6 +699,71 @@ impl LiveActor {
             .min()
             .unwrap_or_else(Instant::now);
         n0_future::time::sleep_until(earliest)
+    }
+
+    /// A timer that completes when the earliest missing-content retry is due.
+    fn missing_retry_timer(retries: &HashMap<NamespaceId, MissingRetry>) -> n0_future::time::Sleep {
+        let earliest = retries
+            .values()
+            .filter_map(|r| r.due)
+            .min()
+            .unwrap_or_else(Instant::now);
+        n0_future::time::sleep_until(earliest)
+    }
+
+    /// After a failed download, fetch the namespace's missing content again
+    /// once its backoff has passed.
+    fn schedule_missing_retry(&mut self, namespace: NamespaceId) {
+        let retry = self
+            .missing_retries
+            .entry(namespace)
+            .or_insert(MissingRetry {
+                due: None,
+                step: MISSING_RETRY_FIRST,
+            });
+        if retry.due.is_none() {
+            retry.due = Some(Instant::now() + retry.step);
+            retry.step = (retry.step * 2).min(MISSING_RETRY_MAX);
+        }
+    }
+
+    /// Queue the missing content of every namespace whose retry is due, from
+    /// the nodes known to hold each hash and the namespace's gossip
+    /// neighbors. A failure reschedules with the next, longer wait; the
+    /// backoff resets once nothing is missing.
+    async fn fire_missing_retries(&mut self) {
+        let now = Instant::now();
+        let due: Vec<NamespaceId> = self
+            .missing_retries
+            .iter()
+            .filter(|(_, r)| r.due.is_some_and(|at| at <= now))
+            .map(|(namespace, _)| *namespace)
+            .collect();
+        for namespace in due {
+            let missing = self.missing_hashes.hashes_for_namespace(&namespace);
+            if missing.is_empty() || !self.state.is_syncing(&namespace) {
+                self.missing_retries.remove(&namespace);
+                continue;
+            }
+            if let Some(retry) = self.missing_retries.get_mut(&namespace) {
+                retry.due = None;
+            }
+            let neighbors = self.neighbors.get(&namespace).cloned().unwrap_or_default();
+            debug!(
+                namespace = %namespace.fmt_short(),
+                missing = missing.len(),
+                "retry missing content",
+            );
+            for hash in missing {
+                let mut peers: HashSet<PublicKey> =
+                    self.known_providers(hash).into_iter().collect();
+                peers.extend(neighbors.iter().copied());
+                for peer in peers {
+                    self.queue_download(namespace, hash, peer, true);
+                }
+            }
+        }
+        self.flush_pending_downloads().await;
     }
 
     /// Start re-syncs for the namespaces whose deferred re-sync time has arrived.
@@ -925,6 +1015,7 @@ impl LiveActor {
         }
         self.neighbors.remove(&namespace);
         self.deferred_resyncs.remove(&namespace);
+        self.missing_retries.remove(&namespace);
         self.validation_warned.remove(&namespace);
         self.lagged_reacted.remove(&namespace);
         if kill_subscribers {
@@ -1266,11 +1357,19 @@ impl LiveActor {
         if complete {
             for namespace in removed.namespaces.iter().copied() {
                 self.missing_hashes.remove(hash, &namespace);
+                if self
+                    .missing_hashes
+                    .hashes_for_namespace(&namespace)
+                    .is_empty()
+                {
+                    self.missing_retries.remove(&namespace);
+                }
                 self.emit_content_ready(namespace, hash).await;
             }
         } else {
-            for namespace in &removed.namespaces {
-                self.missing_hashes.insert(hash, *namespace);
+            for namespace in removed.namespaces.iter().copied() {
+                self.missing_hashes.insert(hash, namespace);
+                self.schedule_missing_retry(namespace);
             }
         }
         for namespace in removed.completed_namespaces.iter() {
@@ -1647,12 +1746,18 @@ impl LiveActor {
                 self.queued_hashes.insert(hash, namespace);
                 self.missing_hashes.remove(hash, &namespace);
             }
+            #[cfg(test)]
+            let injected = fault::take_download_failure(&download_namespace);
+            #[cfg(not(test))]
+            let injected = false;
             let task = self.download_tasks.spawn(async move {
-                (
-                    download_namespace,
-                    hash,
-                    handle.await.map_err(|e| anyhow::anyhow!(e)),
-                )
+                let res = if injected {
+                    drop(handle);
+                    Err(anyhow::anyhow!("injected download failure"))
+                } else {
+                    handle.await.map_err(|e| anyhow::anyhow!(e))
+                };
+                (download_namespace, hash, res)
             });
             self.download_task_ids
                 .insert(task.id(), (download_namespace, hash));
@@ -2059,6 +2164,27 @@ pub(crate) mod fault {
         }
     }
 
+    static FAILED_DOWNLOADS: Mutex<Vec<(NamespaceId, usize)>> = Mutex::new(Vec::new());
+
+    /// Fail the next `count` content downloads for `namespace` without
+    /// contacting any provider.
+    pub(crate) fn fail_next_downloads(namespace: NamespaceId, count: usize) {
+        FAILED_DOWNLOADS.lock().unwrap().push((namespace, count));
+    }
+
+    /// Whether this download is one of the armed failures.
+    pub(crate) fn take_download_failure(namespace: &NamespaceId) -> bool {
+        let mut armed = FAILED_DOWNLOADS.lock().unwrap();
+        let Some(pos) = armed.iter().position(|(ns, _)| ns == namespace) else {
+            return false;
+        };
+        armed[pos].1 -= 1;
+        if armed[pos].1 == 0 {
+            armed.remove(pos);
+        }
+        true
+    }
+
     /// Armed stalls for remote inserts (gossip puts): (namespace, remaining, delay).
     static DELAYED_INSERTS: Mutex<Vec<(NamespaceId, usize, Duration)>> = Mutex::new(Vec::new());
 
@@ -2191,6 +2317,53 @@ mod task_failure_tests {
         })
         .await??;
         assert_eq!(entry.content_len(), 5);
+
+        b.router.shutdown().await?;
+        a.router.shutdown().await?;
+        Ok(())
+    }
+
+    /// A content download that fails is fetched again on its own, without a
+    /// later sync round: in a quiet swarm, whose updates arrive by gossip,
+    /// no round may come, and the content stayed missing for good.
+    #[tokio::test]
+    async fn failed_content_download_is_retried_without_a_new_sync() -> anyhow::Result<()> {
+        let a = node().await?;
+        let b = node().await?;
+        let author = a.docs.api().author_create().await?;
+        let doc_a = a.docs.api().create().await?;
+        // Over the inline threshold, so the content is a download, not a
+        // value carried with the entry.
+        let value = vec![7u8; 64 * 1024];
+        let hash = doc_a
+            .set_bytes(author, b"key".to_vec(), value.clone())
+            .await?;
+        let ticket = doc_a
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await?;
+        let doc_b = b
+            .docs
+            .api()
+            .import_namespace(ticket.capability.clone())
+            .await?;
+        let mut events = doc_b.subscribe().await?;
+
+        // Every download a sync round's redrive could start fails too, so
+        // only a retry outside the rounds can fetch the content.
+        super::fault::fail_next_downloads(doc_b.id(), 4);
+        doc_b.start_sync(ticket.nodes.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(ev) = events.next().await {
+                if let LiveEvent::ContentReady { hash: ready } = ev? {
+                    if ready == hash {
+                        return anyhow::Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("event stream ended: the live actor stopped")
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the failed content was never fetched again"))??;
 
         b.router.shutdown().await?;
         a.router.shutdown().await?;
