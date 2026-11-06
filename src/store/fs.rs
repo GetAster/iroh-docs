@@ -1480,7 +1480,10 @@ fn parents(
     let mut res = Vec::new();
 
     while !key.is_empty() {
-        let entry = get_exact(table, namespace, author, &key, false);
+        // Empty entries included: a deletion marker is an empty entry, and
+        // it must outrank every older entry at or below its key, or a peer
+        // that has not yet seen the delete syncs the removed entries back.
+        let entry = get_exact(table, namespace, author, &key, true);
         key.pop();
         match entry {
             Err(err) => res.push(Err(err)),

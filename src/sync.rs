@@ -2651,6 +2651,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stale_entry_after_delete_memory() -> Result<()> {
+        test_stale_entry_after_delete(store::Store::memory()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn test_stale_entry_after_delete_fs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        test_stale_entry_after_delete(store::fs::Store::persistent(dbfile.path())?).await
+    }
+
+    /// A peer that has not yet seen a delete still holds, and syncs back, the
+    /// entries it removed. The deletion marker is an empty entry and must win
+    /// over every older entry at or below its key, or the delete is undone.
+    async fn test_stale_entry_after_delete(mut store: Store) -> Result<()> {
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let myspace = NamespaceSecret::new(&mut rng);
+        let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert(b"ops/1", &author, b"one").await?;
+        replica.hash_and_insert(b"solo", &author, b"two").await?;
+        let stale_child = store
+            .get_exact(myspace.id(), author.id(), b"ops/1", false)?
+            .expect("ops/1 written");
+        let stale_exact = store
+            .get_exact(myspace.id(), author.id(), b"solo", false)?
+            .expect("solo written");
+
+        let mut replica = store.new_replica(myspace.clone())?;
+        assert_eq!(replica.delete_prefix(b"ops/", &author).await?, 1);
+        assert_eq!(replica.delete_prefix(b"solo", &author).await?, 1);
+
+        let peer = [7u8; 32];
+        let mut keys = Vec::new();
+        for stale in [stale_child, stale_exact] {
+            let key = stale.key().to_vec();
+            let res = replica
+                .insert_remote_entry(stale, peer, ContentStatus::Complete)
+                .await;
+            assert!(
+                matches!(res, Err(InsertError::NewerEntryExists)),
+                "{}: {res:?}",
+                String::from_utf8_lossy(&key)
+            );
+            keys.push(key);
+        }
+        drop(replica);
+        for key in keys {
+            assert_eq!(
+                store.get_exact(myspace.id(), author.id(), &key, false)?,
+                None
+            );
+        }
+        store.flush()?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_replica_sync_delete_memory() -> Result<()> {
         let alice_store = store::Store::memory();
         let bob_store = store::Store::memory();
