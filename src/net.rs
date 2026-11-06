@@ -65,6 +65,51 @@ fn close_timed_out(connection: &iroh::endpoint::Connection) {
     connection.close(TIMEOUT_CLOSE_CODE.into(), b"sync inactivity timeout");
 }
 
+/// Whether the peer closed the connection gracefully (application code 0,
+/// what dropping its last connection handle sends).
+///
+/// Each side ends an exchange by finishing its stream, waiting for the peer
+/// to acknowledge it, and reading the peer's stream to its end; the side that
+/// gets there first drops the connection. The other may still be waiting for
+/// the acknowledgement of its final frame, which the close can overtake (or a
+/// lost packet can carry, and acknowledgements are not retransmitted). Once
+/// the exchange itself succeeded, a graceful close by the peer during this
+/// closing phase means the peer is done, not that the sync failed.
+fn closed_gracefully_by_peer(error: &iroh::endpoint::ConnectionError) -> bool {
+    matches!(
+        error,
+        iroh::endpoint::ConnectionError::ApplicationClosed(close)
+            if close.error_code == iroh::endpoint::VarInt::from_u32(0)
+    )
+}
+
+/// Finish our stream, wait for the peer to take it, and read the peer's
+/// stream to its end; a graceful close by the peer at any point counts as
+/// done (see [`closed_gracefully_by_peer`]).
+async fn close_streams(
+    send_stream: &mut iroh::endpoint::SendStream,
+    recv_stream: &mut iroh::endpoint::RecvStream,
+) -> anyhow::Result<()> {
+    use iroh::endpoint::{ReadError, ReadToEndError, StoppedError};
+    send_stream.finish()?;
+    match send_stream.stopped().await {
+        Ok(_) => {}
+        Err(StoppedError::ConnectionLost(error)) if closed_gracefully_by_peer(&error) => {
+            return Ok(())
+        }
+        Err(error) => return Err(error.into()),
+    }
+    match recv_stream.read_to_end(0).await {
+        Ok(_) => Ok(()),
+        Err(ReadToEndError::Read(ReadError::ConnectionLost(error)))
+            if closed_gracefully_by_peer(&error) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Connect to a peer and sync a replica
 ///
 /// The exchange is abandoned after [`DEFAULT_SYNC_INACTIVITY_TIMEOUT`] without progress.
@@ -197,17 +242,9 @@ async fn close_connect(
     recv_stream: &mut iroh::endpoint::RecvStream,
     inactivity: Duration,
 ) -> Result<(), ConnectError> {
-    let closing = async {
-        send_stream.finish().map_err(ConnectError::close)?;
-        send_stream.stopped().await.map_err(ConnectError::close)?;
-        recv_stream
-            .read_to_end(0)
-            .await
-            .map_err(ConnectError::close)?;
-        Ok(())
-    };
+    let closing = close_streams(send_stream, recv_stream);
     match timeout(inactivity, closing).await {
-        Ok(res) => res,
+        Ok(res) => res.map_err(ConnectError::close),
         Err(_) => {
             close_timed_out(connection);
             Err(ConnectError::timeout(inactivity))
@@ -306,22 +343,9 @@ where
         // The peer is not answering, so the closing handshake would not complete either.
         close_timed_out(&connection);
     } else {
-        let closing = async {
-            send_stream
-                .finish()
-                .map_err(|error| AcceptError::close(peer, namespace, error))?;
-            send_stream
-                .stopped()
-                .await
-                .map_err(|error| AcceptError::close(peer, namespace, error))?;
-            recv_stream
-                .read_to_end(0)
-                .await
-                .map_err(|error| AcceptError::close(peer, namespace, error))?;
-            Ok(())
-        };
+        let closing = close_streams(&mut send_stream, &mut recv_stream);
         match timeout(inactivity, closing).await {
-            Ok(closed) => closed?,
+            Ok(closed) => closed.map_err(|error| AcceptError::close(peer, namespace, error))?,
             Err(_) => {
                 close_timed_out(&connection);
                 return Err(AcceptError::timeout(peer, namespace, inactivity));
@@ -563,5 +587,59 @@ impl ConnectError {
     }
     pub(crate) fn remote_abort(reason: AbortReason) -> Self {
         Self::RemoteAbort(reason)
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use iroh::endpoint::presets;
+
+    use super::*;
+
+    const TEST_ALPN: &[u8] = b"iroh-docs/close-test";
+
+    /// A peer that accepts the stream and then closes the connection with
+    /// `code`, without ever reading or acknowledging what we sent.
+    async fn closed_by_peer(code: u32) -> anyhow::Result<anyhow::Result<()>> {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal).bind().await?;
+        let addr = server.addr();
+        let peer = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").await?;
+            let (mut send, _recv) = conn.accept_bi().await?;
+            send.finish()?;
+            conn.close(code.into(), b"done");
+            conn.closed().await;
+            anyhow::Ok(server)
+        });
+        let conn = client.connect(addr, TEST_ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        // A byte the peer never reads, so our stream stays unacknowledged
+        // until the peer's close ends the connection.
+        send.write_all(b"x").await?;
+        let res = timeout(Duration::from_secs(10), close_streams(&mut send, &mut recv))
+            .await
+            .expect("closing finished");
+        let server = peer.await??;
+        client.close().await;
+        server.close().await;
+        Ok(res)
+    }
+
+    #[tokio::test]
+    async fn a_graceful_close_by_the_peer_completes_the_closing_phase() -> anyhow::Result<()> {
+        closed_by_peer(0)
+            .await?
+            .expect("a code-0 close by the peer is a finished exchange");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_error_close_by_the_peer_still_fails_the_closing_phase() -> anyhow::Result<()> {
+        assert!(closed_by_peer(TIMEOUT_CLOSE_CODE).await?.is_err());
+        Ok(())
     }
 }
