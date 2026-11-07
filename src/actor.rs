@@ -1130,6 +1130,16 @@ impl Actor {
             }
         };
 
+        // Refuse new work and fail what is already queued. The channel keeps a
+        // queued action until every sender is gone, and the handles outlive
+        // the actor, so an action left queued would hold its reply open and
+        // its caller would wait forever. Dropping it drops the reply, which
+        // the caller sees as an error.
+        self.action_rx.close();
+        while let Ok(action) = self.action_rx.try_recv() {
+            debug!(%action, "dropping an action queued behind shutdown");
+        }
+
         if let Err(cause) = self.store.flush() {
             warn!(?cause, "failed to flush store");
         }
@@ -1774,6 +1784,46 @@ mod tests {
                 );
             }
             res => panic!("expected a validation failure, got {res:?}"),
+        }
+        Ok(())
+    }
+
+    /// An action queued behind `Shutdown` fails instead of waiting forever.
+    ///
+    /// The actor stops reading at `Shutdown`, but the channel keeps whatever
+    /// is queued behind it for as long as any handle lives, so a request
+    /// enqueued in that window must be failed by the actor itself.
+    #[tokio::test]
+    async fn an_action_queued_behind_shutdown_fails() -> anyhow::Result<()> {
+        for _ in 0..50 {
+            let sync = SyncHandle::spawn(store::Store::memory(), None, "queued".into());
+            let namespace = NamespaceSecret::new(&mut rand::rng());
+            let id = namespace.id();
+            sync.import_namespace(namespace.into()).await?;
+            sync.open(id, Default::default()).await?;
+
+            // Both land in the queue before the actor can pick up the first.
+            sync.tx.send_blocking(Action::Shutdown { reply: None })?;
+            let (reply, rx) = oneshot::channel();
+            let queued = sync.tx.send_blocking(Action::Replica(
+                id,
+                ReplicaAction::GetManyVec {
+                    query: store::Query::all().build(),
+                    reply,
+                },
+            ));
+            if queued.is_ok() {
+                let answer = tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .expect("a queued action is answered or dropped, never left waiting");
+                assert!(answer.is_err(), "the actor had shut down: {answer:?}");
+            }
+            assert!(
+                sync.get_many_vec(id, store::Query::all().build())
+                    .await
+                    .is_err(),
+                "a request after shutdown fails"
+            );
         }
         Ok(())
     }
