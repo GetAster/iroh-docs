@@ -819,7 +819,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1822,8 +1822,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.12"
-source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=825b70e865d81e12891c77ae370bdd8de11aa393#825b70e865d81e12891c77ae370bdd8de11aa393"
+version = "0.103.14"
+source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=750b04f36bccb27252c502f0a7de580114ef7ef9#750b04f36bccb27252c502f0a7de580114ef7ef9"
 dependencies = [
  "arrayvec",
  "bao-tree",
