@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-docs"
-version = "0.101.1030"
+version = "0.101.1031"
 dependencies = [
  "anyhow",
  "async-channel",
