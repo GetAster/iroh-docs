@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1029` |
-| Pinned commit | `e3dd9dcb0ad89baaf3cda26fed1eb592308879de` |
-| Crate version | 0.101.1029 (workspace spec `iroh-docs = "0.101.1029"`) |
+| Tag | `aster-iroh-docs-v0.101.1030` |
+| Pinned commit | `58373597e7636c9307c2867bc3c96d4b2d83214c` |
+| Crate version | 0.101.1030 (workspace spec `iroh-docs = "0.101.1030"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `825b70e8` (0.103.12, `aster-iroh-blobs-v0.103.12-p4`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1019) pins ir
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "e3dd9dcb0ad89baaf3cda26fed1eb592308879de" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "58373597e7636c9307c2867bc3c96d4b2d83214c" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -92,6 +92,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 70 | none recorded | `SyncFinished` carries a failed sync's whole cause chain (`{err:#}`), not just the top-level message, which read "Failed to close connection1" with nothing about what failed. |
 | 71 | none recorded | Split ranges in set reconciliation are answered from maintained bucket aggregates. A new table (`namespace-buckets-1`) partitions each namespace's records, in records-table order, into contiguous buckets of about 512 (`BUCKET_SIZE`), each keyed by its first record and holding a count and the XOR of its record fingerprints. Every write to the records table updates it in the same transaction, and it is rebuilt with the namespace fingerprint on open. `get_fingerprint`, `get_range_len` and the new `Store::get_nth_key` combine the buckets a range covers and read only the two it cuts through, O(N/B + B) instead of O(range). `process_message` computes the start index and pivots through them and collects a sub-range only when it is small enough to send. Messages are byte-identical to before. Per-session counters (rounds, ranges per round, range size bins, records hashed and read) are logged at debug as "set reconciliation summary". Before, a sync under live ingest walked and hashed every record of every split range at every level, about 10 times per record per sync; on portal-sync's 1M-file cell BLAKE3 was 14% of the receiver docs actor. Tests: `bucket_aggregates_track_random_ops_{memory,fs}`, `split_range_fingerprint_hashes_only_the_end_buckets`, `reconciliation_messages_match_the_walking_store`, `remove_replica_clears_bucket_rows`; debug builds cross-check every bucket answer against a scan. |
 | 72 | none recorded | Reads stop committing, and stale remote entries skip signature verification. `get_many` and `get_many_vec` read the open write transaction (`QueryIterator` runs over an owned snapshot or the write transaction's borrowed tables) instead of taking a snapshot, which committed it: every query was a redb commit plus `fdatasync`. `get_many` collects up to `COLLECTED_QUERY_LIMIT` (4096) entries this way; only a larger result commits, to stream. `content_hashes` (blobs GC protect) still commits. `ranger::Store::would_insert` runs the newer-than-existing check that `put` makes; set reconciliation and `insert_remote_entry` run it before validation, so a duplicate or stale entry is dropped without verifying its two signatures (a stale entry with a bad signature reports `NewerEntryExists`). The sync summary adds entries received, stale, validated, rejected and inserted. Asked for by portal-sync (§M) after its 1M-file cell on 0.101.1028. |
+| 73 | none recorded | Batch durable writes and a bounded replica-store page cache. `Doc::set_bytes_many_durable(author, entries)` (RPC `SetManyDurable`, appended last to the positional protocol enum) imports every value, runs one blob-store `sync_db`, inserts every record and runs one `flush_store` before replying, so a batch costs the two commits of one `set_bytes_durable`; no record of the batch can commit before every value's blob metadata. `Builder::redb_cache_size(bytes)` and `Store::persistent_with_cache_size(path, Option<usize>)` set redb's page cache (default unchanged, 1 GiB). Tests: `durable_set_many_crash` (a child hard-killed right after the call returns; every record and value present on reopen; fails with the final `flush_store` removed), `test_cache_size_bounds_the_page_cache` (redb `cache_metrics`, dev-only: a 256 KiB cache evicts and stays within its bound, the default does not evict). Asked for by portal-sync (§N, §O). |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -189,7 +190,20 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1029 (2026-11-06), current
+### 0.101.1030 (2026-11-07), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1030` | `58373597e7636c9307c2867bc3c96d4b2d83214c` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-07, 0.101.1030** (`5837359`, tag `aster-iroh-docs-v0.101.1030`):
+  row 73 (`0e1ab16`), batch durable writes with one commit per store and a
+  configurable replica-store page cache. Also `1cae9dc`, a test that reads of
+  the open write transaction match a committed snapshot across query shapes
+  (row 72's contract). Asked for by portal-sync (§N, §O). Validation: full
+  local suite green (205 tests across 15 suites), fmt and clippy clean.
+
+### 0.101.1029 (2026-11-06)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
