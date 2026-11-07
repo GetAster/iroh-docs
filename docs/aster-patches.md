@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1030-p1` |
-| Pinned commit | `474bc1f114c4b0a8b797910866a9eb116137489c` |
-| Crate version | 0.101.1030 (workspace spec `iroh-docs = "0.101.1030"`) |
+| Tag | `aster-iroh-docs-v0.101.1031` |
+| Pinned commit | `5df8c9ce9f13163487f3758c76b7ed7ba8a31671` |
+| Crate version | 0.101.1031 (workspace spec `iroh-docs = "0.101.1031"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1030-p1) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `750b04f3` (0.103.14, `aster-iroh-blobs-v0.103.14`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1030-p1) pins
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "474bc1f114c4b0a8b797910866a9eb116137489c" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "5df8c9ce9f13163487f3758c76b7ed7ba8a31671" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -93,6 +93,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 71 | none recorded | Split ranges in set reconciliation are answered from maintained bucket aggregates. A new table (`namespace-buckets-1`) partitions each namespace's records, in records-table order, into contiguous buckets of about 512 (`BUCKET_SIZE`), each keyed by its first record and holding a count and the XOR of its record fingerprints. Every write to the records table updates it in the same transaction, and it is rebuilt with the namespace fingerprint on open. `get_fingerprint`, `get_range_len` and the new `Store::get_nth_key` combine the buckets a range covers and read only the two it cuts through, O(N/B + B) instead of O(range). `process_message` computes the start index and pivots through them and collects a sub-range only when it is small enough to send. Messages are byte-identical to before. Per-session counters (rounds, ranges per round, range size bins, records hashed and read) are logged at debug as "set reconciliation summary". Before, a sync under live ingest walked and hashed every record of every split range at every level, about 10 times per record per sync; on portal-sync's 1M-file cell BLAKE3 was 14% of the receiver docs actor. Tests: `bucket_aggregates_track_random_ops_{memory,fs}`, `split_range_fingerprint_hashes_only_the_end_buckets`, `reconciliation_messages_match_the_walking_store`, `remove_replica_clears_bucket_rows`; debug builds cross-check every bucket answer against a scan. |
 | 72 | none recorded | Reads stop committing, and stale remote entries skip signature verification. `get_many` and `get_many_vec` read the open write transaction (`QueryIterator` runs over an owned snapshot or the write transaction's borrowed tables) instead of taking a snapshot, which committed it: every query was a redb commit plus `fdatasync`. `get_many` collects up to `COLLECTED_QUERY_LIMIT` (4096) entries this way; only a larger result commits, to stream. `content_hashes` (blobs GC protect) still commits. `ranger::Store::would_insert` runs the newer-than-existing check that `put` makes; set reconciliation and `insert_remote_entry` run it before validation, so a duplicate or stale entry is dropped without verifying its two signatures (a stale entry with a bad signature reports `NewerEntryExists`). The sync summary adds entries received, stale, validated, rejected and inserted. Asked for by portal-sync (§M) after its 1M-file cell on 0.101.1028. |
 | 73 | none recorded | Batch durable writes and a bounded replica-store page cache. `Doc::set_bytes_many_durable(author, entries)` (RPC `SetManyDurable`, appended last to the positional protocol enum) imports every value, runs one blob-store `sync_db`, inserts every record and runs one `flush_store` before replying, so a batch costs the two commits of one `set_bytes_durable`; no record of the batch can commit before every value's blob metadata. `Builder::redb_cache_size(bytes)` and `Store::persistent_with_cache_size(path, Option<usize>)` set redb's page cache (default unchanged, 1 GiB). Tests: `durable_set_many_crash` (a child hard-killed right after the call returns; every record and value present on reopen; fails with the final `flush_store` removed), `test_cache_size_bounds_the_page_cache` (redb `cache_metrics`, dev-only: a 256 KiB cache evicts and stays within its bound, the default does not evict). Asked for by portal-sync (§N, §O). |
+| 74 | none recorded | Actions queued behind shutdown fail instead of waiting. The sync actor stops reading its action channel at `Shutdown`, but the channel keeps a queued action until every sender is gone and the handles outlive the actor, so a request enqueued between `Shutdown` and the actor's exit held its reply open and its caller never returned. The actor now closes the channel (later sends fail) and drains it, dropping each queued action and its reply. The race predates row 72, which made reads fast enough to land in the window routinely: portal-sync saw a policy read racing node shutdown hang its write-authority worker, so the worker never observed its subscription end. Tests: `actor::tests::an_action_queued_behind_shutdown_fails` (hangs without the fix), `tests/subscribe_shutdown.rs` (a subscription ends when its node shuts down, with and without reads in flight). |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -190,7 +191,19 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1030 (2026-11-07), current
+### 0.101.1031 (2026-11-07), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1031` | `5df8c9ce9f13163487f3758c76b7ed7ba8a31671` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-07, 0.101.1031** (`5df8c9c`, tag `aster-iroh-docs-v0.101.1031`):
+  row 74 (`39be090`), actions queued behind shutdown fail instead of waiting.
+  Reported by portal-sync (two daemon tests hung on 0.101.1029; both pass
+  10/10 on 1029 with this fix). Validation: full local suite green (207
+  tests), fmt and clippy clean.
+
+### 0.101.1030 (2026-11-07)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
