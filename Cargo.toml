@@ -106,7 +106,7 @@ cfg_aliases = "0.2.1"
 iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
 iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
 iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "750b04f36bccb27252c502f0a7de580114ef7ef9" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "d5116409d990f1b1a79be7c58c4d71d4d557fc96" }
 noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
