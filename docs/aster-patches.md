@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1031` |
-| Pinned commit | `5df8c9ce9f13163487f3758c76b7ed7ba8a31671` |
+| Tag | `aster-iroh-docs-v0.101.1031-p1` |
+| Pinned commit | `5ebaecf91bc9474443c7fcadd8ef51f697e5edfa` |
 | Crate version | 0.101.1031 (workspace spec `iroh-docs = "0.101.1031"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
-The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1030-p1) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `750b04f3` (0.103.14, `aster-iroh-blobs-v0.103.14`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
+The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1031-p1) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `d5116409` (0.103.2001, `aster-iroh-blobs-v0.103.2001`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "5df8c9ce9f13163487f3758c76b7ed7ba8a31671" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "5ebaecf91bc9474443c7fcadd8ef51f697e5edfa" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -195,7 +195,13 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.101.0` | `aster-iroh-docs-v0.101.1031` | `5df8c9ce9f13163487f3758c76b7ed7ba8a31671` | `upgrade/iroh-docs-v0.101` |
+| `v0.101.0` | `aster-iroh-docs-v0.101.1031-p1` | `5ebaecf91bc9474443c7fcadd8ef51f697e5edfa` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-07, `aster-iroh-docs-v0.101.1031-p1`** (`5ebaecf`): re-pin only, the
+  fork's `[patch.crates-io]` iroh-blobs to `d5116409` (0.103.2001: the same
+  code as 0.103.14, renumbered into the fork patch space because 0.103.14 was
+  never published). Cargo.toml and Cargo.lock only; the crate source is
+  unchanged. Validation: full local suite green, `--locked`.
 
 - **2026-11-07, 0.101.1031** (`5df8c9c`, tag `aster-iroh-docs-v0.101.1031`):
   row 74 (`39be090`), actions queued behind shutdown fail instead of waiting.
