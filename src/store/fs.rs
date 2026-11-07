@@ -115,8 +115,12 @@ impl Iterator for QueryResults {
 }
 
 #[cfg(feature = "fs-store")]
-fn open_database(path: &std::path::Path) -> Result<Database> {
-    match Database::create(path) {
+fn open_database(path: &std::path::Path, cache_size: Option<usize>) -> Result<Database> {
+    let mut builder = Database::builder();
+    if let Some(cache_size) = cache_size {
+        builder.set_cache_size(cache_size);
+    }
+    match builder.create(path) {
         Ok(db) => Ok(db),
         Err(redb::DatabaseError::UpgradeRequired(v)) => Err(anyhow!(
             "Opening the database failed: Upgrading from redb {v} no longer supported. Use an older redb version first."
@@ -151,8 +155,18 @@ impl Store {
     /// The file will be created if it does not exist, otherwise it will be opened.
     #[cfg(feature = "fs-store")]
     pub fn persistent(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::persistent_with_cache_size(path, None)
+    }
+
+    /// [`Self::persistent`] with the database's page cache bounded to
+    /// `cache_size` bytes; `None` keeps redb's default (1 GiB).
+    #[cfg(feature = "fs-store")]
+    pub fn persistent_with_cache_size(
+        path: impl AsRef<std::path::Path>,
+        cache_size: Option<usize>,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let db = open_database(path)?;
+        let db = open_database(path, cache_size)?;
         match Self::new_impl(db) {
             Ok(store) => Ok(store),
             Err(err) if is_redb_v2_tuple_mismatch(&err) => {
@@ -160,7 +174,7 @@ impl Store {
                 {
                     info!("redb 2.x tuple format detected, running migration");
                     migrate_redb_v2_tuples::run(path)?;
-                    Self::new_impl(open_database(path)?)
+                    Self::new_impl(open_database(path, cache_size)?)
                 }
                 #[cfg(not(feature = "redb-v2-migration"))]
                 {
@@ -2122,6 +2136,53 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_size_bounds_the_page_cache() -> Result<()> {
+        const CACHE: usize = 256 * 1024;
+        let fill = |store: &mut Store| -> Result<()> {
+            let author = store.new_author(&mut rand::rng())?;
+            let namespace = NamespaceSecret::new(&mut rand::rng());
+            let _replica = store.new_replica(namespace.clone())?;
+            store.close_replica(namespace.id());
+            let mut wrapper = StoreInstance::new(namespace.id(), store);
+            for i in 0..20_000 {
+                let id = RecordIdentifier::new(namespace.id(), author.id(), format!("k-{i:06}"));
+                let entry = Entry::new(id, Record::current_from_data(format!("v-{i}")));
+                wrapper.entry_put(SignedEntry::from_entry(entry, &namespace, &author))?;
+            }
+            store.flush()?;
+            let all = store.get_many_vec(namespace.id(), Query::all().build())?;
+            assert_eq!(all.len(), 20_000);
+            Ok(())
+        };
+
+        let bounded_file = tempfile::NamedTempFile::new()?;
+        let mut bounded = Store::persistent_with_cache_size(bounded_file.path(), Some(CACHE))?;
+        fill(&mut bounded)?;
+        let stats = bounded.db.cache_stats();
+        assert!(
+            stats.used_bytes() <= CACHE,
+            "the cache holds {} bytes against a {CACHE}-byte bound",
+            stats.used_bytes()
+        );
+        assert!(
+            stats.evictions() > 0,
+            "a store larger than the bound evicts"
+        );
+
+        let default_file = tempfile::NamedTempFile::new()?;
+        let mut default = Store::persistent(default_file.path())?;
+        fill(&mut default)?;
+        let stats = default.db.cache_stats();
+        assert_eq!(
+            stats.evictions(),
+            0,
+            "the default cache holds the whole store"
+        );
+        assert!(stats.used_bytes() > CACHE);
         Ok(())
     }
 

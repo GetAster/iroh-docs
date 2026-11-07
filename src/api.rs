@@ -33,7 +33,8 @@ use self::{
         GetManyRequest, GetManyVecRequest, GetSyncPeersRequest, ImportRequest, LeaveRequest,
         ListRequest, OpenRequest, RetireWriteAuthorityRequest, SequenceRequest,
         SetAllowedWritersRequest, SetDownloadPolicyRequest, SetDurableRequest, SetHashRequest,
-        SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest, SubscribeRequest,
+        SetManyDurableRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest,
+        StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -116,6 +117,7 @@ impl DocsApi {
                     DocsProtocol::Fingerprint(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Sequence(msg) => local.send((msg, tx)).await,
                     DocsProtocol::EntriesSince(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::SetManyDurable(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetSyncPeers(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorList(msg) => local.send((msg, tx)).await,
                     DocsProtocol::AuthorCreate(msg) => local.send((msg, tx)).await,
@@ -417,6 +419,37 @@ impl Doc {
             })
             .await??;
         Ok(response.entry.content_hash())
+    }
+
+    /// [`Self::set_bytes_durable`] for many entries of one author, with one
+    /// blob-store commit and one document-store commit for the whole batch.
+    ///
+    /// Every value is imported, the blob store commits, every record is
+    /// inserted, and the document store commits before the call returns. No
+    /// record of the batch can become durable before the blob metadata of
+    /// every value in it, and after a successful return every record is
+    /// durable. An error part-way leaves a prefix of the batch inserted but
+    /// not yet committed, each naming committed blob metadata, so retrying
+    /// the batch is safe.
+    ///
+    /// Entries are inserted in order, so a repeated key ends with its last
+    /// value. Returns the content hash of each entry, in order. An empty
+    /// batch commits nothing.
+    pub async fn set_bytes_many_durable(
+        &self,
+        author_id: AuthorId,
+        entries: Vec<(Bytes, Bytes)>,
+    ) -> Result<Vec<Hash>> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(SetManyDurableRequest {
+                doc_id: self.namespace_id,
+                author_id,
+                entries,
+            })
+            .await??;
+        Ok(response.hashes)
     }
 
     /// Sets an entry on the doc via its key, hash, and size.

@@ -63,6 +63,8 @@ iroh = { version = "1", features = ["test-utils"] }
 nested_enum_utils = "0.2"
 parking_lot = "0.12.3"
 proptest = "1.2.0"
+# Cache counters for the cache-size test; tests only.
+redb = { version = "4.1", features = ["cache_metrics"] }
 rand = { version = "0.10", features = ["chacha"] }
 tempfile = "3.4"
 test-strategy = "0.4"

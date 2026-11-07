@@ -24,9 +24,9 @@ use super::{
         RetireWriteAuthorityRequest, RetireWriteAuthorityResponse, SequenceRequest,
         SequenceResponse, SetAllowedWritersRequest, SetAllowedWritersResponse,
         SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetDurableRequest, SetHashRequest,
-        SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse,
-        StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest,
-        SubscribeResponse,
+        SetHashResponse, SetManyDurableRequest, SetManyDurableResponse, SetRequest, SetResponse,
+        ShareMode, ShareRequest, ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest,
+        StatusResponse, SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -130,6 +130,13 @@ impl RpcActor {
                 let result = self.doc_set_durable(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send SetDurable response: {}", e);
+                }
+            }
+            DocsMessage::SetManyDurable(set) => {
+                let WithChannels { tx, inner, .. } = set;
+                let result = self.doc_set_many_durable(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send SetManyDurable response: {}", e);
                 }
             }
             DocsMessage::Get(get) => {
@@ -671,6 +678,56 @@ impl RpcActor {
             .ok_or_else(|| RpcError::new(&*anyhow!("failed to get entry after insertion")))?;
         self.hold_until_protected(tag);
         Ok(SetResponse { entry })
+    }
+
+    /// [`Self::doc_set_durable`] for a batch: one `sync_db` barrier after
+    /// every import and one `flush_store` after every insert, so the batch
+    /// costs one commit per store however many entries it holds. The
+    /// barrier order is the single-entry one, applied to the whole batch: no
+    /// record is inserted before every value's blob metadata is committed.
+    pub(super) async fn doc_set_many_durable(
+        &self,
+        req: SetManyDurableRequest,
+    ) -> RpcResult<SetManyDurableResponse> {
+        let blobs_store = self.blob_store();
+        let SetManyDurableRequest {
+            doc_id,
+            author_id,
+            entries,
+        } = req;
+        let mut imported = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let len = value.len() as u64;
+            let inline_value = self.inline_value(&value);
+            let tag = blobs_store
+                .add_bytes(value)
+                .temp_tag()
+                .await
+                .map_err(|e| RpcError::new(&e))?;
+            imported.push((key, len, inline_value, tag));
+        }
+        if imported.is_empty() {
+            return Ok(SetManyDurableResponse { hashes: Vec::new() });
+        }
+        blobs_store.sync_db().await.map_err(|e| RpcError::new(&e))?;
+        let mut hashes = Vec::with_capacity(imported.len());
+        let mut tags = Vec::with_capacity(imported.len());
+        for (key, len, inline_value, tag) in imported {
+            self.sync
+                .insert_local(doc_id, author_id, key, tag.hash(), len, inline_value)
+                .await
+                .map_err(|e| RpcError::new(&*e))?;
+            hashes.push(tag.hash());
+            tags.push(tag);
+        }
+        self.sync
+            .flush_store()
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        for tag in tags {
+            self.hold_until_protected(tag);
+        }
+        Ok(SetManyDurableResponse { hashes })
     }
 
     /// Hold a publish's temp tag until a GC protect enumeration has run.

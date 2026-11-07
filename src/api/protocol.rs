@@ -142,6 +142,23 @@ pub struct SetDurableRequest {
     pub value: Bytes,
 }
 
+/// Many [`SetDurableRequest`]s for one author with one commit per store: the
+/// blob store's metadata for every value is committed before any of the
+/// document records is inserted, and the document records are committed
+/// before the reply.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SetManyDurableRequest {
+    pub doc_id: NamespaceId,
+    pub author_id: AuthorId,
+    pub entries: Vec<(Bytes, Bytes)>,
+}
+
+/// Content hashes of a [`SetManyDurableRequest`], in request order.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SetManyDurableResponse {
+    pub hashes: Vec<Hash>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SetHashRequest {
     pub doc_id: NamespaceId,
@@ -488,6 +505,8 @@ pub enum DocsProtocol {
     Sequence(SequenceRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<EntriesSinceResponse>>)]
     EntriesSince(EntriesSinceRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<SetManyDurableResponse>>)]
+    SetManyDurable(SetManyDurableRequest),
 }
 
 /// Options to configure what is included in a [`iroh::EndpointAddr`].

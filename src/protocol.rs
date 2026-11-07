@@ -50,6 +50,7 @@ impl Docs {
             sync_inactivity_timeout: None,
             max_future_shift: None,
             max_inline_value_size: None,
+            redb_cache_size: None,
         }
     }
 
@@ -106,9 +107,20 @@ pub struct Builder {
     sync_inactivity_timeout: Option<Duration>,
     max_future_shift: Option<Duration>,
     max_inline_value_size: Option<usize>,
+    redb_cache_size: Option<usize>,
 }
 
 impl Builder {
+    /// Set the page cache size of the persistent replica store, in bytes.
+    ///
+    /// Without it the store uses redb's default (1 GiB). The cache grows up
+    /// to this bound as pages are read, so it bounds the store's resident
+    /// memory. Ignored for in-memory storage.
+    pub fn redb_cache_size(mut self, bytes: usize) -> Self {
+        self.redb_cache_size = Some(bytes);
+        self
+    }
+
     /// Set the garbage collection protection handler for blobs.
     ///
     /// See [`ProtectCallbackHandler::new`] for details.
@@ -169,7 +181,9 @@ impl Builder {
         let replica_store = match &self.storage {
             Storage::Memory => Store::memory(),
             #[cfg(feature = "fs-store")]
-            Storage::Persistent(path) => Store::persistent(path.join("docs.redb"))?,
+            Storage::Persistent(path) => {
+                Store::persistent_with_cache_size(path.join("docs.redb"), self.redb_cache_size)?
+            }
         };
         let author_store = match &self.storage {
             Storage::Memory => DefaultAuthorStorage::Mem,
