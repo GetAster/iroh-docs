@@ -192,3 +192,56 @@ async fn without_a_protect_handler_publish_tags_are_not_held() -> Result<()> {
     assert!(doc.get_exact(author, "durable", false).await?.is_some());
     Ok(())
 }
+
+/// A durable batch that fails partway keeps the entries it inserted before
+/// the failure; their blobs must stay protected like a successful batch's.
+/// The second entry is empty, so the insert fails after the first one.
+#[tokio::test]
+#[cfg(feature = "fs-store")]
+async fn a_failed_durable_batch_keeps_its_inserted_prefix_protected() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let dir = testdir!();
+    let endpoint = iroh::Endpoint::bind(presets::Minimal).await?;
+
+    let (handler, cb) = ProtectCallbackHandler::new();
+    let mut opts = iroh_blobs::store::fs::options::Options::new(&dir.join("blobs"));
+    opts.gc = Some(GcConfig {
+        interval: Duration::from_secs(3600),
+        add_protected: Some(cb.clone()),
+    });
+    let fs = iroh_blobs::store::fs::FsStore::load_with_opts(dir.join("blobs.db"), opts).await?;
+    let blobs = (*fs).clone();
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    tokio::fs::create_dir_all(dir.join("docs")).await?;
+    let docs = Docs::persistent(dir.join("docs"))
+        .protect_handler(handler)
+        .spawn(endpoint.clone(), blobs.clone(), gossip.clone())
+        .await?;
+    let api = docs.api().clone();
+    let doc = api.create().await?;
+    let author = api.author_create().await?;
+
+    let entries = vec![
+        (bytes::Bytes::from("kept"), bytes::Bytes::from("kept-value")),
+        (bytes::Bytes::from("empty"), bytes::Bytes::new()),
+    ];
+    assert!(doc.set_bytes_many_durable(author, entries).await.is_err());
+    let kept = iroh_blobs::Hash::new(b"kept-value");
+    assert!(
+        doc.get_exact(author, "kept", false).await?.is_some(),
+        "the entry inserted before the failure stays in the document"
+    );
+
+    n0_future::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        temp_hashes(&blobs).await?.contains(&kept),
+        "the inserted prefix's temp tag must be held after a failed batch"
+    );
+    let mut stale = HashSet::new();
+    iroh_blobs::store::gc_run_once(&blobs, &mut stale).await?;
+    assert!(
+        blobs.has(kept).await?,
+        "a sweep with a stale live set collected the inserted prefix's blob"
+    );
+    Ok(())
+}

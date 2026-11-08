@@ -712,22 +712,32 @@ impl RpcActor {
         blobs_store.sync_db().await.map_err(|e| RpcError::new(&e))?;
         let mut hashes = Vec::with_capacity(imported.len());
         let mut tags = Vec::with_capacity(imported.len());
+        let mut result = Ok(());
         for (key, len, inline_value, tag) in imported {
-            self.sync
+            if let Err(e) = self
+                .sync
                 .insert_local(doc_id, author_id, key, tag.hash(), len, inline_value)
                 .await
-                .map_err(|e| RpcError::new(&*e))?;
+            {
+                result = Err(RpcError::new(&*e));
+                break;
+            }
             hashes.push(tag.hash());
             tags.push(tag);
         }
-        self.sync
-            .flush_store()
-            .await
-            .map_err(|e| RpcError::new(&*e))?;
+        if result.is_ok() {
+            result = self
+                .sync
+                .flush_store()
+                .await
+                .map_err(|e| RpcError::new(&*e));
+        }
+        // Entries inserted before a failure stay in the store and become
+        // visible at its next flush, so their tags are held like a success's.
         for tag in tags {
             self.hold_until_protected(tag);
         }
-        Ok(SetManyDurableResponse { hashes })
+        result.map(|()| SetManyDurableResponse { hashes })
     }
 
     /// Hold a publish's temp tag until a GC protect enumeration has run.
