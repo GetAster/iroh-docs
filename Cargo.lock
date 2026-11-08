@@ -819,7 +819,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1931,8 +1931,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-gossip"
-version = "0.101.1002"
-source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=602bbb719ece3c2314faf732639a29a582fdf9ed#602bbb719ece3c2314faf732639a29a582fdf9ed"
+version = "0.101.1003"
+source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=4e2806907272633748c5bee45c6f4e263cd94f88#4e2806907272633748c5bee45c6f4e263cd94f88"
 dependencies = [
  "blake3",
  "bytes",
@@ -4184,7 +4184,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
