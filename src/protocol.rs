@@ -15,8 +15,8 @@ use crate::{
 };
 
 /// Default size threshold for inlining entry values in sync and gossip
-/// messages: entries up to 1 KiB of content ride the message with their value.
-pub const DEFAULT_MAX_INLINE_VALUE_SIZE: usize = 1024;
+/// messages: entries up to 2 KiB of content ride the message with their value.
+pub const DEFAULT_MAX_INLINE_VALUE_SIZE: usize = 2048;
 
 #[derive(Default, Debug)]
 enum Storage {
@@ -164,7 +164,7 @@ impl Builder {
     /// Entries at or below this many bytes of content carry their value inside
     /// the message itself; the receiver imports it directly instead of
     /// downloading the value blob, saving one round trip per small entry. The
-    /// default is [`DEFAULT_MAX_INLINE_VALUE_SIZE`] (1024 bytes). Set to 0 to
+    /// default is [`DEFAULT_MAX_INLINE_VALUE_SIZE`] (2048 bytes). Set to 0 to
     /// disable the feature.
     pub fn max_inline_value_size(mut self, size: usize) -> Self {
         self.max_inline_value_size = Some(size);

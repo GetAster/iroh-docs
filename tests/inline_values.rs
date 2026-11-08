@@ -26,7 +26,7 @@ use util::Node;
 mod util;
 
 /// `iroh_docs::protocol::DEFAULT_MAX_INLINE_VALUE_SIZE`.
-const MAX_INLINE: usize = 1024;
+const MAX_INLINE: usize = 2048;
 
 async fn node(accept_blobs: bool) -> Result<Node> {
     let ep = iroh::Endpoint::bind(presets::Minimal).await?;
@@ -388,7 +388,7 @@ async fn carried_value_over_the_size_cap_is_not_announced() -> Result<()> {
     let mut events1 = doc1.subscribe().await?;
     wait_sync_finished(&mut events1).await?;
 
-    // The author's threshold is the 1024-byte default; 2048 is over it.
+    // The author's threshold is the 2048-byte default; twice that is over it.
     let value: Vec<u8> = vec![0x99; MAX_INLINE * 2];
     let hash = Hash::new(&value);
     author
@@ -888,7 +888,7 @@ async fn sync_falls_back_to_a_peer_that_speaks_only_the_legacy_alpn() -> Result<
     let doc0 = legacy_api.create().await?;
     let legacy_author = legacy_api.author_create().await?;
     let small: Vec<u8> = vec![0x11; 512];
-    let large: Vec<u8> = vec![0x22; 2048];
+    let large: Vec<u8> = vec![0x22; 4096];
     let hash_small = doc0
         .set_bytes(legacy_author, b"small".to_vec(), small.clone())
         .await?;

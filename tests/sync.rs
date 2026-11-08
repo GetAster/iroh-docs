@@ -743,10 +743,10 @@ async fn test_sync_via_relay() -> Result<()> {
     node2.online().await;
     let doc1 = node1.docs().create().await?;
     let author1 = node1.docs().author_create().await?;
-    // Above the inline-value threshold (1024), so the value does not ride
+    // Above the inline-value threshold (2048), so the value does not ride
     // the sync or gossip messages: the InsertRemote reports Missing and the
     // download below proves content flows over the relay.
-    let big: Vec<u8> = vec![0xBA; 2048];
+    let big: Vec<u8> = vec![0xBA; 4096];
     let inserted_hash = doc1
         .set_bytes(author1, b"foo".to_vec(), big.clone())
         .await?;
@@ -799,7 +799,7 @@ async fn test_sync_via_relay() -> Result<()> {
     assert_eq!(actual.as_ref(), &big[..]);
 
     // update
-    let big2: Vec<u8> = vec![0xBE; 2048];
+    let big2: Vec<u8> = vec![0xBE; 4096];
     let updated_hash = doc1
         .set_bytes(author1, b"foo".to_vec(), big2.clone())
         .await?;
@@ -1024,7 +1024,7 @@ async fn test_download_policies() -> Result<()> {
     // this test is about download policy, not about values riding messages.
     for k in star_wars_movies.iter() {
         let mut v = k.as_bytes().to_vec();
-        v.resize(2048, 0);
+        v.resize(4096, 0);
         let hash = doc_a.set_bytes(author_a, k.to_owned(), v).await?;
         key_hashes.insert(hash, k);
     }
@@ -1032,7 +1032,7 @@ async fn test_download_policies() -> Result<()> {
     // set content in b
     for k in lotr_movies.iter() {
         let mut v = k.as_bytes().to_vec();
-        v.resize(2048, 0);
+        v.resize(4096, 0);
         let hash = doc_b.set_bytes(author_b, k.to_owned(), v).await?;
         key_hashes.insert(hash, k);
     }
