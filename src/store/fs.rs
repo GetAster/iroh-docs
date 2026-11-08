@@ -1905,6 +1905,50 @@ mod tests {
         Ok(())
     }
 
+    /// Reads on an idle store make no durable commit, however long the
+    /// transaction they opened stays open; a write still commits.
+    #[tokio::test]
+    async fn reads_never_commit() -> Result<()> {
+        use super::tables::COMMITS;
+        let commits = || COMMITS.with(|c| c.get());
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let mut replica = store.new_replica(namespace)?;
+        replica.hash_and_insert(b"k", &author, b"v").await?;
+        drop(replica);
+        store.close_replica(id);
+        store.flush()?;
+
+        let before = commits();
+        for _ in 0..10 {
+            assert!(store.get_exact(id, author.id(), b"k", false)?.is_some());
+            assert_eq!(store.get_latest_for_each_author(id)?.count(), 1);
+            assert!(store.get_author(&author.id())?.is_some());
+            assert_eq!(store.namespace_capability_kind(&id)?, CapabilityKind::Write);
+            let _ = store.get_download_policy(&id)?;
+            let _ = store.get_sync_peers(&id)?;
+            store.flush()?;
+        }
+        // A read transaction older than MAX_COMMIT_DELAY is replaced, not
+        // committed, on the next access.
+        let _ = store.get_exact(id, author.id(), b"k", false)?;
+        std::thread::sleep(MAX_COMMIT_DELAY + std::time::Duration::from_millis(50));
+        let _ = store.get_exact(id, author.id(), b"k", false)?;
+        store.flush()?;
+        assert_eq!(commits(), before, "reads must not commit");
+
+        let mut replica = store.open_replica(&id)?;
+        replica.hash_and_insert(b"k2", &author, b"v2").await?;
+        drop(replica);
+        store.close_replica(id);
+        store.flush()?;
+        assert!(commits() > before, "a write still commits");
+        Ok(())
+    }
+
     /// An open replica is refused, and the stored capability is untouched.
     #[tokio::test]
     async fn retire_refuses_an_open_replica() -> Result<()> {

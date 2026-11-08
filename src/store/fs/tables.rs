@@ -153,6 +153,17 @@ pub struct TransactionAndTables {
     #[debug("TransactionAndTablesInner")]
     inner: TransactionAndTablesInner,
     pub(crate) since: Instant,
+    /// Set by any mutable access. A transaction that only served reads is
+    /// aborted instead of committed, so reading never costs a durable commit.
+    dirty: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Durable commits made on this thread through
+    /// [`TransactionAndTables::commit`]. Per thread, so tests running in
+    /// parallel do not see each other's commits.
+    pub(crate) static COMMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl TransactionAndTables {
@@ -160,6 +171,7 @@ impl TransactionAndTables {
         Ok(Self {
             inner: TransactionAndTablesInner::try_new(tx, |tx| Tables::new(tx))?,
             since: Instant::now(),
+            dirty: false,
         })
     }
 
@@ -171,11 +183,20 @@ impl TransactionAndTables {
         &mut self,
         f: impl FnOnce(&mut Tables) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.dirty = true;
         self.inner.with_dependent_mut(|_, t| f(t))
     }
 
+    /// Commit the transaction if anything wrote to it; otherwise abort it,
+    /// which writes nothing.
     pub fn commit(self) -> std::result::Result<(), redb::CommitError> {
-        self.inner.into_owner().commit()
+        let tx = self.inner.into_owner();
+        if !self.dirty {
+            return tx.abort().map_err(redb::CommitError::Storage);
+        }
+        #[cfg(test)]
+        COMMITS.with(|c| c.set(c.get() + 1));
+        tx.commit()
     }
 }
 
