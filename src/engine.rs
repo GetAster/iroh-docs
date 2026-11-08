@@ -570,10 +570,18 @@ impl DefaultAuthorStorage {
                             path.to_string_lossy()
                         )
                     })?;
-                    let author_id = AuthorId::from_str(&data).with_context(|| {
-                        format!(
-                            "Failed to parse the default author from `{}`",
-                            path.to_string_lossy()
+                    let author_id = AuthorId::from_str(data.trim()).map_err(|err| {
+                        anyhow::anyhow!(
+                            "The default author file `{}` is {} ({err}). It names this node's \
+                             default author, so it is not replaced automatically. To recover, \
+                             write the author id back into the file, or delete the file to \
+                             create a new default author (a new identity for writes that use it).",
+                            path.to_string_lossy(),
+                            if data.trim().is_empty() {
+                                "empty"
+                            } else {
+                                "unreadable"
+                            },
                         )
                     })?;
                     if docs_store.export_author(author_id).await?.is_none() {
@@ -607,8 +615,11 @@ impl DefaultAuthorStorage {
             #[cfg(feature = "fs-store")]
             Self::Persistent(ref path) => {
                 use anyhow::Context;
-                tokio::fs::write(path, author_id.to_string())
+                let target = path.clone();
+                let data = author_id.to_string();
+                tokio::task::spawn_blocking(move || write_atomic(&target, data.as_bytes()))
                     .await
+                    .context("default author write task")?
                     .with_context(|| {
                         format!(
                             "Failed to write the default author to `{}`",
@@ -619,6 +630,33 @@ impl DefaultAuthorStorage {
         }
         Ok(())
     }
+}
+
+/// Replace `path` with `data` so that a crash leaves either the old or the
+/// new contents, never a truncated file: write a sibling temp file, fsync it,
+/// rename it over `path`, then fsync the directory so the rename is durable.
+#[cfg(feature = "fs-store")]
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Persistent default author for a docs engine.

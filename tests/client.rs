@@ -260,3 +260,57 @@ async fn test_default_author_persist() -> TestResult<()> {
 
     Ok(())
 }
+
+/// A truncated default author file (a crash mid-write before writes were
+/// atomic) stops start-up with an error that names the recovery; it never
+/// silently mints a new author. Writing the id back recovers the identity.
+#[tokio::test]
+#[traced_test]
+#[cfg(feature = "fs-store")]
+async fn test_default_author_empty_file_names_the_recovery() -> TestResult<()> {
+    let iroh_root_dir = tempfile::TempDir::new()?;
+    let iroh_root = iroh_root_dir.path();
+    let file = iroh_root.join("default-author");
+
+    let default_author = {
+        let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
+            .spawn()
+            .await?;
+        let author = iroh.docs().author_default().await?;
+        iroh.shutdown().await?;
+        author
+    };
+    assert_eq!(
+        tokio::fs::read_to_string(&file).await?,
+        default_author.to_string()
+    );
+    assert!(
+        !iroh_root.join("default-author.tmp").exists(),
+        "the atomic write leaves no temp file behind"
+    );
+
+    tokio::fs::write(&file, b"").await?;
+    let err = Node::persistent(iroh_root, empty_endpoint().await?)
+        .spawn()
+        .await
+        .expect_err("an empty default author file must stop start-up");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("is empty"), "{msg}");
+    assert!(msg.contains("write the author id back"), "{msg}");
+    assert_eq!(
+        tokio::fs::read(&file).await?,
+        b"",
+        "the file is left as it was"
+    );
+
+    #[cfg(target_os = "macos")]
+    n0_future::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    tokio::fs::write(&file, default_author.to_string()).await?;
+    let iroh = Node::persistent(iroh_root, empty_endpoint().await?)
+        .spawn()
+        .await?;
+    assert_eq!(iroh.docs().author_default().await?, default_author);
+    iroh.shutdown().await?;
+    Ok(())
+}
