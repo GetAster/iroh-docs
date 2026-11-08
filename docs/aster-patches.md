@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1031-p2` |
-| Pinned commit | `953479f19e065b9bb19def5c2f1d50df20b0a377` |
-| Crate version | 0.101.1031 (workspace spec `iroh-docs = "0.101.1031"`) |
+| Tag | `aster-iroh-docs-v0.101.1032` |
+| Pinned commit | `5d4272115367a37dac7bfad60cc655464cf08abe` |
+| Crate version | 0.101.1032 (workspace spec `iroh-docs = "0.101.1032"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1031-p2) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `e7937c99` (0.103.2002, `aster-iroh-blobs-v0.103.2002`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1031-p2) pins
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "953479f19e065b9bb19def5c2f1d50df20b0a377" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "5d4272115367a37dac7bfad60cc655464cf08abe" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -94,6 +94,8 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 72 | none recorded | Reads stop committing, and stale remote entries skip signature verification. `get_many` and `get_many_vec` read the open write transaction (`QueryIterator` runs over an owned snapshot or the write transaction's borrowed tables) instead of taking a snapshot, which committed it: every query was a redb commit plus `fdatasync`. `get_many` collects up to `COLLECTED_QUERY_LIMIT` (4096) entries this way; only a larger result commits, to stream. `content_hashes` (blobs GC protect) still commits. `ranger::Store::would_insert` runs the newer-than-existing check that `put` makes; set reconciliation and `insert_remote_entry` run it before validation, so a duplicate or stale entry is dropped without verifying its two signatures (a stale entry with a bad signature reports `NewerEntryExists`). The sync summary adds entries received, stale, validated, rejected and inserted. Asked for by portal-sync (§M) after its 1M-file cell on 0.101.1028. |
 | 73 | none recorded | Batch durable writes and a bounded replica-store page cache. `Doc::set_bytes_many_durable(author, entries)` (RPC `SetManyDurable`, appended last to the positional protocol enum) imports every value, runs one blob-store `sync_db`, inserts every record and runs one `flush_store` before replying, so a batch costs the two commits of one `set_bytes_durable`; no record of the batch can commit before every value's blob metadata. `Builder::redb_cache_size(bytes)` and `Store::persistent_with_cache_size(path, Option<usize>)` set redb's page cache (default unchanged, 1 GiB). Tests: `durable_set_many_crash` (a child hard-killed right after the call returns; every record and value present on reopen; fails with the final `flush_store` removed), `test_cache_size_bounds_the_page_cache` (redb `cache_metrics`, dev-only: a 256 KiB cache evicts and stays within its bound, the default does not evict). Asked for by portal-sync (§N, §O). |
 | 74 | none recorded | Actions queued behind shutdown fail instead of waiting. The sync actor stops reading its action channel at `Shutdown`, but the channel keeps a queued action until every sender is gone and the handles outlive the actor, so a request enqueued between `Shutdown` and the actor's exit held its reply open and its caller never returned. The actor now closes the channel (later sends fail) and drains it, dropping each queued action and its reply. The race predates row 72, which made reads fast enough to land in the window routinely: portal-sync saw a policy read racing node shutdown hang its write-authority worker, so the worker never observed its subscription end. Tests: `actor::tests::an_action_queued_behind_shutdown_fails` (hangs without the fix), `tests/subscribe_shutdown.rs` (a subscription ends when its node shuts down, with and without reads in flight). |
+| 77 | none recorded (`cb5973a`) | A durable batch that fails partway holds its inserted prefix's temp tags. In `doc_set_many_durable`, a failed `insert_local` or `flush_store` returned early and dropped the temp tags of the entries already inserted; those entries stay in the replica store and become visible at its next flush, so a sweep with a stale live set could collect their blobs. The inserted prefix now goes through `hold_until_protected` as on success. File: `src/api/actor.rs`. | Reported by portal-sync's rv03 review; any Aster caller of `set_bytes_many_durable` with GC enabled. | `cb5973a` | carried | Low conflict risk. Test: `tests/gc_publish_wedge.rs::a_failed_durable_batch_keeps_its_inserted_prefix_protected` (an empty second value fails the insert after the first; fails without the fix). |
+| 78 | none recorded (`e3a4646`) | The default author file is written atomically, and an unreadable one names the recovery. `DefaultAuthorStorage::persist` wrote with a bare truncate-and-write; it now writes `default-author.tmp`, fsyncs it, renames it over the file and fsyncs the directory (unix). On load, an empty or unparseable file stops start-up with an error that says to write the author id back or delete the file (a new identity); no author is minted. File: `src/engine.rs`. | portal-sync §S: a kill mid-write left a 0-byte file on N2 and the daemon crash-looped for 12 days. | `e3a4646` | carried | Low conflict risk. Test: `tests/client.rs::test_default_author_empty_file_names_the_recovery`. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -191,7 +193,19 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1031 (2026-11-07), current
+### 0.101.1032 (2026-11-08), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1032` | `5d4272115367a37dac7bfad60cc655464cf08abe` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-08, `aster-iroh-docs-v0.101.1032`** (`5d42721`): rows 77 (a failed
+  durable batch holds its inserted prefix's temp tags) and 78 (atomic default
+  author file, recovery named on an unreadable one); re-pins iroh-blobs to
+  `275c207e` (0.103.2003, zstd 0.14.3 floor, iroh-blobs row 79). Validation:
+  full local suite green.
+
+### 0.101.1031 (2026-11-07)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
