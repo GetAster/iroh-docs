@@ -1,6 +1,6 @@
 [package]
 name = "iroh-docs"
-version = "0.101.1032"
+version = "0.101.1033"
 edition = "2021"
 readme = "README.md"
 description = "Iroh sync"
@@ -44,7 +44,7 @@ postcard = { version = "1", default-features = false, features = [
 ] }
 noq = { version = "1", optional = true }
 rand = "0.10"
-redb = { version = "4.1" }
+redb = { version = "4.5" }
 redb_v3 = { package = "redb", version = "3.1", optional = true }
 self_cell = "1.0.3"
 serde = { version = "1.0.164", features = ["derive"] }
@@ -64,7 +64,7 @@ nested_enum_utils = "0.2"
 parking_lot = "0.12.3"
 proptest = "1.2.0"
 # Cache counters for the cache-size test; tests only.
-redb = { version = "4.1", features = ["cache_metrics"] }
+redb = { version = "4.5", features = ["cache_metrics"] }
 rand = { version = "0.10", features = ["chacha"] }
 tempfile = "3.4"
 test-strategy = "0.4"
@@ -106,7 +106,7 @@ cfg_aliases = "0.2.1"
 iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
 iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
 iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "275c207e4cf1b89344250c4456ffad86d1122254" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "3208a99e53e75baf5b539e924e50b5e914fa0f9d" }
 noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
