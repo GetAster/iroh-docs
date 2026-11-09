@@ -352,6 +352,20 @@ async fn receive_loop(
                         .await?;
                 }
             }
+            // `iroh_gossip::api::Event` is `#[non_exhaustive]` since iroh-gossip 0.102. The
+            // variants that carry meaning for docs (`Lagged`, `Received`, `NeighborUp`,
+            // `NeighborDown`) are all handled above, so a new variant cannot be a loss signal
+            // we know how to act on. Keep the loop alive (like the one-undecodable-message
+            // case) and leave a rate-limited trace so a future variant is noticed.
+            other => {
+                if warn_limiter.allow() {
+                    warn!(
+                        ?other,
+                        namespace = %namespace.fmt_short(),
+                        "ignoring unknown gossip event"
+                    );
+                }
+            }
         }
     }
     Ok(())
