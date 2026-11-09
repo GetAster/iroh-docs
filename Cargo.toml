@@ -30,8 +30,8 @@ futures-buffered = "0.2.4"
 hex = "0.4"
 iroh = { version = "1", default-features = false }
 iroh-tickets = { version = "1" }
-iroh-blobs = { version = "0.103", default-features = false }
-iroh-gossip = { version = "0.101.0", features = ["net"], default-features = false }
+iroh-blobs = { version = "0.104.2001", default-features = false }
+iroh-gossip = { version = "0.102.0", features = ["net"], default-features = false }
 iroh-metrics = { version = "1", default-features = false }
 irpc = { version = "0.17", default-features = false }
 n0-error = "1"
@@ -106,9 +106,9 @@ cfg_aliases = "0.2.1"
 iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
 iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
 iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "9ba1447d2a3a12b6143fa0e345528686229b1a7c" }
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "3208a99e53e75baf5b539e924e50b5e914fa0f9d" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "da34ac02aeaba0cb80c71b6f29de7ff643b7e39c" }
 noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
 noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "379f73677c057908b7e43a40466e38d2bbe75630" }
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "4e2806907272633748c5bee45c6f4e263cd94f88" }
-iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "b28211ec000f013d7ad49cc9dd2fb93518c1ec8f" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "3cb924b5d8b0c5dd4398df4ae5443a3f5d2b2f64" }
+iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "bfef8edbbe599bc4ea892860ea5218cf4a006844" }

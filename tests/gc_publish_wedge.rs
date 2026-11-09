@@ -83,7 +83,7 @@ async fn blob_published_before_a_sweep_enumerates_survives_it() -> Result<()> {
     // held temp tag keeps the blob alive. A tree that drops the tag at
     // publish return (the original wedge) loses both blobs here.
     let mut stale = HashSet::new();
-    iroh_blobs::store::gc_run_once(&blobs, &mut stale).await?;
+    iroh_blobs::store::gc_run_once(&blobs, &mut stale, None).await?;
     assert!(
         blobs.has(plain).await?,
         "a sweep with a stale live set collected the plain blob"
@@ -132,7 +132,7 @@ async fn blob_published_before_a_sweep_enumerates_survives_it() -> Result<()> {
 
     // A sweep with the live set that observed the records leaves the
     // published state intact.
-    iroh_blobs::store::gc_run_once(&blobs, &mut live).await?;
+    iroh_blobs::store::gc_run_once(&blobs, &mut live, None).await?;
     assert!(
         blobs.has(plain).await?,
         "the sweep collected the plain blob"
@@ -238,7 +238,7 @@ async fn a_failed_durable_batch_keeps_its_inserted_prefix_protected() -> Result<
         "the inserted prefix's temp tag must be held after a failed batch"
     );
     let mut stale = HashSet::new();
-    iroh_blobs::store::gc_run_once(&blobs, &mut stale).await?;
+    iroh_blobs::store::gc_run_once(&blobs, &mut stale, None).await?;
     assert!(
         blobs.has(kept).await?,
         "a sweep with a stale live set collected the inserted prefix's blob"
