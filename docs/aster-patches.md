@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1033` |
-| Pinned commit | `7ebb66ff656465dcee75445fa27127dc838a4fd0` |
-| Crate version | 0.101.1033 (workspace spec `iroh-docs = "0.101.1033"`) |
+| Tag | `aster-iroh-docs-v0.101.1034` |
+| Pinned commit | `67a4b46ab658f202e7f98099838c576824dcf543` |
+| Crate version | 0.101.1034 (workspace spec `iroh-docs = "0.101.1034"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
-The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1031-p2) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `e7937c99` (0.103.2002, `aster-iroh-blobs-v0.103.2002`), iroh-gossip `602bbb71` (`aster-iroh-gossip-v0.101.1002`) and iroh-util `b28211ec` (`aster-iroh-util-v0.6.3-p7`).
+The fork's own `[patch.crates-io]` (row 9, re-pinned in 0.101.1034) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `da34ac02` (0.104.2001, `aster-iroh-blobs-v0.104.2001`), iroh-gossip `39a2ed2c` (0.102.1001, `aster-iroh-gossip-v0.102.1001`) and iroh-util `bfef8edb` (0.7.1001, `aster-iroh-util-v0.7.1001`). The upstream base stays `v0.101.0`: no newer iroh-docs release.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "7ebb66ff656465dcee75445fa27127dc838a4fd0" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "67a4b46ab658f202e7f98099838c576824dcf543" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -46,7 +46,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 
 | Id | Topic branch | What | Why / what in Aster depends on it | Commits (topic / upgrade) | Status | Conflict or porting notes |
 |---|---|---|---|---|---|---|
-| 9 | none recorded (original commit `81f3461`) | `[patch.crates-io]` block pointing the iroh/noq crates (and since 0.101.5-p2 also iroh-blobs, iroh-gossip, iroh-util) at the Aster forks. File: `Cargo.toml`. | Keeps the docs sync tests and standalone builds on the same endpoint/base/noq fork stack as Aster. | `81f3461` (original); rc.1 copy `7efdff0`; re-pinned since (see History), latest `c5dda393` and `03c44cd4` (0.101.10-p1), `22bb6668` (0.101.10-p2), `c4cfc63`, `ab3d1cf` and `e400fb0` (0.101.1019) | carried | Low conflict risk. Pin explicit fork revs or tags; drop stale `pre.6` wording. |
+| 9 | none recorded (original commit `81f3461`) | `[patch.crates-io]` block pointing the iroh/noq crates (and since 0.101.5-p2 also iroh-blobs, iroh-gossip, iroh-util) at the Aster forks. File: `Cargo.toml`. | Keeps the docs sync tests and standalone builds on the same endpoint/base/noq fork stack as Aster. | `81f3461` (original); rc.1 copy `7efdff0`; re-pinned since (see History), latest `c5dda393` and `03c44cd4` (0.101.10-p1), `22bb6668` (0.101.10-p2), `c4cfc63`, `ab3d1cf` and `e400fb0` (0.101.1019), `c710ed8` and `8ad3a7c` (0.101.1034; topic `chore/blobs-0.104-gossip-0.102` `378ba2e`, `5ed4cc2`) | carried | Low conflict risk. Pin explicit fork revs or tags; drop stale `pre.6` wording. |
 | 10 | none recorded | Emits `ContentReady` immediately when `start_download` sees `BlobStatus::Complete`, instead of silently returning. Files: `src/engine/live.rs`, `tests/sync.rs`. | portal-sync waits for `LiveEvent::ContentReady` to mark remotely advertised CAS content usable/retryable, even when the blob was preloaded through another path. | `4ae3eaf` (released in `aster-iroh-docs-v0.100.0-p1`) | carried | Medium conflict risk around `LiveActor::start_download`, `on_download_ready` and content-ready propagation. Preserve the regression: the receiver preloads the blob, imports the doc, receives `InsertRemote { content_status: Complete }`, and still gets an explicit `ContentReady` (`sync_emits_content_ready_for_already_local_content`). |
 | 11 | `fix/sync-redrive-missing-content-after-resync` | After a successful sync round, scans local doc entries matching the download policy and re-queues missing content downloads from the synced peer before emitting `PendingContentReady`. Files: `src/engine/live.rs`, `tests/sync.rs`. | portal-sync recovers from "entry replicated, content blob missing" after a peer reconnects or stabilises; repeated `start_sync` calls fetch content that was unavailable at the original insert. | `2c8ab9b` | carried | Medium conflict risk around `LiveActor::on_sync_finished`, `start_download` and `PendingContentReady` ordering. Preserve the regression: an entry arrives with `ContentStatus::Missing`, the provider later stores the blob, a re-sync receives no new entries, and the receiver still gets `ContentReady` plus the blob (`sync_redrives_known_missing_content_after_resync`; see row 20). |
 | 12 | `fix/large-namespace-initial-sync` (tip `14107686520394f1df0ffe08cb45c9ec7a229221`) | Adds a collected `Doc::get_many_vec` query path and protocol request, avoiding the streaming query channel drain path for large full-namespace snapshots. Files: `src/actor.rs`, `src/api.rs`, `src/api/actor.rs`, `src/api/protocol.rs`, `tests/sync.rs`. | Aster core uses `Doc::get_many_vec` for `query_key_exact`, `query_latest_exact`, `query_key_prefix` and `query_latest_prefix`; portal-sync uses those during Tree snapshots. | `e1f9340` | carried | Medium conflict risk around the docs query RPC plumbing. Preserve the large read-import, peer-initiated sync regression where a namespace with many content-bearing entries can be queried to completion after sync. |
@@ -99,6 +99,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 80 | none recorded (`184c654`) | A transaction that only served reads is aborted instead of committed. Reads (`get_exact`, latest-per-author, the policy and peer getters, `load_replica_info`) go through `Store::tables()`, which opens a write transaction; the idle flush then committed it durably, so a node polling the store paid a commit and an fsync per pass. `TransactionAndTables` now tracks a dirty flag set by any mutable access, and `commit()` aborts a clean transaction. Files: `src/store/fs/tables.rs`, `src/store/fs.rs`. | portal-sync §U: 46 of 62 idle commits a minute came from Aster's enrollment reconcile pass reading the policy namespace. | `184c654` | carried | Low conflict risk. Test: `store::fs::tests::reads_never_commit` (fails without the dirty check). |
 | 81 | none recorded (`bb41092`) | `DEFAULT_MAX_INLINE_VALUE_SIZE` is 2 KiB (was 1 KiB): entry values up to 2 KiB ride sync and gossip messages. Files: `src/protocol.rs`; tests that need an over-threshold value use 4 KiB. | Owner's threshold for inline entry values (Portal's are at most 427 B). | `bb41092` | carried | Keep the default below the gossip `max_message_size` (4096) minus the signed entry. |
 | 82 | none recorded (`d1e55a1`) | redb 4.5 (was 4.1): fixes to crash recovery that could roll back or corrupt durable commits (4.2, 4.3), mid-commit error hardening, and bounded page-cache memory under writes (4.4). Same in iroh-blobs. File: `Cargo.toml`. | Durability. Bytes written per small blob unchanged in the iroh-blobs bench. | `d1e55a1` | carried | `redb_v3` stays for the v2-store migration. |
+| 87 | `chore/blobs-0.104-gossip-0.102` (`378ba2e`, on `upgrade/iroh-docs-v0.101` at `7ebb66f`) | API moves for iroh-blobs 0.104 and iroh-gossip 0.102. `engine/gossip.rs`: iroh-gossip's `Event` is `#[non_exhaustive]` (upstream iroh-gossip #198), so the receive loop gains a catch-all arm that logs (rate-limited) and keeps the loop alive; `Lagged` (row 50) and the other known variants stay explicit. `tests/gc_publish_wedge.rs`: `gc_run_once` takes a third, protect argument (iroh-blobs upstream #240); the tests pass `None`, as they sweep with a stale live set on purpose. Files: `src/engine/gossip.rs`, `tests/gc_publish_wedge.rs` (and the dependency moves in `Cargo.toml`, rows 9 and 15). | Builds against the forks Aster pins. A future gossip event must not end Docs live sync's receive loop. | `378ba2e` / `c710ed8` | carried | Drop the catch-all only if upstream makes `Event` exhaustive again. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -196,7 +197,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1033 (2026-11-08), current
+### 0.101.1034 (2026-11-09), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1034` | `67a4b46ab658f202e7f98099838c576824dcf543` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-09, `aster-iroh-docs-v0.101.1034`** (`67a4b46`), the iroh-family upstream wave: `c710ed8` moves to iroh-blobs 0.104.2001 (`da34ac02`), iroh-gossip 0.102.1001 and iroh-util 0.7.1001 (`bfef8edb`) with row 87's API moves (rows 9, 15, 43, 50 touched); `8ad3a7c` re-pins iroh-gossip to its final 0.102.1001 commit `39a2ed2c`; `67a4b46` sets the version. The lock follows by named packages only (bao-tree 0.16 to 0.17 with blobs 0.104). Validation at the pinned commit, 3 runs: `cargo test --locked --all-features` 211 passed each run (lib 149, 1 ignored; sync 27, 3 ignored; the rest as in 0.101.1033), clippy `--all-features --all-targets -D warnings` clean, fmt clean on the patched files.
+
+### 0.101.1033 (2026-11-08)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
