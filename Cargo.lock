@@ -1912,7 +1912,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.102.1001"
-source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=3cb924b5d8b0c5dd4398df4ae5443a3f5d2b2f64#3cb924b5d8b0c5dd4398df4ae5443a3f5d2b2f64"
+source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=39a2ed2c8b5e99d2fb49f887e9589804cd441c82#39a2ed2c8b5e99d2fb49f887e9589804cd441c82"
 dependencies = [
  "blake3",
  "bytes",
