@@ -38,6 +38,7 @@ pub use self::{
     // consumer can read a completion but not construct one — which makes
     // `SyncEvent` untestable downstream.
     live::{Op, SyncDetails, SyncEvent},
+    policy::{SyncDirection, SyncPolicyFn},
     state::{Origin, SyncReason},
 };
 use crate::{
@@ -49,6 +50,7 @@ use crate::{
 mod announce;
 mod gossip;
 mod live;
+mod policy;
 mod state;
 
 /// Capacity of the channel for the [`ToLiveActor`] messages.
@@ -91,6 +93,8 @@ pub struct Engine {
     /// one drain task per engine retires the batch per enumeration, so the
     /// tags never cost a task each. `None` together with `protect_notify`.
     tag_hold: Option<TagHold>,
+    /// Per-peer sync policy shared with the live actor.
+    sync_policy: policy::SyncPolicy,
 }
 
 impl Engine {
@@ -262,6 +266,8 @@ impl Engine {
             tag_hold.clone(),
         )?;
         actor.set_sync_inactivity_timeout(sync_inactivity_timeout);
+        let sync_policy = policy::SyncPolicy::default();
+        actor.set_sync_policy(sync_policy.clone());
         let actor_handle = n0_future::task::spawn(
             async move {
                 if let Err(err) = actor.run().await {
@@ -293,7 +299,29 @@ impl Engine {
             _gc_protect_task: gc_protect_task,
             protect_notify,
             tag_hold,
+            sync_policy,
         })
+    }
+
+    /// Install a per-peer sync policy, replacing any earlier one.
+    ///
+    /// The live engine consults it before accepting a peer's sync request and
+    /// before dialling a peer to sync. A refused accept is answered as if this
+    /// node did not hold the namespace; a refused dial is skipped. The policy
+    /// runs on the engine's loop, so it must answer from memory without
+    /// blocking. A changed answer applies from the next exchange: one already
+    /// running is not interrupted.
+    pub fn set_sync_policy(
+        &self,
+        policy: impl Fn(NamespaceId, iroh::PublicKey, SyncDirection) -> bool + Send + Sync + 'static,
+    ) {
+        self.sync_policy.set(Some(Arc::new(policy)));
+    }
+
+    /// Remove the sync policy: every peer that names a namespace this node
+    /// syncs is accepted again.
+    pub fn clear_sync_policy(&self) {
+        self.sync_policy.set(None);
     }
 
     /// Get the blob store.

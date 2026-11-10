@@ -71,6 +71,22 @@ impl Docs {
     pub fn sync(&self) -> &crate::actor::SyncHandle {
         &self.engine.sync
     }
+
+    /// Install a per-peer sync policy; see [`Engine::set_sync_policy`].
+    pub fn set_sync_policy(
+        &self,
+        policy: impl Fn(crate::NamespaceId, iroh::PublicKey, crate::engine::SyncDirection) -> bool
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.engine.set_sync_policy(policy);
+    }
+
+    /// Remove the sync policy; see [`Engine::clear_sync_policy`].
+    pub fn clear_sync_policy(&self) {
+        self.engine.clear_sync_policy();
+    }
 }
 
 impl std::ops::Deref for Docs {

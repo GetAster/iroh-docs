@@ -29,6 +29,7 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 // use super::gossip::{GossipActor, ToGossipActor};
 use super::announce::{AnnounceKind, Announcer};
+use super::policy::{SyncDirection, SyncPolicy};
 use super::state::{is_tiebreak_loss, NamespaceStates, Origin, SyncReason};
 use crate::{
     actor::{OpenOpts, SyncHandle, TagHold},
@@ -273,6 +274,8 @@ pub struct LiveActor {
     endpoint: Endpoint,
     bao_store: Store,
     downloader: Downloader,
+    /// Per-peer sync policy, consulted before every accept and dial.
+    sync_policy: SyncPolicy,
     /// Entries at or below this many bytes of content are gossiped with their
     /// value inlined in the message; 0 disables.
     max_inline_value_size: usize,
@@ -398,6 +401,7 @@ impl LiveActor {
             gossip: gossip_state,
             bao_store,
             downloader,
+            sync_policy: SyncPolicy::default(),
             max_inline_value_size,
             tag_hold,
             sync_actor_tx,
@@ -430,6 +434,11 @@ impl LiveActor {
     /// Set how long a sync exchange may make no progress before it is abandoned.
     pub fn set_sync_inactivity_timeout(&mut self, timeout: Duration) {
         self.sync_inactivity_timeout = timeout;
+    }
+
+    /// Share the engine's sync-policy slot with this actor.
+    pub(super) fn set_sync_policy(&mut self, policy: SyncPolicy) {
+        self.sync_policy = policy;
     }
 
     /// Run the actor loop.
@@ -662,6 +671,13 @@ impl LiveActor {
 
     #[instrument("connect", skip_all, fields(peer = %peer.fmt_short(), namespace = %namespace.fmt_short()))]
     fn sync_with_peer(&mut self, namespace: NamespaceId, peer: PublicKey, reason: SyncReason) {
+        if !self
+            .sync_policy
+            .allows(namespace, peer, SyncDirection::Connect)
+        {
+            debug!(?reason, "sync policy refused the dial");
+            return;
+        }
         if !self.state.start_connect(&namespace, peer, reason) {
             return;
         }
@@ -1855,6 +1871,17 @@ impl LiveActor {
         namespace: NamespaceId,
         peer: PublicKey,
     ) -> AcceptOutcome {
+        if !self
+            .sync_policy
+            .allows(namespace, peer, SyncDirection::Accept)
+        {
+            debug!(
+                peer = %peer.fmt_short(),
+                namespace = %namespace.fmt_short(),
+                "sync policy refused the request"
+            );
+            return AcceptOutcome::Reject(AbortReason::NotFound);
+        }
         self.state
             .accept_request(&self.endpoint.id(), &namespace, peer)
     }

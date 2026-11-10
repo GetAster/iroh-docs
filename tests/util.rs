@@ -44,6 +44,7 @@ pub struct Node {
     router: iroh::protocol::Router,
     client: Client,
     gossip: Gossip,
+    docs: iroh_docs::protocol::Docs,
 }
 
 impl Deref for Node {
@@ -154,6 +155,7 @@ impl Builder {
             router,
             client,
             gossip,
+            docs: docs.clone(),
         })
     }
 
@@ -265,6 +267,12 @@ impl Node {
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.router.shutdown().await?;
         Ok(())
+    }
+
+    /// The docs protocol handle, for engine-level settings.
+    #[allow(dead_code)]
+    pub fn docs_protocol(&self) -> &iroh_docs::protocol::Docs {
+        &self.docs
     }
 
     /// Returns the client
