@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1034` |
-| Pinned commit | `67a4b46ab658f202e7f98099838c576824dcf543` |
-| Crate version | 0.101.1034 (workspace spec `iroh-docs = "0.101.1034"`) |
+| Tag | `aster-iroh-docs-v0.101.1035` |
+| Pinned commit | `9fad662ca009605242b5c3d5d2d1ec94749f4478` |
+| Crate version | 0.101.1035 (workspace spec `iroh-docs = "0.101.1035"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
 The fork's own `[patch.crates-io]` (row 9, re-pinned in 0.101.1034) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001), iroh-blobs `da34ac02` (0.104.2001, `aster-iroh-blobs-v0.104.2001`), iroh-gossip `39a2ed2c` (0.102.1001, `aster-iroh-gossip-v0.102.1001`) and iroh-util `bfef8edb` (0.7.1001, `aster-iroh-util-v0.7.1001`). The upstream base stays `v0.101.0`: no newer iroh-docs release.
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 9, re-pinned in 0.101.1034) pins iroh `9
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "67a4b46ab658f202e7f98099838c576824dcf543" }
+iroh-docs = { git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "9fad662ca009605242b5c3d5d2d1ec94749f4478" }
 ```
 
 iroh-docs is the fork that exercises all the others together (iroh, noq, iroh-blobs, iroh-gossip, iroh-util). Its suite runs whenever any of them is re-pinned; see "Porting to a new upstream release".
@@ -100,6 +100,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 81 | none recorded (`bb41092`) | `DEFAULT_MAX_INLINE_VALUE_SIZE` is 2 KiB (was 1 KiB): entry values up to 2 KiB ride sync and gossip messages. Files: `src/protocol.rs`; tests that need an over-threshold value use 4 KiB. | Owner's threshold for inline entry values (Portal's are at most 427 B). | `bb41092` | carried | Keep the default below the gossip `max_message_size` (4096) minus the signed entry. |
 | 82 | none recorded (`d1e55a1`) | redb 4.5 (was 4.1): fixes to crash recovery that could roll back or corrupt durable commits (4.2, 4.3), mid-commit error hardening, and bounded page-cache memory under writes (4.4). Same in iroh-blobs. File: `Cargo.toml`. | Durability. Bytes written per small blob unchanged in the iroh-blobs bench. | `d1e55a1` | carried | `redb_v3` stays for the v2-store migration. |
 | 87 | `chore/blobs-0.104-gossip-0.102` (`378ba2e`, on `upgrade/iroh-docs-v0.101` at `7ebb66f`) | API moves for iroh-blobs 0.104 and iroh-gossip 0.102. `engine/gossip.rs`: iroh-gossip's `Event` is `#[non_exhaustive]` (upstream iroh-gossip #198), so the receive loop gains a catch-all arm that logs (rate-limited) and keeps the loop alive; `Lagged` (row 50) and the other known variants stay explicit. `tests/gc_publish_wedge.rs`: `gc_run_once` takes a third, protect argument (iroh-blobs upstream #240); the tests pass `None`, as they sweep with a stale live set on purpose. Files: `src/engine/gossip.rs`, `tests/gc_publish_wedge.rs` (and the dependency moves in `Cargo.toml`, rows 9 and 15). | Builds against the forks Aster pins. A future gossip event must not end Docs live sync's receive loop. | `378ba2e` / `c710ed8` | carried | Drop the catch-all only if upstream makes `Event` exhaustive again. |
+| 88 | none recorded (`fd5b97f`) | A per-peer sync policy. `Engine::set_sync_policy` (and `Docs::set_sync_policy`) installs `Fn(NamespaceId, PublicKey, SyncDirection) -> bool`; the live actor asks it before accepting a sync request (a refusal answers `NotFound`, as for a namespace this node does not hold) and before dialling a peer to sync (a refusal skips the dial). `clear_sync_policy` restores the default, which accepts every peer that names a live namespace. Files: `src/engine/policy.rs`, `src/engine.rs`, `src/engine/live.rs`, `src/protocol.rs`; tests `tests/sync_policy.rs` (and `tests/util.rs` exposes the protocol handle). | Aster decides per peer which namespaces it reconciles: foreign peers only the namespaces their grant names, members only the bound namespaces their scopes reach. The namespace id stays the capability without a policy. | `fd5b97f` / `9fad662` | carried | Upstream has no per-peer accept hook; drop if one lands. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -197,7 +198,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1034 (2026-11-09), current
+### 0.101.1035 (2026-11-10), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1035` | `9fad662ca009605242b5c3d5d2d1ec94749f4478` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-10, `aster-iroh-docs-v0.101.1035`** (`9fad662`): row 88 (per-peer sync policy); `9fad662` sets the version. Validation: full local suite and clippy green.
+
+### 0.101.1034 (2026-11-09)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
