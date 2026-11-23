@@ -23,12 +23,12 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-docs-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-docs-v<upstream version>`) |
-| Tag | `aster-iroh-docs-v0.101.1035-p1` (`aster-iroh-docs-v0.101.1035` is the previous pin) |
-| Pinned commit | `34b90850074acca44b4bed2ecf072ecf87ac8874` |
-| Crate version | 0.101.1035 (workspace spec `iroh-docs = "0.101.1035"`) |
+| Tag | `aster-iroh-docs-v0.101.1036` (`aster-iroh-docs-v0.101.1035-p1` is the previous pin) |
+| Pinned commit | `d5b773dcc6e6cf7a926f27bce846af394d6e34b8` |
+| Crate version | 0.101.1036 (workspace spec `iroh-docs = "0.101.1036"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-docs.git` |
 
-The fork's own `[patch.crates-io]` (row 9, re-pinned in 0.101.1035-p1) pins iroh `370b54434` (1.4.2003), noq `4e193fb2d` (1.4.1002), iroh-blobs `86ef7da0` (0.104.2001, `aster-iroh-blobs-v0.104.2001-p1`), iroh-gossip `6d13a652` (0.102.1001, `aster-iroh-gossip-v0.102.1001-p1`) and iroh-util `f91c1f97` (0.7.1001, `aster-iroh-util-v0.7.1001-p1`). The upstream base stays `v0.101.0`: no newer iroh-docs release.
+The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1035-p1) pins iroh `370b54434` (1.4.2003), noq `4e193fb2d` (1.4.1002), iroh-blobs `86ef7da0` (0.104.2001, `aster-iroh-blobs-v0.104.2001-p1`), iroh-gossip `6d13a652` (0.102.1001, `aster-iroh-gossip-v0.102.1001-p1`) and iroh-util `f91c1f97` (0.7.1001, `aster-iroh-util-v0.7.1001-p1`). The upstream base stays `v0.101.0`: no newer iroh-docs release.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
@@ -101,6 +101,7 @@ Most topic branches from the 0.100 line are stacked on each other rather than ba
 | 82 | none recorded (`d1e55a1`) | redb 4.5 (was 4.1): fixes to crash recovery that could roll back or corrupt durable commits (4.2, 4.3), mid-commit error hardening, and bounded page-cache memory under writes (4.4). Same in iroh-blobs. File: `Cargo.toml`. | Durability. Bytes written per small blob unchanged in the iroh-blobs bench. | `d1e55a1` | carried | `redb_v3` stays for the v2-store migration. |
 | 87 | `chore/blobs-0.104-gossip-0.102` (`378ba2e`, on `upgrade/iroh-docs-v0.101` at `7ebb66f`) | API moves for iroh-blobs 0.104 and iroh-gossip 0.102. `engine/gossip.rs`: iroh-gossip's `Event` is `#[non_exhaustive]` (upstream iroh-gossip #198), so the receive loop gains a catch-all arm that logs (rate-limited) and keeps the loop alive; `Lagged` (row 50) and the other known variants stay explicit. `tests/gc_publish_wedge.rs`: `gc_run_once` takes a third, protect argument (iroh-blobs upstream #240); the tests pass `None`, as they sweep with a stale live set on purpose. Files: `src/engine/gossip.rs`, `tests/gc_publish_wedge.rs` (and the dependency moves in `Cargo.toml`, rows 9 and 15). | Builds against the forks Aster pins. A future gossip event must not end Docs live sync's receive loop. | `378ba2e` / `c710ed8` | carried | Drop the catch-all only if upstream makes `Event` exhaustive again. |
 | 88 | none recorded (`fd5b97f`) | A per-peer sync policy. `Engine::set_sync_policy` (and `Docs::set_sync_policy`) installs `Fn(NamespaceId, PublicKey, SyncDirection) -> bool`; the live actor asks it before accepting a sync request (a refusal answers `NotFound`, as for a namespace this node does not hold) and before dialling a peer to sync (a refusal skips the dial). `clear_sync_policy` restores the default, which accepts every peer that names a live namespace. Files: `src/engine/policy.rs`, `src/engine.rs`, `src/engine/live.rs`, `src/protocol.rs`; tests `tests/sync_policy.rs` (and `tests/util.rs` exposes the protocol handle). | Aster decides per peer which namespaces it reconciles: foreign peers only the namespaces their grant names, members only the bound namespaces their scopes reach. The namespace id stays the capability without a policy. | `fd5b97f` / `9fad662` | carried | Upstream has no per-peer accept hook; drop if one lands. |
+| 89 | `fix/default-author-flush` (`1fecd33`, on `upgrade/iroh-docs-v0.101` at `56fdbce`) | `DefaultAuthor::set` commits the docs store (`flush_store`) before it writes the default-author file. Upstream's store batches writes, so a node killed with SIGKILL right after its first start could leave the file naming an author the store never committed, and the next start failed with the default author missing from the docs store. File: `src/engine.rs`; test `test_default_author_set_is_committed_before_the_file_names_it` in `tests/client.rs`. | A persistent Aster node killed with SIGKILL restarts (Aster issue #2); Aster's `durable_docs::a_node_killed_right_after_its_first_start_restarts` reproduces it. | `1fecd33` / `56fdbce`, version `d5b773d` | carried | Same batching root cause as upstream n0-computer/iroh-docs issue #78 (a different call). Stand-in for upstream PR #113 (moves the default author into the docs DB, removing the bug class); drop if #113 lands. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -198,7 +199,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.101.1035-p1 (2026-11-10), current
+### 0.101.1036 (2026-11-23), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-docs-v0.101.1036` | `d5b773dcc6e6cf7a926f27bce846af394d6e34b8` | `upgrade/iroh-docs-v0.101` |
+
+- **2026-11-23, `aster-iroh-docs-v0.101.1036`** (`d5b773d`): row 89 (default author committed before its file names it; `56fdbce` is the cherry-pick of `1fecd33`); `d5b773d` sets the version. Validation: `cargo test --test client default_author` 4 passed; Aster's reproduction and docs suites green on this pin.
+
+### 0.101.1035-p1 (2026-11-10)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
