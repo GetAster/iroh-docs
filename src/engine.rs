@@ -716,6 +716,10 @@ impl DefaultAuthor {
         if docs_store.export_author(author_id).await?.is_none() {
             bail!("The author does not exist");
         }
+        // `export_author` also sees an author still in the store's open write
+        // batch. Commit it before the file names it, as `load` does when it
+        // creates the author; otherwise a crash leaves a dangling reference.
+        docs_store.flush_store().await?;
         self.storage.persist(author_id).await?;
         *self.value.write().unwrap() = author_id;
         Ok(())
