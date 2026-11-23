@@ -261,6 +261,43 @@ async fn test_default_author_persist() -> TestResult<()> {
     Ok(())
 }
 
+/// `author_set_default` must not write the `default-author` file before the
+/// docs store holds the author. The author is imported into the store's open
+/// write batch, which commits later; a process killed between the file write
+/// and that commit leaves a file naming an author the store lacks, and the next
+/// start refuses with "The default author is missing from the docs store".
+/// Copying the on-disk state while the node is still running is the state a
+/// SIGKILL leaves: committed pages and the file, without the open batch.
+#[tokio::test]
+#[traced_test]
+#[cfg(feature = "fs-store")]
+async fn test_default_author_set_is_committed_before_the_file_names_it() -> TestResult<()> {
+    let iroh_root_dir = tempfile::TempDir::new()?;
+    let crashed_root_dir = tempfile::TempDir::new()?;
+    let crashed_root = crashed_root_dir.path();
+
+    let iroh = Node::persistent(iroh_root_dir.path(), empty_endpoint().await?)
+        .spawn()
+        .await?;
+    let author = iroh_docs::Author::new(&mut rand::rng());
+    let author_id = author.id();
+    iroh.docs().author_import(author).await?;
+    iroh.docs().author_set_default(author_id).await?;
+
+    for name in ["docs.redb", "default-author"] {
+        tokio::fs::copy(iroh_root_dir.path().join(name), crashed_root.join(name)).await?;
+    }
+
+    let restarted = Node::persistent(crashed_root, empty_endpoint().await?)
+        .spawn()
+        .await
+        .map_err(|err| anyhow::anyhow!("restart after a crash: {err:#}"))?;
+    assert_eq!(restarted.docs().author_default().await?, author_id);
+    restarted.shutdown().await?;
+    iroh.shutdown().await?;
+    Ok(())
+}
+
 /// A truncated default author file (a crash mid-write before writes were
 /// atomic) stops start-up with an error that names the recovery; it never
 /// silently mints a new author. Writing the id back recovers the identity.
