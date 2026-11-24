@@ -807,7 +807,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1723,8 +1723,8 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iroh"
-version = "1.5.1001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b010df8a650f05f9bb309e021df8c44f09d6eb0b#b010df8a650f05f9bb309e021df8c44f09d6eb0b"
+version = "1.5.1002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b0fac795ec2cabefbab48cf076f0ee32babf033e#b0fac795ec2cabefbab48cf076f0ee32babf033e"
 dependencies = [
  "axum",
  "backon",
@@ -1774,8 +1774,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.5.1001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b010df8a650f05f9bb309e021df8c44f09d6eb0b#b010df8a650f05f9bb309e021df8c44f09d6eb0b"
+version = "1.5.1002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b0fac795ec2cabefbab48cf076f0ee32babf033e#b0fac795ec2cabefbab48cf076f0ee32babf033e"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1834,8 +1834,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.5.1001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b010df8a650f05f9bb309e021df8c44f09d6eb0b#b010df8a650f05f9bb309e021df8c44f09d6eb0b"
+version = "1.5.1002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b0fac795ec2cabefbab48cf076f0ee32babf033e#b0fac795ec2cabefbab48cf076f0ee32babf033e"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1976,8 +1976,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.5.1001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b010df8a650f05f9bb309e021df8c44f09d6eb0b#b010df8a650f05f9bb309e021df8c44f09d6eb0b"
+version = "1.5.1002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=b0fac795ec2cabefbab48cf076f0ee32babf033e#b0fac795ec2cabefbab48cf076f0ee32babf033e"
 dependencies = [
  "blake3",
  "bytes",
