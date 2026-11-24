@@ -1118,9 +1118,11 @@ async fn sync_big() -> Result<()> {
     let n_entries_init = 1;
 
     tokio::task::spawn(async move {
-        for i in 0.. {
+        let mut i = 0u64;
+        loop {
             n0_future::time::sleep(Duration::from_secs(1)).await;
             info!("tick {i}");
+            i += 1;
         }
     });
 
