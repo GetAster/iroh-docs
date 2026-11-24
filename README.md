@@ -53,7 +53,7 @@ Here is a basic example of how to set up `iroh-docs` with `iroh`:
 use iroh::{endpoint::presets, protocol::Router, Endpoint};
 use iroh_blobs::{BlobsProtocol, store::mem::MemStore, ALPN as BLOBS_ALPN};
 use iroh_docs::{protocol::Docs, ALPN as DOCS_ALPN};
-use iroh_gossip::{net::Gossip, ALPN as GOSSIP_ALPN};
+use iroh_gossip::{Gossip, ALPN as GOSSIP_ALPN};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

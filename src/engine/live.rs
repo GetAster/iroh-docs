@@ -17,7 +17,7 @@ use iroh_blobs::{
     },
     Hash, HashAndFormat,
 };
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 use n0_future::{
     task::{Id as TaskId, JoinError, JoinSet},
     time::{Duration, Instant, SystemTime},
@@ -2264,7 +2264,7 @@ mod task_failure_tests {
     async fn node() -> anyhow::Result<TestNode> {
         let ep = iroh::Endpoint::bind(presets::Minimal).await?;
         let store = iroh_blobs::store::mem::MemStore::new();
-        let gossip = iroh_gossip::net::Gossip::builder().spawn(ep.clone());
+        let gossip = iroh_gossip::Gossip::builder().spawn(ep.clone());
         let downloader = store.downloader(&ep);
         let engine = super::super::Engine::spawn(
             ep.clone(),

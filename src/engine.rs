@@ -25,7 +25,7 @@ use iroh_blobs::{
     store::{ProtectCb, ProtectOutcome},
     Hash,
 };
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 use n0_future::{task::AbortOnDropHandle, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Notify};

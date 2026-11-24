@@ -18,7 +18,7 @@ use std::{
 
 use bytes::Bytes;
 use iroh::EndpointId;
-use iroh_gossip::api::GossipSender;
+use iroh_gossip::GossipSender;
 use tokio::sync::mpsc;
 use tracing::warn;
 

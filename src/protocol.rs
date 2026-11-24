@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use iroh::{endpoint::Connection, protocol::ProtocolHandler, Endpoint};
 use iroh_blobs::api::Store as BlobsStore;
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 
 use crate::{
     api::DocsApi,

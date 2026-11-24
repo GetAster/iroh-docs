@@ -13,7 +13,7 @@ use iroh::{
 };
 use iroh_blobs::store::GcConfig;
 use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs, sync::Clock};
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 use n0_error::Result;
 
 pub async fn empty_endpoint() -> Result<Endpoint, BindError> {

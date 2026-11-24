@@ -37,7 +37,7 @@ use iroh_docs::{
     store::Store,
     Author, NamespaceId, ProtocolMessage,
 };
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 use n0_future::StreamExt;
 use rand::SeedableRng;
 use serde::Serialize;

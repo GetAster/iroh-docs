@@ -3,11 +3,7 @@ use std::collections::{hash_map, HashMap};
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use iroh_blobs::Hash;
-use iroh_gossip::{
-    api::{Event, GossipReceiver, GossipSender, JoinOptions},
-    net::Gossip,
-    TopicId,
-};
+use iroh_gossip::{Event, Gossip, GossipReceiver, GossipSender, JoinOptions, TopicId};
 use n0_future::{
     task::{AbortHandle, JoinSet},
     StreamExt,
@@ -352,7 +348,7 @@ async fn receive_loop(
                         .await?;
                 }
             }
-            // `iroh_gossip::api::Event` is `#[non_exhaustive]` since iroh-gossip 0.102. The
+            // `iroh_gossip::Event` is `#[non_exhaustive]` since iroh-gossip 0.102. The
             // variants that carry meaning for docs (`Lagged`, `Received`, `NeighborUp`,
             // `NeighborDown`) are all handled above, so a new variant cannot be a loss signal
             // we know how to act on. Keep the loop alive (like the one-undecodable-message

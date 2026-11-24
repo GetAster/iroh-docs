@@ -21,7 +21,7 @@ use std::{collections::HashSet, time::Duration};
 use iroh::endpoint::presets;
 use iroh_blobs::store::GcConfig;
 use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs};
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 use n0_error::Result;
 use n0_future::StreamExt;
 use testdir::testdir;
@@ -30,7 +30,7 @@ async fn temp_hashes(store: &iroh_blobs::api::Store) -> Result<HashSet<iroh_blob
     let mut temps = store.tags().list_temp_tags().await?;
     let mut hashes = HashSet::new();
     while let Some(hf) = temps.next().await {
-        hashes.insert(hf.hash);
+        hashes.insert(hf?.hash);
     }
     Ok(hashes)
 }

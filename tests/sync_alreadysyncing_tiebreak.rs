@@ -30,7 +30,7 @@ use iroh_docs::{
     engine::LiveEvent,
     protocol::Docs,
 };
-use iroh_gossip::net::Gossip;
+use iroh_gossip::Gossip;
 use n0_future::StreamExt;
 use rand::{RngExt, SeedableRng};
 

@@ -17,7 +17,7 @@ use iroh_docs::{
     store::DownloadPolicy,
     AuthorId, NamespaceId,
 };
-use iroh_gossip::{api::GossipTopic, TopicId};
+use iroh_gossip::{GossipTopic, TopicId};
 use n0_future::{Stream, TryStreamExt};
 use std::time::Duration;
 use tracing_test::traced_test;
@@ -869,7 +869,7 @@ async fn sync_falls_back_to_a_peer_that_speaks_only_the_legacy_alpn() -> Result<
     // Legacy node: its router accepts only the version-0 docs ALPN.
     let ep = iroh::Endpoint::bind(presets::Minimal).await?;
     let blobs = (*iroh_blobs::store::mem::MemStore::new()).clone();
-    let gossip = iroh_gossip::net::Gossip::builder().spawn(ep.clone());
+    let gossip = iroh_gossip::Gossip::builder().spawn(ep.clone());
     let legacy_docs = iroh_docs::protocol::Docs::memory()
         .spawn(ep.clone(), blobs.clone(), gossip.clone())
         .await?;
