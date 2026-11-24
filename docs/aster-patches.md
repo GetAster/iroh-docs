@@ -30,6 +30,8 @@ Historical and current tag schemes in this repository:
 
 The fork's own `[patch.crates-io]` (row 9, last re-pinned in 0.101.1037) pins iroh `b010df8a65` (1.5.1001, `aster-iroh-v1.5.1001`), noq `819373faf` (1.5.1001, `aster-noq-v1.5.1001`), iroh-blobs `ed663eaf` (0.105.1001, `aster-iroh-blobs-v0.105.1001`), iroh-gossip `a7a8c52b` (0.103.1001, `aster-iroh-gossip-v0.103.1001`) and iroh-util `e83da6f8` (0.7.1001, `aster-iroh-util-v0.7.1001-p2`). The upstream base stays `v0.101.0`: no newer iroh-docs release. iroh-docs moved to irpc 1.0 in 0.101.1037 (one irpc in the graph, shared with iroh-blobs 0.105). (Ledger drift fixed in this edit: the bootstrap pin line named `34b90850`, the 0.101.1035-p1 pin, although `d5b773dc` (0.101.1036) was current.)
 
+**Re-pin 2026-11-24 (`aster-iroh-docs-v0.101.1037-p1`, `716d8317`), supersedes the iroh pin above:** the fork's `[patch.crates-io]` and lock name iroh `b0fac795ec` (Aster iroh 1.5.1002, tag `aster-iroh-v1.5.1002`). iroh 1.5.1002 differs from 1.5.1001 only in manifests: iroh now requires the iroh-relay it ships (iroh ledger row `relay-requirement`). No version change; noq unchanged. Its iroh-blobs, iroh-gossip and iroh-util pins stay `ed663eaf`, `a7a8c52b` and `e83da6f8`: their re-pins (`da0a972e`, `c94c9f07`, `489f339d`) change only those forks' own `[patch.crates-io]`, which Cargo ignores for dependencies, so the code built is the same. Aster's `fork_compat` ran the suite on it: 0 failed.
+
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
